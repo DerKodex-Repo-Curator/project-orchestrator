@@ -331,6 +331,9 @@ pub const WS_TICKET_PATH: &str = "/auth/ws-ticket";
 const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     "/auth/mcp-tokens",
     "/api/chat/config",
+    // Installing the Claude Code CLI downloads a program and writes ~/.claude (allowed tools,
+    // and mcp.json with the server's JWT secret): never an agent's call (review of #722).
+    "/api/chat/cli",
     "/api/chat/providers",
     "/api/chat/roles",
     // Where the chats outside any project may send their content (B3).
@@ -889,6 +892,7 @@ mod tests {
                 "/api/chat/llm-consents/{provider_id}",
                 put(ok_handler).delete(ok_handler),
             )
+            .route("/api/chat/cli/install", post(ok_handler))
             .route("/api/notes", post(ok_handler))
             .layer(from_fn_with_state(state.clone(), require_auth))
             .with_state(state);
@@ -911,6 +915,7 @@ mod tests {
             ("PUT", "/api/projects/demo/llm-consent"),
             ("PUT", "/api/chat/llm-consents/deepseek"),
             ("DELETE", "/api/chat/llm-consents/deepseek"),
+            ("POST", "/api/chat/cli/install"),
         ] {
             assert_eq!(
                 status_of(app.clone(), method, uri, &agent).await,

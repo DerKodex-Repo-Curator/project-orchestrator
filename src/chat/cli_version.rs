@@ -312,7 +312,21 @@ fn resolve_cli_in(
     }
     std::env::split_paths(&path_var?)
         .map(|dir| dir.join(configured))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// What execvp accepts while it walks the PATH: a regular file with an execute bit (a
+/// non-executable `claude` earlier in the PATH is skipped, review of #722).
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// The Claude Code CLI to configure or run: the configured path (a bare name through the
@@ -424,11 +438,21 @@ mod tests {
         let empty = tempfile::TempDir::new().unwrap();
         let path = std::env::join_paths([empty.path(), bin.path()]).unwrap();
         assert_eq!(resolve_cli_in("claude", Some(path.clone())), None);
-        std::fs::write(bin.path().join("claude"), "#!/bin/sh\n").unwrap();
-        assert_eq!(
-            resolve_cli_in("claude", Some(path.clone())),
-            Some(bin.path().join("claude"))
-        );
+        let cli = bin.path().join("claude");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Not executable: skipped like execvp skips it.
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(resolve_cli_in("claude", Some(path.clone())), None);
+            // A non-executable `claude` EARLIER in the PATH does not hide the real one.
+            std::fs::write(empty.path().join("claude"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(resolve_cli_in("claude", Some(path.clone())), Some(cli));
+        #[cfg(unix)]
+        std::fs::remove_file(empty.path().join("claude")).unwrap();
         // No PATH at all: not found, never a guess.
         assert_eq!(resolve_cli_in("claude", None), None);
         // A value with a separator is that file, never searched.
