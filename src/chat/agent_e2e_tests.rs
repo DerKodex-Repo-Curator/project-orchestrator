@@ -5826,9 +5826,14 @@ mod legacy_nats_permission {
 
     /// `fake_claude` behind a wrapper that plays the transcript and records stdin.
     fn wrapper(dir: &std::path::Path) -> String {
+        wrapper_of(dir, transcript())
+    }
+
+    /// [`wrapper`] playing `transcript`.
+    fn wrapper_of(dir: &std::path::Path, transcript: Vec<Value>) -> String {
         use std::os::unix::fs::PermissionsExt;
         let script = dir.join("transcript.jsonl");
-        let lines: String = transcript().iter().map(|l| format!("{l}\n")).collect();
+        let lines: String = transcript.iter().map(|l| format!("{l}\n")).collect();
         std::fs::write(&script, lines).unwrap();
         let wrapper = dir.join("claude");
         std::fs::write(
@@ -5866,6 +5871,100 @@ mod legacy_nats_permission {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("{needle:?} was never stored for {sid}");
+    }
+
+    /// Review of #712 (legacy gap): a permission request of the CLI is pending BEFORE it is
+    /// broadcast, so a strict answer (`require_pending`, the REST and WS paths) sent the
+    /// moment a client sees the request is delivered, never `NotPending`. The test holds
+    /// the session's pending map while the request arrives: a broadcast seen during that
+    /// hold is a request not yet stored (it used to be broadcast first, then stored).
+    #[tokio::test]
+    async fn a_strict_answer_sent_the_moment_the_request_is_seen_finds_it_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = transcript();
+        // The request comes a little after the tool call: the map is held by then.
+        let at = lines
+            .iter()
+            .position(|l| l.to_string().contains("can_use_tool"))
+            .unwrap();
+        lines.insert(at, json!({"op": "sleep", "ms": 400}));
+        let cli = wrapper_of(dir.path(), lines);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, None, "default");
+        req.message = "run pwd".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        let pending = manager
+            .active_sessions
+            .read()
+            .await
+            .get(&sid)
+            .expect("the session is live")
+            .pending_permission_inputs
+            .clone();
+
+        async fn next_request(rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>) {
+            loop {
+                match rx.recv().await {
+                    Ok(ChatEvent::PermissionRequest { id, .. }) if id == "req-nats" => return,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(e) => panic!("channel closed: {e}"),
+                }
+            }
+        }
+        {
+            let held = pending.lock().await;
+            // Long enough for the request to come (400 ms after the tool call).
+            if tokio::time::timeout(Duration::from_secs(3), next_request(&mut rx))
+                .await
+                .is_ok()
+            {
+                assert!(
+                    held.contains_key("req-nats"),
+                    "the request was broadcast before it was pending: a strict answer \
+                     sent now is refused NotPending"
+                );
+            }
+        }
+        // Released: the request, stored first, now leaves the backend.
+        tokio::time::timeout(Duration::from_secs(10), next_request(&mut rx))
+            .await
+            .expect("the request is broadcast once pending");
+        let answered = manager
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(answered, Ok(DeliveryRoute::Local)),
+            "the strict answer is delivered: {answered:?}"
+        );
+        stored_until(&graph, &sid, "allowed and done").await;
+        manager.close_session(&sid).await.unwrap();
     }
 
     #[tokio::test]
@@ -11058,6 +11157,21 @@ mod legacy_turn_end_at_boot {
                 .map(|e| e.event_type.clone())
                 .collect::<Vec<_>>()
         );
+        // Follow-up review of #711, finding 2: the end is neutral — the reloaded thread
+        // shows no `result_error` block under the stopped turn (the frontend keys it on
+        // `error_during_execution`) — and carries a real duration, never "0 ms".
+        let ended: Value = cli
+            .events()
+            .await
+            .iter()
+            .find(|e| e.event_type == "result")
+            .map(|e| serde_json::from_str(&e.data).unwrap())
+            .unwrap();
+        assert_eq!(ended["subtype"], "interrupted", "{ended}");
+        assert_eq!(ended["is_error"], false, "{ended}");
+        assert_eq!(ended["stop_reason"], "interrupted", "{ended}");
+        assert!(ended.get("result_text").is_none(), "{ended}");
+        assert!(ended["duration_ms"].as_u64().unwrap() > 0, "{ended}");
         assert_eq!(cli.closed_at_next_boot().await, 0);
         cli.manager.close_session(&cli.sid).await.unwrap();
     }

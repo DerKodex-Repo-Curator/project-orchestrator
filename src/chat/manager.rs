@@ -2463,8 +2463,15 @@ pub(crate) fn po_server_unauthorised(
 
 /// The `result` that ends a turn of the Claude CLI stopped by a person: the CLI's own
 /// `result` of that turn when it was read in time, else one made here; either way with
-/// `stop_reason: interrupted`, the neutral reason the agent engine gives.
-pub(crate) fn interrupted_turn_end(read: Option<Message>) -> ChatEvent {
+/// `stop_reason: interrupted`, the neutral reason the agent engine gives, and in the
+/// stored form of a stopped turn ([`stored_interrupted_result`]): a Stop is not a failure,
+/// so the thread reloaded shows no error block under the turn (follow-up review of #711,
+/// finding 2). `elapsed`, the time the turn ran, is its duration when the CLI gave none
+/// (a `result` made here, or a CLI's `0`): never a false "0 ms".
+pub(crate) fn interrupted_turn_end(
+    read: Option<Message>,
+    elapsed: std::time::Duration,
+) -> ChatEvent {
     let from_cli = read
         .as_ref()
         .map(ChatManager::message_to_events)
@@ -2473,7 +2480,10 @@ pub(crate) fn interrupted_turn_end(read: Option<Message>) -> ChatEvent {
                 .into_iter()
                 .find(|e| matches!(e, ChatEvent::Result { .. }))
         });
-    match from_cli {
+    let elapsed_ms = u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let ended = match from_cli {
         Some(ChatEvent::Result {
             session_id,
             duration_ms,
@@ -2488,7 +2498,11 @@ pub(crate) fn interrupted_turn_end(read: Option<Message>) -> ChatEvent {
             ..
         }) => ChatEvent::Result {
             session_id,
-            duration_ms,
+            duration_ms: if duration_ms == 0 {
+                elapsed_ms
+            } else {
+                duration_ms
+            },
             cost_usd,
             subtype,
             is_error,
@@ -2501,9 +2515,9 @@ pub(crate) fn interrupted_turn_end(read: Option<Message>) -> ChatEvent {
         },
         _ => ChatEvent::Result {
             session_id: String::new(),
-            duration_ms: 0,
+            duration_ms: elapsed_ms,
             cost_usd: None,
-            subtype: "interrupted".to_string(),
+            subtype: INTERRUPTED_SUBTYPE.to_string(),
             is_error: false,
             num_turns: None,
             result_text: None,
@@ -2512,6 +2526,50 @@ pub(crate) fn interrupted_turn_end(read: Option<Message>) -> ChatEvent {
             model: None,
             stop_reason: Some("interrupted".to_string()),
         },
+    };
+    stored_interrupted_result(&ended).unwrap_or(ended)
+}
+
+/// `subtype` of the `result` of a turn stopped by a person, as stored: the one the native
+/// provider gives (`done(Interrupted, "interrupted", false)`), neither a success nor an error.
+pub(crate) const INTERRUPTED_SUBTYPE: &str = "interrupted";
+
+/// The stored form of a `result` whose `stop_reason` is `interrupted`, `None` for any other
+/// event. The Claude CLI answers an interrupt with `error_during_execution` and
+/// `is_error: true`, often with an empty `result`: stored as is, the reloaded thread shows an
+/// empty error block under every stopped turn while the live client saw none (follow-up
+/// review of #711, finding 2). Stored instead with the native provider's neutral form —
+/// `subtype: interrupted`, `is_error: false` — by both engines (the legacy loop through
+/// [`interrupted_turn_end`], the agent runtime when it persists a `result`), so a thread
+/// reloads the same whichever engine ran it. Only the STORED copy: what is broadcast live
+/// (the runner and the sub-agents read `is_error` there) keeps the provider's form.
+pub(crate) fn stored_interrupted_result(event: &ChatEvent) -> Option<ChatEvent> {
+    match event {
+        ChatEvent::Result {
+            session_id,
+            duration_ms,
+            cost_usd,
+            num_turns,
+            result_text,
+            cost,
+            usage,
+            model,
+            stop_reason,
+            ..
+        } if stop_reason.as_deref() == Some("interrupted") => Some(ChatEvent::Result {
+            session_id: session_id.clone(),
+            duration_ms: *duration_ms,
+            cost_usd: *cost_usd,
+            subtype: INTERRUPTED_SUBTYPE.to_string(),
+            is_error: false,
+            num_turns: *num_turns,
+            result_text: result_text.clone().filter(|t| !t.trim().is_empty()),
+            cost: cost.clone(),
+            usage: usage.clone(),
+            model: model.clone(),
+            stop_reason: stop_reason.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -7217,6 +7275,9 @@ impl ChatManager {
             }
         };
 
+        // When the turn started: the duration of a stopped turn the CLI gave none
+        // (`interrupted_turn_end`).
+        let turn_started = std::time::Instant::now();
         is_streaming.store(true, Ordering::SeqCst);
         // Broadcast streaming_status to all connected clients (multi-tab support)
         emit_chat(
@@ -7534,6 +7595,8 @@ impl ChatManager {
 
                     // Helper closure: process an SDK control message (permission or AskUserQuestion).
                     // Returns Some(ChatEvent) if a can_use_tool was parsed, None otherwise.
+                    // Persisted here, NOT broadcast: the caller stores a permission request's
+                    // input first, then announces it (`announce_control_event`).
                     // The caller is responsible for adding the event to streaming_events (async)
                     // and for auto-allowing AskUserQuestion events via stdin_tx.
                     let handle_control_msg = |control_msg: serde_json::Value,
@@ -7576,11 +7639,18 @@ impl ChatManager {
                             });
                         }
 
-                        // Broadcast to WebSocket clients
-                        emit_chat(event.clone(), &events_tx, &nats, &session_id);
-                        // Light signal on /ws/events (ids only, never the command/question)
-                        notify_attention_for_chat_event(&event_emitter, &session_id, &event);
                         Some(event)
+                    };
+
+                    // The request leaves the backend: broadcast to the WebSocket clients and
+                    // a light signal on /ws/events (ids only, never the command/question).
+                    // Called AFTER a permission request is in `pending_perm_inputs`: a strict
+                    // answer (`route_permission_response` with `require_pending`) sent the
+                    // moment a client sees the request finds it pending, never `NotPending`
+                    // (review of #712).
+                    let announce_control_event = |event: &ChatEvent| {
+                        emit_chat(event.clone(), &events_tx, &nats, &session_id);
+                        notify_attention_for_chat_event(&event_emitter, &session_id, event);
                     };
 
                     // A decision the backend made itself (a request a session grant covers): persisted
@@ -7662,6 +7732,13 @@ impl ChatManager {
 
                                             if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                                 let mut granted_decision: Option<ChatEvent> = None;
+                                                // A regular permission is pending BEFORE anyone sees it.
+                                                if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
+                                                    if !id.is_empty() {
+                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                    }
+                                                }
+                                                announce_control_event(&evt);
                                                 // AskUserQuestion: auto-allow the control request so the CLI
                                                 // waits for the tool_result (user's answer) instead of blocking.
                                                 // Do NOT store in pending_perm_inputs (it's not a permission).
@@ -7684,9 +7761,8 @@ impl ChatManager {
                                                         }
                                                     }
                                                 } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
-                                                    // Regular permission: store original input for later response
+                                                    // Regular permission (its input stored above): a session grant may answer it
                                                     if !id.is_empty() {
-                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
                                                         if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, &tool_clock, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
                                                             record_decision(decision.clone(), &mut events_to_persist, &next_seq);
                                                             granted_decision = Some(decision);
@@ -7732,6 +7808,13 @@ impl ChatManager {
 
                                                 if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                                 let mut granted_decision: Option<ChatEvent> = None;
+                                                    // Pending before anyone sees it (same as above).
+                                                    if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
+                                                        if !id.is_empty() {
+                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                        }
+                                                    }
+                                                    announce_control_event(&evt);
                                                     // AskUserQuestion: auto-allow (same logic as above)
                                                     if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
                                                         if let Some(ref tx) = stdin_tx_for_auto_allow {
@@ -7754,7 +7837,6 @@ impl ChatManager {
                                                         }
                                                     } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                         if !id.is_empty() {
-                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
                                                         if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, &tool_clock, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
                                                             record_decision(decision.clone(), &mut events_to_persist, &next_seq);
                                                             granted_decision = Some(decision);
@@ -8241,7 +8323,7 @@ impl ChatManager {
                         // interrupted turn with such a `result` too); the live clients
                         // already see the turn stop (`streaming_status`).
                         if let Some(uuid) = session_uuid {
-                            let ended = interrupted_turn_end(drained);
+                            let ended = interrupted_turn_end(drained, turn_started.elapsed());
                             events_to_persist.push(ChatEventRecord {
                                 id: Uuid::new_v4(),
                                 session_id: uuid,
@@ -8311,7 +8393,7 @@ impl ChatManager {
                     // (`interrupted_turn_end`): ended by `retrying` alone, it would look cut
                     // at the next boot (follow-up review of #711, finding 3).
                     if let Some(uuid) = session_uuid {
-                        let ended = interrupted_turn_end(None);
+                        let ended = interrupted_turn_end(None, turn_started.elapsed());
                         events_to_persist.push(ChatEventRecord {
                             id: Uuid::new_v4(),
                             session_id: uuid,
@@ -18029,6 +18111,85 @@ mod tests {
         assert!(matches!(&events[0], ChatEvent::Result {
             subtype, is_error, num_turns, ..
         } if subtype == "error_max_turns" && *is_error && *num_turns == Some(15)));
+    }
+
+    /// Follow-up review of #711, finding 2: the CLI answers an interrupt with
+    /// `error_during_execution`, `is_error: true` and an empty `result`; the stored end of
+    /// the stopped turn is the neutral one (no error block at reload), with the CLI's
+    /// duration, or the turn's own when the CLI gave none (never "0 ms").
+    #[test]
+    fn a_stopped_cli_turn_is_stored_with_a_neutral_end_and_a_real_duration() {
+        let cli_result = |duration_ms: i64| Message::Result {
+            subtype: "error_during_execution".into(),
+            duration_ms,
+            duration_api_ms: 0,
+            is_error: true,
+            num_turns: 1,
+            session_id: "cli-stopped".into(),
+            total_cost_usd: Some(0.01),
+            usage: None,
+            result: Some(String::new()),
+            structured_output: None,
+        };
+        let elapsed = Duration::from_millis(1500);
+        for (read, want_ms, want_session) in [
+            (Some(cli_result(2000)), 2000, "cli-stopped"),
+            (Some(cli_result(0)), 1500, "cli-stopped"),
+            (None, 1500, ""),
+        ] {
+            let ended = interrupted_turn_end(read, elapsed);
+            let ChatEvent::Result {
+                session_id,
+                duration_ms,
+                subtype,
+                is_error,
+                result_text,
+                stop_reason,
+                ..
+            } = &ended
+            else {
+                panic!("not a result: {ended:?}");
+            };
+            assert_eq!(subtype, INTERRUPTED_SUBTYPE, "{ended:?}");
+            assert!(!is_error, "a Stop is not a failure: {ended:?}");
+            assert_eq!(result_text, &None, "no empty error text: {ended:?}");
+            assert_eq!(stop_reason.as_deref(), Some("interrupted"));
+            assert_eq!(*duration_ms, want_ms, "{ended:?}");
+            assert_eq!(session_id, want_session);
+        }
+    }
+
+    /// Only a `result` stopped by a person has a stored form of its own.
+    #[test]
+    fn only_an_interrupted_result_is_stored_in_the_neutral_form() {
+        let result = |stop: Option<&str>| ChatEvent::Result {
+            session_id: "s".into(),
+            duration_ms: 7,
+            cost_usd: None,
+            subtype: "error_during_execution".into(),
+            is_error: true,
+            num_turns: Some(1),
+            result_text: Some("boom".into()),
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: stop.map(str::to_string),
+        };
+        assert!(stored_interrupted_result(&result(Some("error"))).is_none());
+        assert!(stored_interrupted_result(&result(None)).is_none());
+        assert!(stored_interrupted_result(&ChatEvent::StreamingStatus {
+            is_streaming: false
+        })
+        .is_none());
+        let stored = stored_interrupted_result(&result(Some("interrupted"))).unwrap();
+        assert!(
+            matches!(
+                &stored,
+                ChatEvent::Result { subtype, is_error: false, result_text: Some(t), duration_ms: 7, .. }
+                    if subtype == INTERRUPTED_SUBTYPE && t == "boom"
+            ),
+            "{stored:?}"
+        );
     }
 
     #[test]

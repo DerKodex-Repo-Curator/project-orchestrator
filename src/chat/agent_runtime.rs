@@ -701,12 +701,16 @@ impl AgentSessionHandle {
                 | ChatEvent::ActiveTasksUpdate { .. }
         ) {
             if let Some(uuid) = self.uuid {
+                // A stopped turn is stored in its neutral form, as on the Claude Code
+                // engine: the reloaded thread shows no error block under it.
+                let stored = super::manager::stored_interrupted_result(&event);
                 let record = ChatEventRecord {
                     id: Uuid::new_v4(),
                     session_id: uuid,
                     seq: self.next_seq.fetch_add(1, Ordering::SeqCst),
                     event_type: event.event_type().to_string(),
-                    data: serde_json::to_string(&event).unwrap_or_default(),
+                    data: serde_json::to_string(stored.as_ref().unwrap_or(&event))
+                        .unwrap_or_default(),
                     created_at: chrono::Utc::now(),
                 };
                 let _ = self.graph.store_chat_events(uuid, vec![record]).await;
@@ -4198,5 +4202,70 @@ mod tool_timing_tests {
             timing["run_started_at"], timing["permission_resolved_at"],
             "{timing}"
         );
+    }
+}
+
+/// Follow-up review of #711, finding 2, on the agent engine: Claude Code answers an
+/// interrupt with `error_during_execution` and `is_error: true`; the turn is STORED in the
+/// neutral form the legacy loop stores (`manager::stored_interrupted_result`), so the
+/// thread reloads without an error block whichever engine ran it. What is broadcast live
+/// keeps the provider's form (the runner and the sub-agents read `is_error` there).
+#[cfg(test)]
+mod stored_interrupted_result_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+
+    #[tokio::test]
+    async fn a_stopped_turn_is_stored_neutral_and_broadcast_as_the_provider_said() {
+        let graph = Arc::new(MockGraphStore::new());
+        let node = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&node).await.unwrap();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let runtime = AgentRuntime::new(dyn_graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                &node.id.to_string(),
+                "local",
+                provider.session(),
+                1,
+                "claude_code",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let mut rx = handle.events_tx.subscribe();
+        handle
+            .emit(ChatEvent::Result {
+                session_id: "cc".into(),
+                duration_ms: 42,
+                cost_usd: None,
+                subtype: "error_during_execution".into(),
+                is_error: true,
+                num_turns: Some(1),
+                result_text: Some(String::new()),
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: Some("interrupted".into()),
+            })
+            .await;
+        let live = rx.recv().await.unwrap();
+        assert!(
+            matches!(&live, ChatEvent::Result { subtype, is_error: true, .. } if subtype == "error_during_execution"),
+            "{live:?}"
+        );
+        let stored = graph.get_chat_events(node.id, 0, 50).await.unwrap();
+        let ended: serde_json::Value = stored
+            .iter()
+            .find(|e| e.event_type == "result")
+            .map(|e| serde_json::from_str(&e.data).unwrap())
+            .expect("the result is stored");
+        assert_eq!(ended["subtype"], "interrupted", "{ended}");
+        assert_eq!(ended["is_error"], false, "{ended}");
+        assert_eq!(ended["stop_reason"], "interrupted", "{ended}");
+        assert_eq!(ended["duration_ms"], 42, "{ended}");
+        assert!(ended.get("result_text").is_none(), "{ended}");
     }
 }
