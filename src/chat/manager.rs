@@ -652,6 +652,9 @@ struct AgentOpen<'a> {
     system_prompt: &'a str,
     add_dirs: &'a [String],
     project_slug: Option<&'a str>,
+    /// The person the session belongs to (`ChatSessionNode::owner`): with the project,
+    /// whose lasting approvals it keeps (`chat::lasting_rules`).
+    owner: Option<&'a str>,
     /// History relayed from another provider, sent in front of the first message
     /// and stated on the thread.
     relay: Option<&'a super::relay::RelayedFrom>,
@@ -5176,6 +5179,29 @@ impl ChatManager {
         Ok(person_behind(claims).map(str::to_string))
     }
 
+    /// Where the lasting approvals of every person are kept (`chat::lasting_rules`),
+    /// `None` when this server keeps none (`ChatConfig::lasting_rules_dir`).
+    pub fn lasting_rule_store(&self) -> Option<super::lasting_rules::LastingRuleStore> {
+        self.config
+            .lasting_rules_dir
+            .clone()
+            .map(super::lasting_rules::LastingRuleStore::new)
+    }
+
+    /// The lasting rules a session of `owner` on `project` keeps and obeys; `None` (no
+    /// `always` offered) without a store, an owner or a project.
+    pub(crate) fn lasting_scope(
+        &self,
+        owner: Option<&str>,
+        project: Option<&str>,
+    ) -> Option<super::lasting_rules::LastingScope> {
+        super::lasting_rules::LastingScope::of_session(
+            self.lasting_rule_store().as_ref(),
+            owner,
+            project,
+        )
+    }
+
     /// Environment of the project-orchestrator MCP server of one session: the
     /// server URL, the session-BOUND token (registered live, revoked by
     /// `close_session`), the vault token and the session id. Shared by the
@@ -6129,6 +6155,7 @@ impl ChatManager {
                     system_prompt: &system_prompt,
                     add_dirs: &resolved_add_dirs,
                     project_slug: project_slug.as_deref(),
+                    owner: session_node.owner.as_deref(),
                     relay,
                     access,
                 })
@@ -6365,7 +6392,11 @@ impl ChatManager {
                                 &self.config.read_only_mcp_tools,
                                 Some(std::path::Path::new(&crate::expand_tilde(&request.cwd))),
                             ),
-                        ),
+                        )
+                        .with_lasting(self.lasting_scope(
+                            session_node.owner.as_deref(),
+                            session_node.project_slug.as_deref(),
+                        )),
                     )),
                     oob_trigger_cap,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -7935,6 +7966,7 @@ impl ChatManager {
                                 // Convert to ChatEvent(s) and emit + persist structured events
                                 let events = Self::message_to_events(msg);
                                 for event in events {
+                                    let event = offer_lasting_scope(event, &session_grants);
                                     // Deduplicate ToolUse events — ContentBlockStart and
                                     // AssistantMessage can both produce the same tool_use.
                                     //
@@ -9049,7 +9081,11 @@ impl ChatManager {
     ) -> std::result::Result<(), PermissionDeliveryError> {
         // What is accepted is what the engine declares (`system_init.capabilities`), as on
         // the agent engine: a scope it does not declare is refused, never narrowed.
-        if allow && !LEGACY_PERMISSION_SCOPES.contains(&scope) {
+        // `always` is offered by a session that keeps lasting rules (`legacy_offered_scopes`).
+        if allow
+            && !LEGACY_PERMISSION_SCOPES.contains(&scope)
+            && scope != super::types::PermissionAnswerScope::Always
+        {
             return Err(PermissionDeliveryError::ScopeUnsupported(scope));
         }
         let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq, session_grants) = {
@@ -9110,12 +9146,7 @@ impl ChatManager {
                     session_grants
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .grant_for(&super::session_grants::AskedCall {
-                            asker: super::session_grants::Asker::ClaudeCode,
-                            tool: c.tool.clone(),
-                            canonical: None,
-                            input: c.input.clone(),
-                        })
+                        .grant_for(&legacy_asked_call(c))
                 });
                 match grant {
                     Some(grant) => Some(grant),
@@ -9125,9 +9156,22 @@ impl ChatManager {
                     }
                 }
             }
+            // The lasting grant of the call (stricter than `session`), when this session
+            // keeps lasting rules; written once the CLI has the answer.
             (true, super::types::PermissionAnswerScope::Always) => {
-                restore_claim(claimed).await;
-                return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                let grant = claimed.as_ref().and_then(|c| {
+                    session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .lasting_grant_for(&legacy_asked_call(c))
+                });
+                match grant {
+                    Some(grant) => Some(grant),
+                    None => {
+                        restore_claim(claimed).await;
+                        return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                    }
+                }
             }
         };
         let original_input = claimed
@@ -9187,18 +9231,39 @@ impl ChatManager {
             )));
         }
         drop(answering);
-        if let Some(grant) = &grant {
-            session_grants
+        // Kept only now that the CLI has the answer. A lasting rule that cannot be written
+        // leaves the call granted for this session, and the decision says `session`.
+        let mut kept = scope;
+        match (&grant, &claimed, scope) {
+            (Some(grant), Some(c), super::types::PermissionAnswerScope::Always) => {
+                let place = {
+                    let mut grants = session_grants.lock().unwrap_or_else(|p| p.into_inner());
+                    grants.begin_lasting(grant.clone());
+                    grants.lasting_scope()
+                };
+                let written =
+                    super::lasting_rules::keep(place, &legacy_asked_call(c), grant, session_id)
+                        .await;
+                session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .end_lasting(grant, written);
+                if !written {
+                    kept = super::types::PermissionAnswerScope::Session;
+                }
+            }
+            (Some(grant), _, _) => session_grants
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .add(grant.clone());
+                .add(grant.clone()),
+            (None, _, _) => {}
         }
 
         // Persist and broadcast the permission decision so it survives session reload.
         let decision_event = ChatEvent::PermissionDecision {
             id: request_id.to_string(),
             allow,
-            scope: scope.lasting(allow),
+            scope: kept.lasting(allow),
             rule: grant
                 .as_ref()
                 .map(super::session_grants::SessionGrant::describe),
@@ -10608,7 +10673,11 @@ impl ChatManager {
                                     &session_node.cwd,
                                 ))),
                             ),
-                        ),
+                        )
+                        .with_lasting(self.lasting_scope(
+                            session_node.owner.as_deref(),
+                            session_node.project_slug.as_deref(),
+                        )),
                     )),
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -13938,6 +14007,7 @@ impl ChatManager {
             system_prompt,
             add_dirs,
             project_slug,
+            owner,
             relay,
             access,
         } = o;
@@ -14075,6 +14145,7 @@ impl ChatManager {
             host_missing,
             !per_session_mcp || without_mcp,
             project_dir,
+            self.lasting_scope(owner, project_slug),
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -14213,7 +14284,8 @@ impl ChatManager {
     /// a line in the server's log.
     /// `project_dir`: the session's project directory on THIS machine (`None` for a remote
     /// session), whose `.mcp.json` decides which read-only MCP declarations hold for it
-    /// (`session_grants::declarations_for_project`).
+    /// (`session_grants::declarations_for_project`). `lasting`: the person and project whose
+    /// lasting approvals the session keeps and obeys (`None`: `always` is not offered).
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -14226,6 +14298,7 @@ impl ChatManager {
         host_missing: Vec<String>,
         without_mcp: bool,
         project_dir: Option<std::path::PathBuf>,
+        lasting: Option<super::lasting_rules::LastingScope>,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
@@ -14264,10 +14337,13 @@ impl ChatManager {
                 tool_policy,
                 Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
                 host_missing,
-                super::session_grants::declarations_for_project(
-                    &self.config.read_only_mcp_tools,
-                    project_dir.as_deref(),
-                ),
+                super::session_grants::SessionGrants::declaring(
+                    super::session_grants::declarations_for_project(
+                        &self.config.read_only_mcp_tools,
+                        project_dir.as_deref(),
+                    ),
+                )
+                .with_lasting(lasting),
             )
             .await;
         // A failed turn is retried as the chat's configuration says, on both engines.
@@ -14697,6 +14773,7 @@ impl ChatManager {
             host_missing,
             !per_session_mcp || without_mcp,
             project_dir,
+            self.lasting_scope(node.owner.as_deref(), node.project_slug.as_deref()),
         )
         .await;
         let handle = self
@@ -15196,6 +15273,46 @@ fn provider_kind_name<K: serde::Serialize + ?Sized>(kind: &K) -> String {
 ///
 /// This is the pure-logic core extracted from the `handle_control_msg` closure inside
 /// `stream_response`.  Having it as a standalone function makes it directly testable
+/// The call a pending request of the CLI asks for, as the grants compare it.
+fn legacy_asked_call(pending: &PendingPermission) -> super::session_grants::AskedCall {
+    super::session_grants::AskedCall {
+        asker: super::session_grants::Asker::ClaudeCode,
+        tool: pending.tool.clone(),
+        canonical: None,
+        input: pending.input.clone(),
+    }
+}
+
+/// `system_init` of a legacy session, offering `always` when the session keeps lasting
+/// rules (`SessionGrants::keeps_lasting`): what [`ChatManager::deliver_permission_answer`]
+/// accepts. Any other event is returned as it is.
+fn offer_lasting_scope(
+    mut event: ChatEvent,
+    grants: &std::sync::Mutex<super::session_grants::SessionGrants>,
+) -> ChatEvent {
+    if let ChatEvent::SystemInit {
+        capabilities: Some(caps),
+        ..
+    } = &mut event
+    {
+        let keeps = grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keeps_lasting(super::session_grants::Asker::ClaudeCode);
+        if keeps {
+            if let Some(scopes) = caps
+                .get_mut("permission_scopes")
+                .and_then(|s| s.as_array_mut())
+            {
+                if !scopes.iter().any(|s| s == "always") {
+                    scopes.push(serde_json::json!("always"));
+                }
+            }
+        }
+    }
+    event
+}
+
 /// Store a pending permission input in the shared map.
 /// Extracted as a standalone async fn so that `tokio::select!` blocks don't
 /// struggle with type inference on `Arc<Mutex<HashMap>>` inline locks.
@@ -15234,11 +15351,7 @@ async fn answer_granted_request(
         canonical: None,
         input: input.clone(),
     };
-    let grant = grants
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .covering(&call)
-        .cloned()?;
+    let cover = super::session_grants::cover(grants, &call)?;
     let tx = stdin_tx?;
     let line = serde_json::json!({
         "type": "control_response",
@@ -15261,12 +15374,16 @@ async fn answer_granted_request(
         return None;
     }
     drop(answering);
-    info!(request_id = %id, rule = %grant.describe(), "permission covered by a session grant: answered by the backend");
+    info!(request_id = %id, rule = %cover.rule, lasting = cover.lasting, "permission covered by a grant: answered by the backend");
     Some(ChatEvent::PermissionDecision {
         id: id.to_string(),
         allow: true,
-        scope: Some(super::types::PermissionAnswerScope::Session),
-        rule: Some(grant.describe()),
+        scope: Some(if cover.lasting {
+            super::types::PermissionAnswerScope::Always
+        } else {
+            super::types::PermissionAnswerScope::Session
+        }),
+        rule: Some(cover.rule),
     })
 }
 
@@ -15510,6 +15627,7 @@ mod tests {
             server_port: 8080,
             session_token_expiry_secs: 86400,
             read_only_mcp_tools: Vec::new(),
+            lasting_rules_dir: None,
         }
     }
 
@@ -19321,6 +19439,7 @@ mod tests {
                 system_prompt: "p",
                 add_dirs: &[],
                 project_slug: None,
+                owner: None,
                 relay: None,
                 access: Default::default(),
             })
@@ -20022,6 +20141,7 @@ mod tests {
                 system_prompt: "p",
                 add_dirs: &[],
                 project_slug: Some("exits"),
+                owner: None,
                 relay: None,
                 access: Default::default(),
             })

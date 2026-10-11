@@ -128,6 +128,9 @@ sha2 = "0.11"
 base64 = "0.22"
 hmac = "0.13"
 hex = "0.4"
+# Lasting permission rules (chat::lasting_rules): a fresh O_EXCL temporary file renamed over
+# the rule file. Already a dev-dependency, same version.
+tempfile = "3.14"
 # Vault (src/vault): Argon2id derives a key from the user's passphrase,
 # XChaCha20-Poly1305 seals each secret, zeroize wipes keys from memory.
 argon2 = "0.5"

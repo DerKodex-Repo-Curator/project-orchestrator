@@ -235,39 +235,14 @@ const FUNCTIONS: &[(&str, &str)] = &[
 /// Every cell of the table that is not `ok`, declared. A gap measured and not
 /// listed here fails the test; an entry here that the scenario no longer
 /// measures fails it too (update this list and regenerate the table).
-const EXPECTED: &[(Engine, &str, Expect)] = &[
-    (
-        Engine::ClaudeCode,
-        "nexus_tools",
-        Expect::NotMeasured {
-            why: "Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue \
+const EXPECTED: &[(Engine, &str, Expect)] = &[(
+    Engine::ClaudeCode,
+    "nexus_tools",
+    Expect::NotMeasured {
+        why: "Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue \
                   un transcript et n'exécute aucun outil",
-        },
-    ),
-    (
-        Engine::ClaudeCode,
-        "permissions.always",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P11b",
-            why: "volontaire (sécurité) : aucune approbation durable tant que les règles ne sont \
-                  pas tenues par un comparateur strict du backend (revue P11 : une suggestion du \
-                  CLI réécrite vers localSettings pouvait y porter setMode / addDirectories) ; \
-                  always est refusé, typé",
-        },
-    ),
-    (
-        Engine::Native,
-        "permissions.always",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P11b",
-            why: "volontaire (sécurité) : aucune règle durable tant qu'elle n'est pas tenue par \
-                  un comparateur strict du backend (revue P11 : un préfixe Bash(cat *) dans la \
-                  liste allow de nexus autorisait cat x >> ~/.zshrc) ; always est refusé, typé",
-        },
-    ),
-];
+    },
+)];
 
 /// The verdicts of one engine, with what was seen (diagnostics, not in the table).
 #[derive(Default)]
@@ -687,6 +662,9 @@ impl Stage {
             // on its limit (auto-continue); every other turn answers within it.
             max_turns: 3,
             claude_cli_path: Some(cli.path()),
+            // The lasting approvals (`always`, P11b) of the data directory: they outlive a
+            // restart of the backend, as the graph does.
+            lasting_rules_dir: Some(self.data.path().join("permission-rules")),
             ..Default::default()
         };
         let state = mock_app_state();
@@ -1284,7 +1262,8 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
         result_ok("answered five"),
     ]);
     // TURN-PERM-S: `ls -la` granted for the session, then the identical call again
-    // (the backend answers it). TURN-PERM-A: an `always` (refused), then once.
+    // (the backend answers it). TURN-PERM-A: `cat README.md` approved `always`, then the
+    // identical call again (the backend answers it from the lasting rule).
     t.extend(vec![
         await_in(&k.k("TURN-PERM-S")),
         cc_tool_use("t5s", "Bash", json!({"command": "ls -la"})),
@@ -1298,10 +1277,24 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
         text("answered perm s"),
         result_ok("answered perm s"),
         await_in(&k.k("TURN-PERM-A")),
-        cc_tool_use("t5a", "Bash", json!({"command": "cargo fmt"})),
-        permission_request("req-perm-a", "Bash", json!({"command": "cargo fmt"}), "t5a"),
+        cc_tool_use("t5a", "Bash", json!({"command": "cat README.md"})),
+        permission_request(
+            "req-perm-a",
+            "Bash",
+            json!({"command": "cat README.md"}),
+            "t5a",
+        ),
         await_in("req-perm-a"),
-        cc_tool_result("t5a", "formatted", false),
+        cc_tool_result("t5a", "readme", false),
+        cc_tool_use("t5b", "Bash", json!({"command": "cat README.md"})),
+        permission_request(
+            "req-perm-b",
+            "Bash",
+            json!({"command": "cat README.md"}),
+            "t5b",
+        ),
+        await_in("req-perm-b"),
+        cc_tool_result("t5b", "readme", false),
         text("answered perm a"),
         result_ok("answered perm a"),
     ]);
@@ -1649,15 +1642,22 @@ fn native_script(k: Keys, cwd: &str) -> Value {
             json!({"file_path": format!("{cwd}/session-1.txt"), "content": "AGAIN-SESSION"}),
         ),
         says(&k.k("TURN-PERM3"), "answered perm3"),
-        // TURN-ALWAYS: another tool, `always` asked (refused), then once.
+        // TURN-ALWAYS: a read-only command approved `always`; TURN-ALWAYS2: the identical
+        // call again, answered by the backend from the lasting rule.
         calls(
             &k.k("TURN-ALWAYS"),
             "c5d",
-            &nexus("Edit"),
-            json!({"file_path": format!("{cwd}/always.txt"), "old_string": "ALWAYS-ONE",
-                   "new_string": "ALWAYS-EDITED"}),
+            &nexus("Bash"),
+            json!({"command": "cat always.txt"}),
         ),
         says(&k.k("TURN-ALWAYS"), "answered always"),
+        calls(
+            &k.k("TURN-ALWAYS2"),
+            "c5e",
+            &nexus("Bash"),
+            json!({"command": "cat always.txt"}),
+        ),
+        says(&k.k("TURN-ALWAYS2"), "answered always two"),
         // TURN-SIX: a tool that sleeps until cancelled; the model then answers.
         calls(&k.k("TURN-SIX"), "c6", &po("slow"), json!({})),
         says(&k.k("TURN-SIX"), "answered six"),
@@ -1816,6 +1816,77 @@ async fn cc_scoped(
     (routed.is_ok(), line)
 }
 
+/// The person both sessions of the scenario belong to (their lasting approvals are theirs).
+fn parity_person() -> crate::auth::jwt::Claims {
+    crate::auth::jwt::Claims {
+        sub: "parity-person".to_string(),
+        email: "parity@ffs.holdings".to_string(),
+        name: "Parity".to_string(),
+        iat: 0,
+        exp: i64::MAX / 2,
+        token_type: None,
+        scope: None,
+        jti: None,
+    }
+}
+
+/// Whether the lasting rules of [`parity_person`] on `proj` hold `rule` (what another
+/// session of theirs on the project obeys: the rules are read at each request).
+fn lasting_rules_of(manager: &ChatManager, rule: &str) -> bool {
+    manager.lasting_rule_store().is_some_and(|store| {
+        store
+            .rules(&parity_person().sub)
+            .iter()
+            .any(|r| r.project == "proj" && r.rule == rule && r.grant(&[]).is_some())
+    })
+}
+
+/// A Claude Code turn asking `req` then `again` (the identical call): `req` is answered
+/// with `scope`, `again` is left to the backend (answered `once` when it is still asked,
+/// to unblock the turn). Whether `req` was routed, and the line the CLI read for it.
+async fn cc_scoped_twice(
+    manager: &ChatManager,
+    w: &Watch,
+    cli: &FakeClaude,
+    key: String,
+    req: &'static str,
+    again: &'static str,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> (bool, String) {
+    let ends = w.turn_ends();
+    manager.send_message(&w.sid, &key).await.unwrap();
+    assert!(
+        w.wait(
+            WAIT,
+            |e| matches!(e, ChatEvent::PermissionRequest { id, .. } if id == req)
+        )
+        .await,
+        "the Claude Code engine did not show {req}"
+    );
+    let routed = manager
+        .route_permission_response(&w.sid, req, true, scope, false)
+        .await;
+    let once = crate::chat::types::PermissionAnswerScope::Once;
+    if routed.is_err() {
+        let _ = manager
+            .route_permission_response(&w.sid, req, true, once, false)
+            .await;
+    }
+    let line = cli.wait_line(0, req, WAIT).await.unwrap_or_default();
+    if cli
+        .wait_line(0, again, Duration::from_secs(3))
+        .await
+        .is_none()
+    {
+        // Not answered by the backend: the user unblocks it.
+        let _ = manager
+            .route_permission_response(&w.sid, again, true, once, false)
+            .await;
+    }
+    w.settle(ends, manager).await;
+    (routed.is_ok(), line)
+}
+
 /// A native turn whose tool (input holding `needle`) is asked and answered with `scope`:
 /// the request id, and whether the answer was accepted.
 async fn native_grant(
@@ -1940,6 +2011,8 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     let mut req = request(None, Some("proj"), "default");
     req.cwd = cwd.clone();
     req.message = format!("{}: where is the spec built?", kc.k("TURN-ONE"));
+    // A person's conversation: its lasting approvals are theirs (P11b).
+    req.user_claims = Some(parity_person());
     let sid = manager
         .create_session(&req)
         .await
@@ -2156,15 +2229,28 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     ))
     .await;
     cc_sent += 1;
-    let (routed_a, line_a) = Box::pin(cc_scoped(
+    let (routed_a, line_a) = Box::pin(cc_scoped_twice(
         &manager,
         &w,
         &cli,
         kc.k("TURN-PERM-A"),
         "req-perm-a",
+        "req-perm-b",
         crate::chat::types::PermissionAnswerScope::Always,
     ))
     .await;
+    let line_b = cli
+        .wait_line(0, "req-perm-b", WAIT)
+        .await
+        .unwrap_or_default();
+    let events = w.all().await;
+    let b_by_backend = events.iter().any(|e| {
+        matches!(e, ChatEvent::PermissionDecision { id, scope: Some(s), rule: Some(r), .. }
+            if id == "req-perm-b"
+                && *s == crate::chat::types::PermissionAnswerScope::Always
+                && r == "Bash: cat README.md")
+    });
+    let cc_kept = lasting_rules_of(&manager, "Bash: cat README.md");
     cc_sent += 1;
     let second = cli
         .wait_line(0, "req-perm-t", WAIT)
@@ -2185,11 +2271,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     );
     cc.check(
         "permissions.always",
-        routed_a,
+        routed_a && plain(&line_a) && plain(&line_b) && b_by_backend && cc_kept,
         Cause::Harness,
         format!(
-            "always accepté={routed_a}, réponse écrite : {}",
-            excerpt(&line_a)
+            "always accepté={routed_a}, réponse : {}, appel identique répondu par le backend \
+             (always)={b_by_backend} : {}, règle gardée pour la personne et le projet={cc_kept}",
+            excerpt(&line_a),
+            excerpt(&line_b)
         ),
     );
 
@@ -2517,7 +2605,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     // Claude Code → native: the conversation relayed (backend process #2)
     // ===================================================================
     let switched = manager
-        .switch_session_provider(&sid, "local", None, "SWITCH-ONE: continue here", None)
+        .switch_session_provider(
+            &sid,
+            "local",
+            None,
+            "SWITCH-ONE: continue here",
+            Some(parity_person()),
+        )
         .await
         .unwrap_or_else(|e| panic!("switching to the native instance: {e:#}"));
     let nid = switched.session_id.clone();
@@ -2763,7 +2857,8 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     wn.said(WAIT, "answered perm3").await;
     wn.settle(ends, &manager).await;
 
-    // `always`: not offered and refused on every engine in this lot (P11b).
+    // `always` (P11b): offered to a person's session on a project, kept by the BACKEND (the
+    // identical call is still asked by nexus, and answered from the lasting rule).
     let offers_always = match &wn.system_init().await {
         Some(ChatEvent::SystemInit { capabilities, .. }) => capabilities
             .as_ref()
@@ -2777,17 +2872,52 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         &wn,
         &fake,
         kn.k("TURN-ALWAYS"),
-        "ALWAYS-EDITED",
+        "cat always.txt",
         "answered always",
         crate::chat::types::PermissionAnswerScope::Always,
     ))
     .await;
     na_sent += 1;
+    let ends = wn.turn_ends();
+    manager
+        .send_message(&nid, &kn.k("TURN-ALWAYS2"))
+        .await
+        .unwrap();
+    na_sent += 1;
+    let ran_always = wait_body_nth(&fake, &kn.k("TURN-ALWAYS2"), 1, WAIT)
+        .await
+        .is_some();
+    let asked_always = wn.permission_ids("cat always.txt").await;
+    let events = wn.all().await;
+    let always_by_backend = asked_always.len() == 2
+        && events.iter().any(|e| {
+            matches!(e, ChatEvent::PermissionDecision { id, scope: Some(s), .. }
+                if *id == asked_always[1]
+                    && *s == crate::chat::types::PermissionAnswerScope::Always)
+        });
+    for id in asked_always.iter().skip(1).filter(|_| !always_by_backend) {
+        let _ = manager
+            .route_permission_response(
+                &nid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
+    wn.said(WAIT, "answered always two").await;
+    wn.settle(ends, &manager).await;
+    let na_kept = lasting_rules_of(&manager, "mcp__nexus__Bash: cat always.txt");
     na.check(
         "permissions.always",
-        offers_always && granted_always,
+        offers_always && granted_always && ran_always && always_by_backend && na_kept,
         Cause::Harness,
-        format!("portée offerte={offers_always}, accordée={granted_always}"),
+        format!(
+            "portée offerte={offers_always}, accordée={granted_always}, appel identique \
+             demandé par nexus et répondu par le backend (always)={always_by_backend}, règle \
+             gardée pour la personne et le projet={na_kept}"
+        ),
     );
 
     // cancel_tools.
@@ -3318,14 +3448,20 @@ fn an_undeclared_gap_turns_the_matrix_red() {
 
 #[test]
 fn a_declared_gap_fixed_silently_turns_the_matrix_red() {
+    // A gap declared (synthetic: none is left in EXPECTED) and measured ok.
+    let declared = |engine: Engine, function: &str| {
+        if engine == Engine::Native && function == "permissions.always" {
+            return Some(Expect::Gap {
+                cause: Cause::Harness,
+                task: "P0",
+                why: "synthetic",
+            });
+        }
+        expected(engine, function)
+    };
     let cc = as_declared(Engine::ClaudeCode);
-    let mut na = as_declared(Engine::Native);
-    na.rows
-        .iter_mut()
-        .find(|(f, _, _)| *f == "permissions.always")
-        .unwrap()
-        .1 = Verdict::Ok;
-    let problems = audit(&cc, &na, &expected);
+    let na = as_declared(Engine::Native);
+    let problems = audit(&cc, &na, &declared);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("no longer measured"), "{problems:?}");
 }

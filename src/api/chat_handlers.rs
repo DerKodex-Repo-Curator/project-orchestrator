@@ -899,6 +899,129 @@ pub struct SendMessageRequest {
     pub refs: Vec<serde_json::Value>,
 }
 
+/// The person a lasting-rule route serves: a signed-in PERSON with their own session
+/// token (P11b, "human routes only"). An agent session's token, an MCP token, the
+/// server's account and the anonymous user are refused: an agent never lists nor
+/// revokes the approvals of its person (it cannot add any either: a lasting rule only
+/// comes from that person answering a permission request of their own session).
+fn lasting_rules_person(
+    claims: &Option<axum::Extension<crate::auth::jwt::Claims>>,
+) -> Result<String, AppError> {
+    match claims {
+        Some(axum::Extension(c))
+            if c.is_human() && !c.is_service_account() && !c.sub.is_empty() =>
+        {
+            Ok(c.sub.clone())
+        }
+        Some(_) => Err(AppError::Forbidden(
+            "lasting permission rules are managed by their person only, signed in".to_string(),
+        )),
+        None => Err(AppError::Unauthorized(
+            "sign in to manage your lasting permission rules".to_string(),
+        )),
+    }
+}
+
+/// Query of `GET /api/chat/permission-rules`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionRulesQuery {
+    /// Only the rules of this project (slug).
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// One lasting rule as `GET /api/chat/permission-rules` lists it.
+#[derive(Debug, Serialize)]
+pub struct PermissionRuleView {
+    pub id: Uuid,
+    pub project: String,
+    /// The engine it holds on: `claude_code` (the Claude Code CLI) or `native`.
+    pub engine: String,
+    pub tool: String,
+    /// What it covers, as the decisions say it (`Bash: cat README.md`): the identical call.
+    pub rule: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub session_id: Option<String>,
+    /// Whether the backend's comparator still grants it (a rule edited by hand, or whose
+    /// read-only declaration was withdrawn, is listed but holds nothing).
+    pub holds: bool,
+}
+
+/// GET /api/chat/permission-rules[?project=<slug>]
+///
+/// The caller's lasting approvals (`always`, P11b), newest first. Human route only
+/// (a person signed in with their own session token).
+///
+/// - **200** `{ "enabled": bool, "rules": [PermissionRuleView] }` — `enabled: false` when
+///   this server keeps no lasting approval (`always` is then never offered).
+/// - **401** — not signed in. **403** — an agent's, an MCP or the server's token.
+pub async fn list_permission_rules(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    Query(query): Query<PermissionRulesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let person = lasting_rules_person(&claims)?;
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+    let Some(store) = chat_manager.lasting_rule_store() else {
+        return Ok(Json(serde_json::json!({ "enabled": false, "rules": [] })));
+    };
+    let declared = chat_manager.config.read_only_mcp_tools.clone();
+    let mut rules: Vec<PermissionRuleView> =
+        tokio::task::spawn_blocking(move || store.rules(&person))
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+            .into_iter()
+            .filter(|r| query.project.as_ref().is_none_or(|p| *p == r.project))
+            .map(|r| PermissionRuleView {
+                holds: r.grant(&declared).is_some(),
+                id: r.id,
+                project: r.project,
+                engine: r.asker,
+                tool: r.tool,
+                rule: r.rule,
+                created_at: r.created_at,
+                session_id: r.session_id,
+            })
+            .collect();
+    rules.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(Json(serde_json::json!({ "enabled": true, "rules": rules })))
+}
+
+/// DELETE /api/chat/permission-rules/{id}
+///
+/// Revokes one of the caller's lasting approvals: from the next request on, the call it
+/// covered is asked again, in every session (the rules are read at each request).
+///
+/// - **204** — revoked. **404** — no such rule of the caller (or none kept here).
+/// - **401** / **403** — as for the list.
+pub async fn revoke_permission_rule(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    Path(id): Path<Uuid>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let person = lasting_rules_person(&claims)?;
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+    let store = chat_manager
+        .lasting_rule_store()
+        .ok_or_else(|| AppError::NotFound(format!("no lasting permission rule {id}")))?;
+    let revoked = tokio::task::spawn_blocking(move || store.revoke(&person, id))
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    if revoked {
+        Ok(axum::http::StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!(
+            "no lasting permission rule {id}"
+        )))
+    }
+}
+
 const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; continue par un message \
      (POST .../messages)";
 
@@ -4151,11 +4274,21 @@ mod tests {
     }
 
     async fn action_harness_with(cli_path: Option<&str>, refs_v1: bool) -> ActionHarness {
+        action_harness_keeping(cli_path, refs_v1, None).await
+    }
+
+    /// [`action_harness_with`], the lasting approvals kept in `lasting_rules_dir`.
+    async fn action_harness_keeping(
+        cli_path: Option<&str>,
+        refs_v1: bool,
+        lasting_rules_dir: Option<std::path::PathBuf>,
+    ) -> ActionHarness {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let app_state = crate::test_helpers::mock_app_state_with_graph(mock.clone());
         let graph = app_state.neo4j.clone();
         let mut config = test_support::chat_config();
         config.claude_cli_path = cli_path.map(str::to_string);
+        config.lasting_rules_dir = lasting_rules_dir;
         let manager = Arc::new(
             ChatManager::new_without_memory(
                 app_state.neo4j.clone(),
@@ -4374,6 +4507,126 @@ mod tests {
         let reason = body["error"].as_str().unwrap();
         assert!(reason.contains("s'est arrêté"), "{reason}");
         assert!(reason.contains("continue par un message"), "{reason}");
+    }
+
+    /// P11b: a person lists and revokes THEIR lasting approvals, signed in; another person
+    /// sees none of them and cannot revoke them; an agent's token is refused.
+    #[tokio::test]
+    async fn a_person_lists_and_revokes_only_their_own_lasting_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rules");
+        let h = action_harness_keeping(None, true, Some(root.clone())).await;
+        let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let store = crate::chat::lasting_rules::LastingRuleStore::new(root);
+        let place = crate::chat::lasting_rules::LastingScope::of_session(
+            Some(&store),
+            Some(&alice.to_string()),
+            Some("proj"),
+        )
+        .unwrap();
+        let asked = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::ClaudeCode,
+            tool: "Bash".into(),
+            canonical: None,
+            input: serde_json::json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&asked).unwrap();
+        let rule = place.keep(&asked, &grant, "s1").unwrap();
+
+        let as_person = |method: &str, uri: String, person: Uuid| {
+            let token = crate::auth::jwt::encode_jwt(
+                person,
+                "someone@ffs.holdings",
+                "Someone",
+                "test-secret-key-minimum-32-chars!!",
+                28800,
+            )
+            .unwrap();
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let list = "/api/chat/permission-rules".to_string();
+        let (status, body) = call(&h.app, as_person("GET", list.clone(), alice)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["rules"][0]["rule"], "Bash: cat README.md", "{body}");
+        assert_eq!(body["rules"][0]["engine"], "claude_code", "{body}");
+        assert_eq!(body["rules"][0]["holds"], true, "{body}");
+        let (_, body) = call(
+            &h.app,
+            as_person("GET", format!("{list}?project=other"), alice),
+        )
+        .await;
+        assert_eq!(body["rules"], serde_json::json!([]), "{body}");
+        // Bob sees nothing of Alice's, and cannot revoke her rule.
+        let (_, body) = call(&h.app, as_person("GET", list.clone(), bob)).await;
+        assert_eq!(body["rules"], serde_json::json!([]), "{body}");
+        let revoke = format!("/api/chat/permission-rules/{}", rule.id);
+        let (status, _) = call(&h.app, as_person("DELETE", revoke.clone(), bob)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(store.rules(&alice.to_string()).len(), 1);
+        // Alice revokes it: gone, and a second revoke is 404.
+        let (status, _) = call(&h.app, as_person("DELETE", revoke.clone(), alice)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(store.rules(&alice.to_string()).is_empty());
+        let (status, _) = call(&h.app, as_person("DELETE", revoke, alice)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Not signed in: 401.
+        let anonymous = Request::builder()
+            .method("GET")
+            .uri(list)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(&h.app, anonymous).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// An agent's token, an MCP token, the server's account, the anonymous user: never
+    /// a person managing lasting approvals.
+    #[test]
+    fn only_a_person_signed_in_manages_lasting_rules() {
+        use crate::auth::jwt::Claims;
+        let person = Claims {
+            sub: Uuid::new_v4().to_string(),
+            email: "a@ffs.holdings".into(),
+            name: "A".into(),
+            iat: 0,
+            exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
+        };
+        let ext = |c: Claims| Some(axum::Extension(c));
+        assert_eq!(
+            lasting_rules_person(&ext(person.clone())).unwrap(),
+            person.sub
+        );
+        for kind in ["agent_session", "mcp", "vault"] {
+            let c = Claims {
+                token_type: Some(kind.into()),
+                ..person.clone()
+            };
+            assert!(
+                matches!(lasting_rules_person(&ext(c)), Err(AppError::Forbidden(_))),
+                "{kind}"
+            );
+        }
+        assert!(matches!(
+            lasting_rules_person(&ext(Claims::service_account("po"))),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            lasting_rules_person(&ext(Claims::anonymous())),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            lasting_rules_person(&None),
+            Err(AppError::Unauthorized(_))
+        ));
     }
 
     /// Review #679 finding 6: a person answers only the permission requests of THEIR
