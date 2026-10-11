@@ -274,7 +274,7 @@ async fn report_from(
     let prices = PoolPrices(match chat_manager {
         Some(manager) => {
             manager
-                .routing_pool_for(query.project_slug.as_deref())
+                .routing_pool_known(query.project_slug.as_deref())
                 .await
         }
         None => Vec::new(),
