@@ -321,12 +321,18 @@ pub enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// The outcome of a probe that returned `error`. A request refusal is final unless it
-    /// is a timeout (408); a rate limit (429) has its own variant and is retried.
+    /// The outcome of a probe that returned `error`. Only a refusal about the MODEL is
+    /// final: 400, 404, 422 (nexus spells them `HTTP <status>: …` in `InvalidRequest`).
+    /// Every other status nexus also files under `InvalidRequest` (402 out of credit, 408,
+    /// 409, 410, …) says nothing final about the model and is retried with backoff, like
+    /// 401, 429, 5xx and network errors (review of #709, N1).
     pub fn of_error(error: &nexus_claude::agent::ProviderError) -> Self {
         use nexus_claude::agent::ProviderError;
+        const FINAL: [&str; 3] = ["HTTP 400", "HTTP 404", "HTTP 422"];
         match error {
-            ProviderError::InvalidRequest { detail } if !detail.starts_with("HTTP 408") => {
+            ProviderError::InvalidRequest { detail }
+                if FINAL.iter().any(|status| detail.starts_with(status)) =>
+            {
                 Self::Unusable
             }
             _ => Self::Failed,
@@ -528,6 +534,24 @@ pub fn probing(
 ) -> bool {
     log.iter()
         .any(|((id, _), mark)| id == instance && running(mark, now, policy))
+}
+
+/// Records the models of `instance` the catalogue itself lists without tools as answered
+/// (`Concluded`), so that no path reserves them (the pool's and the background probes of
+/// a routed conversation alike; review of #709, N2). A running probe is left alone.
+pub fn mark_listed_without_tools<'a>(
+    log: &mut ProbeLog,
+    instance: &str,
+    models: impl IntoIterator<Item = &'a String>,
+) {
+    for model in models {
+        let entry = log
+            .entry((instance.to_owned(), model.clone()))
+            .or_insert(ProbeMark::Concluded);
+        if !matches!(entry, ProbeMark::InFlight { .. }) {
+            *entry = ProbeMark::Concluded;
+        }
+    }
 }
 
 /// Forgets every probe of `instance`: its provider was rebuilt (the stored record
@@ -1067,6 +1091,22 @@ mod tests {
             ProbeOutcome::of_error(&refused("HTTP 408: request timeout")),
             ProbeOutcome::Failed
         );
+        // N1: an account out of credit is not a verdict on the model.
+        for status in [
+            "HTTP 402: insufficient credits",
+            "HTTP 409: conflict",
+            "HTTP 410: gone",
+        ] {
+            assert_eq!(
+                ProbeOutcome::of_error(&refused(status)),
+                ProbeOutcome::Failed,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            ProbeOutcome::of_error(&refused("HTTP 422: unprocessable model")),
+            ProbeOutcome::Unusable
+        );
         for transient in [
             ProviderError::RateLimited {
                 retry_after_ms: None,
@@ -1077,6 +1117,38 @@ mod tests {
         ] {
             assert_eq!(ProbeOutcome::of_error(&transient), ProbeOutcome::Failed);
         }
+    }
+
+    /// Review of #709 (N2): a model the catalogue lists without tools is never reserved,
+    /// by any path.
+    #[test]
+    fn a_model_the_catalogue_lists_without_tools_is_never_reserved() {
+        let policy = ProbePolicy::standard();
+        let mut log = ProbeLog::new();
+        let t0 = std::time::Instant::now();
+        let listed = models(&["plain"]);
+        mark_listed_without_tools(&mut log, "i", &listed);
+        assert_eq!(
+            names(&reserve_probes(
+                &mut log,
+                "i",
+                models(&["plain", "m"]),
+                t0,
+                &policy
+            )),
+            ["m"]
+        );
+        // Even after a failure would have been retried.
+        let later = t0 + policy.max_backoff;
+        assert!(reserve_probes(&mut log, "i", listed.clone(), later, &policy).is_empty());
+        // A probe already running keeps its reservation (its own outcome records).
+        let mut running = ProbeLog::new();
+        let r = reserve_probes(&mut running, "i", listed.clone(), t0, &policy);
+        mark_listed_without_tools(&mut running, "i", &listed);
+        assert!(matches!(
+            running[&("i".to_owned(), "plain".to_owned())],
+            ProbeMark::InFlight { ticket, .. } if ticket == r[0].ticket
+        ));
     }
 
     #[test]

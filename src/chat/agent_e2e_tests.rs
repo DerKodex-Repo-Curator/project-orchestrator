@@ -1270,11 +1270,16 @@ mod cognitive_routing {
 
     /// `script` with `model` listed and refused by the endpoint itself (a 404, like an
     /// embeddings model behind `/chat/completions`).
-    fn refusing(mut script: Value, model: &str) -> Value {
+    fn refusing(script: Value, model: &str) -> Value {
+        refusing_with(script, model, 404)
+    }
+
+    /// `script` with `model` listed and every probe of it answered `status`.
+    fn refusing_with(mut script: Value, model: &str, status: u16) -> Value {
         let routes = script.as_array_mut().unwrap();
         routes.insert(
             0,
-            json!({"method": "POST", "path": "/v1/chat/completions", "status": 404,
+            json!({"method": "POST", "path": "/v1/chat/completions", "status": status,
                 "body_contains": format!("\"model\":\"{model}\""),
                 "body": {"error": {"message": format!("{model} is not a chat model")}}}),
         );
@@ -1561,6 +1566,34 @@ mod cognitive_routing {
             s.manager.routing_pool_for(Some("proj")).await;
         }
         assert_eq!(asked(&s), first, "{:?}", probes_sent(&s));
+    }
+
+    /// Review of #709 (N1): an account out of credit (402) says nothing final about the
+    /// model: its probe is retried after the backoff (zero here), not marked unusable.
+    #[tokio::test]
+    async fn an_account_out_of_credit_is_retried_not_marked_unusable() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let policy = ProbePolicy {
+            per_instance: 1,
+            retry_after: Duration::ZERO,
+            ..ProbePolicy::standard()
+        };
+        let s = unwarmed(
+            refusing_with(catalogue_script(&["m"], &[]), "pay", 402),
+            "full",
+            "auto",
+            policy,
+        )
+        .await;
+        let asked = |s: &Setup| probes_sent(s).iter().filter(|m| *m == "pay").count();
+        // m first, then pay.
+        for _ in 0..2 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        let first = asked(&s);
+        assert!(first >= 1, "{:?}", probes_sent(&s));
+        s.manager.routing_pool_for(Some("proj")).await;
+        assert!(asked(&s) > first, "retried: {:?}", probes_sent(&s));
     }
 
     /// Review of #709 (C4a): a conversation in Auto under `primary` + `shadow` has every

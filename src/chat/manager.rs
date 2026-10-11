@@ -12440,6 +12440,15 @@ impl ChatManager {
                 .filter(|m| m.supports_tools == Some(false))
                 .map(|m| m.id.clone())
                 .collect();
+            // Answered by the catalogue: no path (this pool, a routed conversation's
+            // background probes) may reserve them (review of #709, N2).
+            if id != resolver::CLAUDE_CODE && !no_tools_listed.is_empty() {
+                super::provider::cognitive::decider::mark_listed_without_tools(
+                    &mut routing.probed.lock().unwrap_or_else(|e| e.into_inner()),
+                    &id,
+                    &no_tools_listed,
+                );
+            }
             let mut entries: Vec<(String, Option<nexus_claude::agent::ModelPrice>)> =
                 models.into_iter().map(|m| (m.id, m.pricing)).collect();
             if let Some(model) = &default_model {
