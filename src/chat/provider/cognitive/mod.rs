@@ -1,7 +1,7 @@
 //! Cognitive routing (RFC v2, decision R2): PO choosing the provider and model
 //! itself, progressively, instead of asking the user to know every instance.
 //!
-//! This slice holds the SETTINGS only: the routing mode (`primary | mixed |
+//! This slice holds the SETTINGS only: the routing mode (`primary | executors_only |
 //! full`), the learning stage (`shadow | advisory | auto`) and the knobs of the
 //! future scorer, stored globally with a per-project override. No decision is
 //! taken here yet; the signature, candidates, scorer and decision log come in
@@ -22,8 +22,8 @@ pub(crate) mod wiring;
 
 pub use mode::{
     conversation_routes, conversation_stage, effective_routing, parse_routing_settings,
-    validate_routing_settings, EffectiveRouting, LearningStage, ProviderRoutingMode, RoutingError,
-    RoutingScope, RoutingSettings, ROUTING_KEY,
+    validate_routing_settings, ConversationRoutingMode, EffectiveRouting, LearningStage,
+    ProviderRoutingMode, RoutingError, RoutingScope, RoutingSettings, ROUTING_KEY,
 };
 
 use crate::chat::provider::settings::{project_scope, GLOBAL};
@@ -82,7 +82,8 @@ mod tests {
             .await
             .unwrap();
         let (s, scope) = load_routing(&graph, Some("p")).await.unwrap();
-        assert_eq!(s.mode, ProviderRoutingMode::Mixed);
+        // Stored before R-S4: the old name of `executors_only`, read as is (no migration).
+        assert_eq!(s.mode, ProviderRoutingMode::ExecutorsOnly);
         assert_eq!(s.stage, LearningStage::Shadow, "absent field = default");
         assert_eq!(scope, RoutingScope::Global);
 

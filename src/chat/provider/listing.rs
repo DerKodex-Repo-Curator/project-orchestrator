@@ -188,7 +188,8 @@ pub struct RemoteEntry {
 /// interface knows who chooses before any session exists.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RoutingSummary {
-    /// `primary | mixed | full`.
+    /// `primary | executors_only | full` (the settings; a conversation's own choice is
+    /// [`super::cognitive::ConversationRoutingMode`]).
     pub mode: ProviderRoutingMode,
     /// `shadow | advisory | auto`.
     pub stage: LearningStage,
@@ -374,7 +375,7 @@ mod tests {
         let v = serde_json::to_value(&l).unwrap();
         assert!(v.get("routing").is_none(), "additive: absent until filled");
         let settings = RoutingSettings {
-            mode: ProviderRoutingMode::Mixed,
+            mode: ProviderRoutingMode::ExecutorsOnly,
             stage: LearningStage::Advisory,
             ..Default::default()
         };
@@ -382,7 +383,7 @@ mod tests {
         let v = serde_json::to_value(&l).unwrap();
         assert_eq!(
             v["routing"],
-            serde_json::json!({"mode": "mixed", "stage": "advisory", "scope": "project"})
+            serde_json::json!({"mode": "executors_only", "stage": "advisory", "scope": "project"})
         );
         assert_eq!(
             RoutingSummary::new(&RoutingSettings::default(), RoutingScope::Default),
@@ -447,16 +448,25 @@ mod tests {
         produced.sort_unstable();
         assert_eq!(documented, produced, "routed_by enum of the contract");
 
-        let modes: Vec<&str> = contract["rest"]["ChatSession"]["routing_mode"]["enum"]
-            .as_array()
-            .expect("ChatSession.routing_mode.enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        // Decision R-S4: a conversation's mode (`mixed` = among its pool) and the settings'
+        // mode (`executors_only`) are named apart in the contract too.
+        for dto in ["ChatSession", "CreateSessionRequest"] {
+            let modes: Vec<&str> = contract["rest"][dto]["routing_mode"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{dto}.routing_mode.enum"))
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                modes,
+                super::super::cognitive::ConversationRoutingMode::ALL.map(|m| m.as_str()),
+                "{dto}.routing_mode enum of the contract"
+            );
+        }
         assert_eq!(
-            modes,
-            ProviderRoutingMode::ALL.map(|m| m.as_str()),
-            "routing_mode enum of the contract"
+            contract["rest"]["GET /api/chat/providers"]["response"]["routing"]["mode"],
+            ProviderRoutingMode::ALL.map(|m| m.as_str()).join(" | "),
+            "the settings' mode in the contract"
         );
         assert_eq!(
             contract["rest"]["ChatSession"]["route_reason"]["type"],

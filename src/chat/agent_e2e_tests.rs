@@ -1207,7 +1207,7 @@ mod cognitive_routing {
     #[tokio::test]
     async fn an_unprobed_instance_is_probed_before_the_first_decision_and_the_decision_names_its_session(
     ) {
-        let s = setup_with("mixed", "auto", true, false).await;
+        let s = setup_with("executors_only", "auto", true, false).await;
         let session = Uuid::new_v4();
         let choice = s
             .manager
@@ -1363,7 +1363,7 @@ mod cognitive_routing {
         use crate::chat::provider::cognitive::decider::ProbePolicy;
         let s = unwarmed(
             catalogue_script(&["m", "other"], &[]),
-            "mixed",
+            "executors_only",
             "auto",
             ProbePolicy::standard(),
         )
@@ -1609,7 +1609,7 @@ mod cognitive_routing {
         )
         .await;
         let mut auto = pilot_request();
-        auto.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Full);
+        auto.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
         s.manager
             .resolve_provider_choice_for(&auto, Some("proj"), None)
             .await
@@ -1659,7 +1659,7 @@ mod cognitive_routing {
     async fn the_models_ticked_are_the_only_candidates_when_a_conversation_opens() {
         let s = setup("full", "auto", true).await;
         let mut r = pilot_request();
-        r.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Mixed);
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
         r.routing_pool = pool_of(&[("local", "not-m"), ("local", "other")]);
         let c = choose(&s, &r).await;
         assert_eq!(
@@ -1674,7 +1674,7 @@ mod cognitive_routing {
     async fn a_pool_is_routed_at_open_even_when_the_settings_say_primary() {
         let s = setup("primary", "auto", true).await;
         let mut r = pilot_request();
-        r.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Mixed);
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
         r.routing_pool = pool_of(&[("local", "m"), ("claude-code", "x")]);
         let c = choose(&s, &r).await;
         assert_eq!(c.routed_by, RoutedBy::Auto);
@@ -1684,12 +1684,53 @@ mod cognitive_routing {
         );
     }
 
+    /// R-S4: the menu sends its "pilot" (provider + model) WITH the pool. The opening is
+    /// still a decision among the pool (`routed_by: auto`): the pilot is no explicit choice.
+    /// Before R-S4 the pilot made the request `named` and opened the conversation itself.
+    #[tokio::test]
+    async fn the_opening_of_a_pool_is_decided_among_it_whatever_pilot_the_menu_names() {
+        let s = setup("primary", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("local", "m"), ("claude-code", "x")]);
+        r.provider = Some("claude-code".into());
+        r.model = Some("x".into());
+        let c = choose(&s, &r).await;
+        assert_eq!(c.routed_by, RoutedBy::Auto, "{c:?}");
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("local", Some("m"))
+        );
+        let opening = decisions(&s).await.remove(0);
+        assert!(opening.applied, "{opening:?}");
+        assert_eq!(opening.chosen.map(|p| p.model).as_deref(), Some("m"));
+    }
+
+    /// R-S4: when no decision among the pool applies, the menu's pilot opens the
+    /// conversation (its provider AND its model), never a default nobody ticked.
+    #[tokio::test]
+    async fn the_menus_pilot_opens_a_pool_only_when_no_decision_applies() {
+        let s = setup("full", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        // Neither ticked model is offered by the instance: nothing to decide among.
+        r.routing_pool = pool_of(&[("local", "not-m"), ("local", "other")]);
+        r.provider = Some("local".into());
+        r.model = Some("other".into());
+        let c = choose(&s, &r).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("local", Some("other"), RoutedBy::Request),
+            "the pilot is the fallback"
+        );
+    }
+
     /// Auto in the chat menu (`routing_mode: full`) routes the opening too, whatever the settings.
     #[tokio::test]
     async fn auto_in_the_request_routes_the_opening_even_when_the_settings_say_primary() {
         let s = setup("primary", "auto", true).await;
         let mut r = pilot_request();
-        r.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Full);
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
         assert_eq!(choose(&s, &r).await.routed_by, RoutedBy::Auto);
     }
 
@@ -1786,8 +1827,8 @@ mod cognitive_routing {
     }
 
     #[tokio::test]
-    async fn mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
-        let s = setup("mixed", "auto", true).await;
+    async fn executors_only_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
+        let s = setup("executors_only", "auto", true).await;
         let executor = choose(&s, &executor_request()).await;
         assert_eq!(executor.provider_id, "local");
         assert_eq!(executor.model.as_deref(), Some("m"));
@@ -1935,7 +1976,7 @@ mod cognitive_routing {
 
     #[tokio::test]
     async fn the_shadow_stage_applies_nothing_in_any_mode() {
-        for mode in ["primary", "mixed", "full"] {
+        for mode in ["primary", "executors_only", "full"] {
             let s = setup(mode, "shadow", true).await;
             for r in [pilot_request(), executor_request()] {
                 let c = choose(&s, &r).await;
@@ -2099,7 +2140,9 @@ mod turn_routing {
     use crate::chat::provider::cognitive::decision::{
         CognitiveDecision, DecideRequest, Decider, Pick,
     };
-    use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, ROUTING_KEY};
+    use crate::chat::provider::cognitive::{
+        ConversationRoutingMode, LearningStage, ProviderRoutingMode, ROUTING_KEY,
+    };
 
     /// The scripted provider under the id (and kind) of Claude Code, so the
     /// engine hands it the graph hooks.
@@ -2430,8 +2473,9 @@ mod turn_routing {
     }
 
     #[tokio::test]
-    async fn mixed_and_primary_modes_leave_the_pilot_alone() {
-        for mode in ["mixed", "primary"] {
+    async fn executors_only_and_primary_modes_leave_the_pilot_alone() {
+        // `mixed` is the old name of `executors_only` in a stored document: same reading.
+        for mode in ["executors_only", "mixed", "primary"] {
             let mut r = rig(mode, "auto", true, None, vec![Answer::Pick("big")]).await;
             assert!(r.turn(DEBUG).await.is_empty(), "{mode}");
             assert_eq!(r.decider.calls(), 0, "{mode}");
@@ -2560,14 +2604,14 @@ mod turn_routing {
     /// Opens a router the way a conversation does, with the mode its request named.
     async fn reopen_with_mode(
         r: &Rig,
-        mode: Option<ProviderRoutingMode>,
+        mode: Option<ConversationRoutingMode>,
     ) -> Arc<crate::chat::agent_hooks::TurnRouter> {
         reopen_with_pool(r, mode, None).await
     }
 
     async fn reopen_with_pool(
         r: &Rig,
-        mode: Option<ProviderRoutingMode>,
+        mode: Option<ConversationRoutingMode>,
         pool: Option<&[&str]>,
     ) -> Arc<crate::chat::agent_hooks::TurnRouter> {
         use crate::chat::manager::OpeningTurn;
@@ -2606,7 +2650,7 @@ mod turn_routing {
     #[tokio::test]
     async fn a_conversation_opened_in_strict_is_never_routed_even_when_the_settings_say_full() {
         let r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
-        reopen_with_mode(&r, Some(ProviderRoutingMode::Primary)).await;
+        reopen_with_mode(&r, Some(ConversationRoutingMode::Primary)).await;
         r.manager.apply_turn_directive(&r.sid, DEBUG).await;
         assert_eq!(r.decider.calls(), 0, "strict: PO is not even asked");
     }
@@ -2614,7 +2658,7 @@ mod turn_routing {
     #[tokio::test]
     async fn a_conversation_opened_in_auto_is_routed_even_when_the_settings_say_primary() {
         let r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
-        reopen_with_mode(&r, Some(ProviderRoutingMode::Full)).await;
+        reopen_with_mode(&r, Some(ConversationRoutingMode::Full)).await;
         r.manager.apply_turn_directive(&r.sid, DEBUG).await;
         assert_eq!(
             r.decider.calls(),
@@ -2629,7 +2673,7 @@ mod turn_routing {
         // Two ticks ("medium" is not offered by this provider): one alone would be strict.
         reopen_with_pool(
             &r,
-            Some(ProviderRoutingMode::Mixed),
+            Some(ConversationRoutingMode::Mixed),
             Some(&["big", "medium"]),
         )
         .await;
@@ -2662,7 +2706,7 @@ mod turn_routing {
                 OpeningTurn {
                     provider_imposed: false,
                     moved_in: false,
-                    routing_mode: Some(ProviderRoutingMode::Mixed),
+                    routing_mode: Some(ConversationRoutingMode::Mixed),
                     routing_pool: Some(vec![
                         crate::chat::types::RoutingPoolEntry {
                             provider: "claude-code".to_owned(),
@@ -2906,7 +2950,7 @@ mod turn_routing {
     #[tokio::test]
     async fn one_model_ticked_at_open_is_strict() {
         let mut req = request(None, None, "default");
-        req.routing_mode = Some(ProviderRoutingMode::Mixed);
+        req.routing_mode = Some(ConversationRoutingMode::Mixed);
         req.routing_pool = Some(vec![crate::chat::types::RoutingPoolEntry {
             provider: "claude-code".into(),
             model: "small".into(),
@@ -2914,7 +2958,7 @@ mod turn_routing {
         let settled = req.settled_routing().expect("a pool of one is settled");
         assert_eq!(settled.provider.as_deref(), Some("claude-code"));
         assert_eq!(settled.model.as_deref(), Some("small"));
-        assert_eq!(settled.routing_mode, Some(ProviderRoutingMode::Primary));
+        assert_eq!(settled.routing_mode, Some(ConversationRoutingMode::Primary));
         assert_eq!(settled.routing_pool, None);
         req.routing_pool = Some(Vec::new());
         assert_eq!(req.settled_routing().unwrap().routing_pool, None);

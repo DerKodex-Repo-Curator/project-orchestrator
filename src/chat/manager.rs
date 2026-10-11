@@ -669,7 +669,7 @@ pub(crate) struct OpeningTurn<'a> {
     /// model was chosen by the router, not imposed, and its next turn does not move again.
     pub moved_in: bool,
     /// The mode the request asked for; it replaces the one of the settings for this conversation.
-    pub routing_mode: Option<super::provider::cognitive::ProviderRoutingMode>,
+    pub routing_mode: Option<super::provider::cognitive::ConversationRoutingMode>,
     /// The pairs the request restricted routing to (`mixed`).
     pub routing_pool: Option<Vec<super::types::RoutingPoolEntry>>,
     pub permission_mode: Option<&'a str>,
@@ -3091,7 +3091,7 @@ impl ChatManager {
         {
             Ok((mut settings, _)) => {
                 if let Some(mode) = turn.routing_mode {
-                    settings.mode = mode;
+                    settings.mode = mode.pilot_mode();
                 }
                 settings
             }
@@ -5818,7 +5818,15 @@ impl ChatManager {
         let provider_choice = self
             .resolve_provider_choice_for(request, project_slug.as_deref(), Some(session_id))
             .await?;
-        let model = match request.model.as_deref().filter(|m| !m.is_empty()) {
+        // A conversation routed among its pool opens on the model PO chose among it; the
+        // pilot the menu names is only the fallback when no decision applied (R-S4).
+        let decided_among_pool = request.routes_among_pool()
+            && provider_choice.routed_by == super::provider::resolver::RoutedBy::Auto;
+        let model = match request
+            .model
+            .as_deref()
+            .filter(|m| !m.is_empty() && !decided_among_pool)
+        {
             Some(explicit) => explicit.to_string(),
             None => match provider_choice.model.as_deref() {
                 Some(chosen) => chosen.to_string(),
@@ -9709,7 +9717,7 @@ impl ChatManager {
         session_id: &str,
         body: &super::types::SessionRoutingRequest,
     ) -> Result<ChatSessionNode> {
-        use super::provider::cognitive::ProviderRoutingMode as Mode;
+        use super::provider::cognitive::ConversationRoutingMode as Mode;
         use super::types::SessionRoutingError as Refused;
         let uuid =
             Uuid::parse_str(session_id).map_err(|_| anyhow::Error::new(Refused::NotFound))?;
@@ -12564,6 +12572,22 @@ impl ChatManager {
                 pick.provider_id.clone(),
                 Some(pick.model.clone()),
             ));
+            // A pool of two models or more: the provider the menu names is its pilot, which
+            // only opens the conversation when no decision applies (R-S4). One applied: the
+            // decision among the pool opens it.
+            if request.routes_among_pool() {
+                input.request = None;
+            }
+        }
+        // A pool and no applied pick among it: the menu's pilot opens the conversation, its
+        // model with its provider (R-S4: the fallback, as the decision did not apply).
+        if auto_pick.is_none() && request.routes_among_pool() {
+            if let (Some(provider), Some(model)) = (
+                input.request.as_ref().map(|c| c.provider_id.clone()),
+                request.model.as_deref().filter(|m| !m.is_empty()),
+            ) {
+                input.request = Some(resolver::Candidate::new(provider, Some(model.to_owned())));
+            }
         }
         // Models ticked, none named and no applied pick among them: the first ticked model
         // opens the conversation, never a default the user did not tick.
@@ -13148,9 +13172,14 @@ impl ChatManager {
             ),
         };
         routing.set_hints(PriorHints::from_aliases(aliases));
-        // A provider, model, alias or run the caller named is never substituted.
-        let named = request.provider.is_some()
-            || request.model.as_deref().is_some_and(|m| !m.is_empty())
+        // A provider, model, alias or run the caller named is never substituted. The
+        // provider and model the menu names WITH a pool of two models or more are its pilot,
+        // not a choice: the opening is decided among the pool (decision R-S4), the pilot is
+        // only the fallback when that decision does not apply.
+        let pilot_only = request.routes_among_pool();
+        let pilot_named = request.provider.is_some()
+            || request.model.as_deref().is_some_and(|m| !m.is_empty());
+        let named = (!pilot_only && pilot_named)
             || request.task_alias.is_some()
             || request.persona_alias.is_some()
             || request.run_provider.is_some();
@@ -13166,7 +13195,7 @@ impl ChatManager {
             ),
         );
         if let Some(mode) = request.routing_mode {
-            settings.mode = mode;
+            settings.mode = mode.pilot_mode();
         }
         let ticked = Self::routing_pool_of(request);
         // The models ticked in the menu are routed like `full` inside them, whatever the

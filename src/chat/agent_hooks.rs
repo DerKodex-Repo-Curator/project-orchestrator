@@ -68,7 +68,8 @@ use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
 use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
 use super::provider::cognitive::{
-    conversation_stage, LearningStage, ProviderRoutingMode, RoutingSettings,
+    conversation_stage, ConversationRoutingMode, LearningStage, ProviderRoutingMode,
+    RoutingSettings,
 };
 use super::types::{EffectiveCapability, EffectiveCause, EffectiveSource, RoutingPoolEntry};
 
@@ -510,12 +511,12 @@ impl TurnRouter {
     /// other choices never move the conversation).
     pub(crate) fn reroute(
         &self,
-        mode: ProviderRoutingMode,
+        mode: ConversationRoutingMode,
         allowed_models: Option<Vec<String>>,
         explicit_model: bool,
     ) {
         let mut choice = locked(&self.choice);
-        choice.routing.mode = mode;
+        choice.routing.mode = mode.pilot_mode();
         choice.allowed_models = allowed_models;
         choice.explicit_model = explicit_model;
         choice.provider_imposed = false;
@@ -523,7 +524,7 @@ impl TurnRouter {
         // Auto, or a pool (`allowed_models` is only given for two models or more): the
         // user's choice, applied at the `auto` stage (decision R-S1).
         let conversation_routes =
-            mode == ProviderRoutingMode::Full || choice.allowed_models.is_some();
+            mode == ConversationRoutingMode::Full || choice.allowed_models.is_some();
         choice.routing.stage = conversation_stage(choice.settings_stage, conversation_routes);
         self.manual.store(false, Ordering::SeqCst);
     }
@@ -1773,7 +1774,7 @@ mod provider_move_tests {
         let mut s = spec(
             decider.clone(),
             Arc::new(ThreeProviders),
-            ProviderRoutingMode::Mixed,
+            ConversationRoutingMode::Mixed.pilot_mode(),
             LearningStage::Auto,
         );
         s.allowed_models = Some(vec!["m".into()]);
@@ -1815,7 +1816,7 @@ mod provider_move_tests {
             "an imposed pair is not even asked about"
         );
         // `PUT .../routing {auto: true}`: PO chooses the provider again.
-        named.reroute(ProviderRoutingMode::Full, None, false);
+        named.reroute(ConversationRoutingMode::Full, None, false);
         assert!(is_move_to(&plan_provider_move(&named).await, "local2"));
     }
 
@@ -2105,7 +2106,7 @@ mod provider_move_tests {
         assert_eq!(decider.last().settings.stage, LearningStage::Auto);
 
         // One model ticked: strict, nothing is asked any more, the settings' stage is back.
-        router.reroute(ProviderRoutingMode::Primary, None, true);
+        router.reroute(ConversationRoutingMode::Primary, None, true);
         assert_eq!(locked(&router.choice).routing.stage, LearningStage::Shadow);
         let calls = decider.calls();
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
@@ -2132,7 +2133,7 @@ mod provider_move_tests {
             LearningStage::Shadow,
         ));
         router.reroute(
-            ProviderRoutingMode::Mixed,
+            ConversationRoutingMode::Mixed,
             Some(vec!["m".into(), "big".into()]),
             false,
         );
@@ -2153,7 +2154,7 @@ mod provider_move_tests {
             ProviderRoutingMode::Primary,
             LearningStage::Shadow,
         ));
-        router.reroute(ProviderRoutingMode::Full, None, false);
+        router.reroute(ConversationRoutingMode::Full, None, false);
         router
     }
 }
@@ -2335,7 +2336,7 @@ mod image_routing_tests {
         let mixed = router(
             Arc::default(),
             pool,
-            ProviderRoutingMode::Mixed,
+            ConversationRoutingMode::Mixed.pilot_mode(),
             Some(vec!["flash".into()]),
         );
         let images = effective_images(&mixed, Some(false)).await.unwrap();

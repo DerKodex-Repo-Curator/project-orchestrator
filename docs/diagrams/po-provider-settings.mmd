@@ -1,6 +1,6 @@
 %% name: po-provider-settings
 %% covers: backend:src/api/provider_handlers.rs backend:src/api/network_tools_handlers.rs
-%% verified: 41425090
+%% verified: c165f221
 %% ---
 %% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
 %%   connexion, consentement, rôles, alias, politique de modèle, journal d'envoi. La logique pure est dans
@@ -51,7 +51,7 @@ flowchart TD
     end
 
     subgraph routingmode["Mode de routage (R2) — routing_handlers.rs"]
-        RGET["✅ GET /api/chat/routing et GET /api/projects/{slug}/routing : réglages effectifs {mode primary|mixed|full, stage shadow|advisory|auto, primary?, exploration_epsilon, cost_weight, latency_weight, demote_after} + scope (project &gt; global &gt; default) ; nœud LlmSetting absent = défaut primary + shadow, aucune migration<br/>test : routing_get_without_a_setting_is_the_default, routing_settings_project_override_wins_and_delete_returns_to_global (Neo4j jetable)"]
+        RGET["✅ GET /api/chat/routing et GET /api/projects/{slug}/routing : réglages effectifs {mode primary|executors_only|full (R-S4 : executors_only = le primaire pilote, PO route les exécutants ; un document ou un corps PUT qui dit encore « mixed » se lit executors_only, aucune migration ; « mixed » ne désigne plus que le routage d'UNE conversation parmi ses modèles cochés), stage shadow|advisory|auto, primary?, exploration_epsilon, cost_weight, latency_weight, demote_after} + scope (project &gt; global &gt; default) ; nœud LlmSetting absent = défaut primary + shadow, aucune migration<br/>test : routing_get_without_a_setting_is_the_default, routing_settings_project_override_wins_and_delete_returns_to_global (Neo4j jetable), routing_project_override_wins_and_delete_returns_to_global (PUT « mixed » relu executors_only)"]
         RPUT["✅ PUT /api/chat/routing et PUT /api/projects/{slug}/routing : humain seulement (middleware + require_human) ; un PUT remplace le document, un champ absent prend son défaut ; 400 typé {error, code} sans jamais renvoyer la valeur : invalid_routing_mode, invalid_learning_stage, invalid_routing_weight (ε 0..0.25, poids 0..1, demote_after ≥ 5), invalid_routing_primary, invalid_routing_settings<br/>test : routing_put_valid_is_stored_and_read_back, routing_put_invalid_is_a_typed_400_and_stores_nothing, routing_mutations_are_refused_to_an_agent_token"]
         RDEL["✅ DELETE /api/projects/{slug}/routing : 204, le global s'applique de nouveau ; 404 sans surcharge ; humain seulement<br/>test : routing_project_override_wins_and_delete_returns_to_global"]
         RNOOP["🟠 STOCKÉ et MONTRÉ (GET /api/chat/providers.routing), PAS APPLIQUÉ : aucune décision n'est prise par cette tranche (B-R4) ; primary + shadow = identité (agent_e2e_tests inchangée)"]

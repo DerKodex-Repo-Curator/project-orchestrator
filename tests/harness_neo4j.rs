@@ -289,7 +289,8 @@ async fn routing_settings_project_override_wins_and_delete_returns_to_global() {
         .await
         .unwrap();
     let (s, from) = load_routing(store, Some(&slug)).await.unwrap();
-    assert_eq!(s.mode, ProviderRoutingMode::Mixed);
+    // `mixed` is the name a document stored before R-S4 gives `executors_only`: read as is.
+    assert_eq!(s.mode, ProviderRoutingMode::ExecutorsOnly);
     assert_eq!(s.stage, LearningStage::Advisory);
     assert_eq!(s.exploration_epsilon, 0.05);
     assert_eq!(from, RoutingScope::Global);
@@ -330,7 +331,7 @@ async fn routing_settings_project_override_wins_and_delete_returns_to_global() {
     let (s, from) = load_routing(store, Some(&slug)).await.unwrap();
     assert_eq!(
         (s.mode, from),
-        (ProviderRoutingMode::Mixed, RoutingScope::Global)
+        (ProviderRoutingMode::ExecutorsOnly, RoutingScope::Global)
     );
     assert!(!store.delete_llm_setting(&scope, ROUTING_KEY).await.unwrap());
 
