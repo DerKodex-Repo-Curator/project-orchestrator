@@ -280,9 +280,206 @@ fn is_local_build(cli_path: &Path) -> bool {
     true
 }
 
+/// Whether the Claude Code CLI is on this machine: the configured path when one is set
+/// (`CLAUDE_CLI_PATH`, `chat.claude_cli_path`), else nexus's search (PATH, the SDK cache,
+/// the usual install locations). Looks at the filesystem only: no process, no download.
+pub fn claude_cli_present(configured: Option<&str>) -> bool {
+    match configured.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => resolve_configured_cli(path).is_some(),
+        None => find_claude_cli().is_ok(),
+    }
+}
+
+/// The file a configured CLI path names, as a spawn would find it: a value with a path
+/// separator is that file; a bare name (`claude`) is looked up in the server's PATH, the
+/// way `Command::new` does (review of #722, finding 2).
+pub fn resolve_configured_cli(configured: &str) -> Option<std::path::PathBuf> {
+    resolve_cli_in(configured, std::env::var_os("PATH"))
+}
+
+fn resolve_cli_in(
+    configured: &str,
+    path_var: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    let has_separator = configured.contains('/') || configured.contains(std::path::MAIN_SEPARATOR);
+    if has_separator {
+        let path = Path::new(configured);
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    std::env::split_paths(&path_var?)
+        .map(|dir| dir.join(configured))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// What execvp accepts while it walks the PATH: a regular file with an execute bit (a
+/// non-executable `claude` earlier in the PATH is skipped, review of #722).
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// The Claude Code CLI to configure or run: the configured path (a bare name through the
+/// PATH), else the one on the machine (PATH, the usual install places, the SDK cache).
+pub fn locate_claude_cli(configured: Option<&str>) -> Option<String> {
+    match configured.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(configured) => resolve_configured_cli(configured).map(|p| p.display().to_string()),
+        None => crate::setup_claude::detect_claude_cli()
+            .or_else(|| find_claude_cli().ok().map(|p| p.display().to_string())),
+    }
+}
+
+/// The CLI path the server is configured with (`CLAUDE_CLI_PATH` over `chat.claude_cli_path`),
+/// recorded at boot; `None` before boot or when nothing is configured.
+static CONFIGURED_CLI_PATH: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Records the configured CLI path (at boot, and when it is changed at runtime), for the
+/// code that has no config at hand (the feature-graph proposal of the code scan).
+pub fn set_configured_cli_path(path: Option<String>) {
+    *CONFIGURED_CLI_PATH
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = path.filter(|p| !p.trim().is_empty());
+}
+
+/// The configured CLI path: what boot recorded, else `CLAUDE_CLI_PATH`.
+pub fn configured_cli_path() -> Option<String> {
+    CONFIGURED_CLI_PATH
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .or_else(|| std::env::var("CLAUDE_CLI_PATH").ok())
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// How long a detection of the CLI is trusted before the machine is looked at again.
+pub const CLI_DETECTION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the chat manager knows of the Claude Code CLI (B2): the built-in instance is
+/// usable only when its CLI is on the server, and a default chat must not be routed to a
+/// missing CLI when another provider is usable.
+#[derive(Debug, Default)]
+pub enum ClaudeCliProbe {
+    /// Never looked up: the built-in instance counts as usable, its absence surfaces when
+    /// a session opens (424 `cli_not_found`). The default of a manager nobody asked to
+    /// detect (tests, embedders that inject their own Claude Code).
+    #[default]
+    Assumed,
+    /// Looked up on the machine ([`claude_cli_present`]), the answer kept
+    /// [`CLI_DETECTION_TTL`]. What the server runs with.
+    Detect(std::sync::Mutex<Option<(std::time::Instant, bool)>>),
+    /// A fixed answer (tests).
+    Fixed(bool),
+}
+
+impl ClaudeCliProbe {
+    /// The probe that looks at the machine.
+    pub fn detecting() -> Self {
+        Self::Detect(std::sync::Mutex::new(None))
+    }
+
+    /// Whether the CLI is there, `configured` being the path the server is set to use.
+    pub fn present(&self, configured: Option<&str>) -> bool {
+        match self {
+            Self::Assumed => true,
+            Self::Fixed(present) => *present,
+            Self::Detect(cache) => {
+                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((at, present)) = *cache {
+                    if at.elapsed() < CLI_DETECTION_TTL {
+                        return present;
+                    }
+                }
+                let present = claude_cli_present(configured);
+                *cache = Some((std::time::Instant::now(), present));
+                present
+            }
+        }
+    }
+
+    /// Drops what was detected: the next question looks at the machine again (the CLI was
+    /// just installed, or its configured path changed).
+    pub fn forget(&self) {
+        if let Self::Detect(cache) = self {
+            *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_cli_path_is_present_only_when_the_file_is_there() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = dir.path().join("claude");
+        let configured = cli.to_str().unwrap();
+        assert!(!claude_cli_present(Some(configured)), "no file yet");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        assert!(claude_cli_present(Some(configured)));
+        // A directory is not a CLI.
+        assert!(!claude_cli_present(Some(dir.path().to_str().unwrap())));
+    }
+
+    #[test]
+    fn a_bare_configured_cli_name_is_looked_up_in_the_path_like_a_spawn_would() {
+        // CLAUDE_CLI_PATH=claude: no separator, so the PATH decides (review of #722).
+        let bin = tempfile::TempDir::new().unwrap();
+        let empty = tempfile::TempDir::new().unwrap();
+        let path = std::env::join_paths([empty.path(), bin.path()]).unwrap();
+        assert_eq!(resolve_cli_in("claude", Some(path.clone())), None);
+        let cli = bin.path().join("claude");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Not executable: skipped like execvp skips it.
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(resolve_cli_in("claude", Some(path.clone())), None);
+            // A non-executable `claude` EARLIER in the PATH does not hide the real one.
+            std::fs::write(empty.path().join("claude"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(resolve_cli_in("claude", Some(path.clone())), Some(cli));
+        #[cfg(unix)]
+        std::fs::remove_file(empty.path().join("claude")).unwrap();
+        // No PATH at all: not found, never a guess.
+        assert_eq!(resolve_cli_in("claude", None), None);
+        // A value with a separator is that file, never searched.
+        let elsewhere = empty.path().join("claude");
+        assert_eq!(
+            resolve_cli_in(elsewhere.to_str().unwrap(), Some(path)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_detection_is_cached_until_forgotten() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = dir.path().join("claude");
+        let configured = cli.to_str().unwrap();
+        let probe = ClaudeCliProbe::detecting();
+        assert!(!probe.present(Some(configured)));
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        assert!(!probe.present(Some(configured)), "still the cached answer");
+        probe.forget();
+        assert!(
+            probe.present(Some(configured)),
+            "looked at again once forgotten"
+        );
+        assert!(ClaudeCliProbe::Assumed.present(Some("/nowhere/claude")));
+        assert!(!ClaudeCliProbe::Fixed(false).present(None));
+    }
 
     #[test]
     fn test_is_local_build_standard_paths() {

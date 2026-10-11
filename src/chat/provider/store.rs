@@ -7,7 +7,7 @@
 use anyhow::Result;
 
 use super::settings::{
-    project_scope, ConsentRecord, InstanceRecord, ModelAlias, RoleAssignments, ALIASES_KEY,
+    consent_scope, ConsentRecord, InstanceRecord, ModelAlias, RoleAssignments, ALIASES_KEY,
     CONSENT_PREFIX, GLOBAL, INSTANCE_PREFIX, ROLES_KEY,
 };
 use crate::neo4j::GraphStore;
@@ -45,8 +45,17 @@ pub async fn aliases(graph: &dyn GraphStore) -> Result<Vec<ModelAlias>> {
 
 /// The consents of a project.
 pub async fn consents(graph: &dyn GraphStore, slug: &str) -> Result<Vec<ConsentRecord>> {
+    consents_for(graph, Some(slug)).await
+}
+
+/// The consents that apply to a session: its project's, or, outside any project, those
+/// given for the sessions without one ([`super::settings::NO_PROJECT_SCOPE`], B3).
+pub async fn consents_for(
+    graph: &dyn GraphStore,
+    project_slug: Option<&str>,
+) -> Result<Vec<ConsentRecord>> {
     Ok(graph
-        .list_llm_settings(&project_scope(slug), CONSENT_PREFIX)
+        .list_llm_settings(&consent_scope(project_slug), CONSENT_PREFIX)
         .await?
         .iter()
         .filter_map(|(_, v)| decode(v))

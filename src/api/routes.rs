@@ -2014,6 +2014,17 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/model-policy",
             get(provider_handlers::get_policy).put(provider_handlers::put_policy),
         )
+        // The consents for the chats outside any project (B3): same body, same rules.
+        .route(
+            "/api/chat/llm-consents",
+            get(provider_handlers::list_no_project_consents)
+                .put(provider_handlers::allow_no_project_consent),
+        )
+        .route(
+            "/api/chat/llm-consents/{provider_id}",
+            put(provider_handlers::allow_no_project_consent_for)
+                .delete(provider_handlers::revoke_no_project_consent),
+        )
         .route(
             "/api/projects/{slug}/llm-consent",
             get(provider_handlers::list_consents).put(provider_handlers::allow_consent),

@@ -98,9 +98,7 @@ pub async fn create_session(
         chat_manager
             .check_provider_binding(&sid, request.provider.as_deref())
             .await
-            .map_err(|e| {
-                AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
-            })?;
+            .map_err(|e| AppError::from_open_error(e, request.provider.as_deref()))?;
 
         // Read before the liveness check and the NATS RPC (up to its timeout): a resume
         // that completes meanwhile then receives this message instead of being resumed
@@ -130,10 +128,7 @@ pub async fn create_session(
                     if !typed && e.to_string().contains("not found") {
                         AppError::NotFound(format!("Session {} not found", sid))
                     } else {
-                        AppError::from_open_error(
-                            e,
-                            Some(crate::chat::provider::resolver::CLAUDE_CODE),
-                        )
+                        AppError::from_open_error(e, request.provider.as_deref())
                     }
                 })?;
         }
@@ -164,9 +159,10 @@ pub async fn create_session(
     }
 
     // ── Create path (no session_id) ────────────────────────────────────────
-    let response = chat_manager.create_session(&request).await.map_err(|e| {
-        AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
-    })?;
+    let response = chat_manager
+        .create_session(&request)
+        .await
+        .map_err(|e| AppError::from_open_error(e, request.provider.as_deref()))?;
 
     // T4.3: Extract code entities from the first message and create DISCUSSED relations (non-blocking)
     super::ws_chat_handler::spawn_entity_extraction(&state, &response.session_id, &request.message);
@@ -1451,6 +1447,8 @@ pub async fn set_session_routing(
                     retryable: false,
                     retry_after_ms: None,
                     fallbacks: None,
+                    consent_scope: None,
+                    candidates: None,
                 }))
             }
             None => AppError::Internal(error),
@@ -1847,7 +1845,17 @@ pub async fn list_providers(
         .map(|m| m.resolve_model(None))
         .unwrap_or_else(|| crate::chat::ChatConfig::from_env().default_model);
 
-    let provider = ClaudeCodeProvider::new(ClaudeCodeConfig::default());
+    // The CLI the server is set to use (`CLAUDE_CLI_PATH`), as a session would.
+    let mut claude_config = ClaudeCodeConfig::default();
+    if let Some(manager) = state.chat_manager.as_ref() {
+        claude_config.cli_path = manager
+            .get_env_config()
+            .await
+            .claude_cli_path
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from);
+    }
+    let provider = ClaudeCodeProvider::new(claude_config);
     let health = HealthEntry::from_nexus(&provider.health().await);
     let mut models: Vec<ModelEntry> = provider
         .catalog()
@@ -1874,9 +1882,8 @@ pub async fn list_providers(
     // writes image blocks, A12 revised), the same on both engines: the legacy
     // engine no longer needs a forced value, the agent engine sends them inline.
     let mut entries = vec![listing::builtin_claude_code(
-        health,
-        models,
-        query.project_slug.is_some(),
+        health, models, // Claude Code needs no consent, in a project or outside one.
+        true,
     )];
     // The stored instances, with the consent of the asked project.
     entries.extend(
@@ -1901,7 +1908,19 @@ pub async fn list_providers(
             serde_json::from_str::<crate::chat::provider::settings::RoleAssignments>(&raw).ok()
         })
         .and_then(|roles| roles.pilot.map(|p| p.provider));
-    let mut body = listing::assemble(entries, configured.as_deref());
+    // Without the Claude CLI, what a chat naming nothing would open (B2).
+    let usable_here = super::provider_handlers::allowed_here(
+        state.orchestrator.neo4j(),
+        query.project_slug.as_deref(),
+    )
+    .await?;
+    let claude_cli = match state.chat_manager.as_ref() {
+        Some(manager) => manager.claude_code_usable().await,
+        None => entries
+            .first()
+            .is_some_and(|p| p.health.state != "cli_not_found"),
+    };
+    let mut body = listing::assemble(entries, configured.as_deref(), claude_cli, &usable_here);
     // The routing mode in force for the asked project (R2): who chooses the
     // provider, and how far the learnt choices are trusted. Shown, not applied.
     let (routing, scope) = crate::chat::provider::cognitive::load_routing(
@@ -1926,9 +1945,36 @@ pub struct InstallCliRequest {
 /// Always returns 200 with `success: true/false` — the frontend displays the message.
 /// No 500 for installation failures (they are expected user-facing scenarios).
 pub async fn install_cli(
+    State(state): State<OrchestratorState>,
     Json(body): Json<InstallCliRequest>,
 ) -> Json<crate::chat::cli_version::CliInstallResult> {
-    Json(crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await)
+    let result = crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await;
+    // A CLI that just appeared becomes the default again at the next opening (B2).
+    if let Some(manager) = state.chat_manager.as_ref() {
+        manager.forget_claude_cli_detection();
+    }
+    // ...and gets the MCP integration the boot skipped without it (review of #722).
+    if result.success {
+        let setup_config = crate::setup_claude::SetupConfig {
+            mcp_server_path: crate::chat::ChatConfig::detect_mcp_server_path_public(),
+            server_port: state.server_port,
+            jwt_secret: state.auth_config.as_ref().map(|a| a.jwt_secret.clone()),
+        };
+        match tokio::task::spawn_blocking(move || {
+            crate::setup_claude::setup_claude_code(&setup_config)
+        })
+        .await
+        {
+            Ok(Ok(outcome)) => tracing::info!(?outcome, "Claude Code MCP configured after install"),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "Claude Code MCP setup after install failed (non-fatal)")
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Claude Code MCP setup after install did not finish")
+            }
+        }
+    }
+    Json(result)
 }
 
 // ============================================================================
@@ -2124,7 +2170,24 @@ mod tests {
 
     /// Build an OrchestratorState with mock backends (no ChatManager)
     async fn mock_server_state() -> OrchestratorState {
+        mock_server_state_with(None).await
+    }
+
+    /// [`mock_server_state`] with a chat manager whose answer to "is the Claude Code CLI on
+    /// this server?" is fixed (`Some(present)`): the listing's default does not depend on
+    /// the machine the tests run on.
+    async fn mock_server_state_with(claude_cli: Option<bool>) -> OrchestratorState {
         let app_state = mock_app_state();
+        let chat_manager = claude_cli.map(|present| {
+            Arc::new(
+                crate::chat::ChatManager::new_without_memory(
+                    app_state.neo4j.clone(),
+                    app_state.meili.clone(),
+                    crate::chat::ChatConfig::default(),
+                )
+                .with_claude_cli_present(present),
+            )
+        });
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2132,12 +2195,20 @@ mod tests {
         Arc::new(ServerState {
             orchestrator,
             watcher,
-            chat_manager: None,
+            chat_manager,
             event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
                 crate::events::EventBus::default(),
             ))),
             nats_emitter: None,
-            auth_config: Some(crate::test_helpers::test_auth_config()),
+            // A root account is configured; the usual test token is NOT root.
+            auth_config: Some(crate::AuthConfig {
+                root_account: Some(crate::RootAccountConfig {
+                    email: ROOT_EMAIL.to_string(),
+                    name: "Root".to_string(),
+                    password_hash: "unused".to_string(),
+                }),
+                ..crate::test_helpers::test_auth_config()
+            }),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
@@ -2186,7 +2257,15 @@ mod tests {
                 crate::events::EventBus::default(),
             ))),
             nats_emitter: None,
-            auth_config: Some(crate::test_helpers::test_auth_config()),
+            // A root account is configured; the usual test token is NOT root.
+            auth_config: Some(crate::AuthConfig {
+                root_account: Some(crate::RootAccountConfig {
+                    email: ROOT_EMAIL.to_string(),
+                    name: "Root".to_string(),
+                    password_hash: "unused".to_string(),
+                }),
+                ..crate::test_helpers::test_auth_config()
+            }),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
@@ -2252,7 +2331,8 @@ mod tests {
 
     #[tokio::test]
     async fn providers_lists_the_builtin_instance_with_the_documented_fields() {
-        let app = test_app().await;
+        // The CLI is declared present: the default does not depend on the machine.
+        let app = create_router(mock_server_state_with(Some(true)).await);
         let resp = app
             .oneshot(auth_get("/api/chat/providers?project_slug=p"))
             .await
@@ -2271,6 +2351,48 @@ mod tests {
         assert_eq!(p["credential"], "none");
         assert!(p["health"]["state"].is_string());
         assert!(p["models"][0]["capabilities"].is_object());
+    }
+
+    #[tokio::test]
+    async fn without_the_claude_cli_the_listing_has_no_default_until_an_instance_is_allowed() {
+        // B2 on the listing: CLI absent → claude-code is listed (unhealthy) but is not the
+        // default; nothing else usable → null; the only allowed instance → that instance.
+        let app = create_router(mock_server_state_with(Some(false)).await);
+        let (status, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["default_provider"].is_null(), "{json}");
+        assert_eq!(json["providers"][0]["id"], "claude-code");
+        assert_eq!(json["providers"][0]["is_default"], false);
+
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        let (_, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        assert!(
+            json["default_provider"].is_null(),
+            "not allowed yet: {json}"
+        );
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consents/deepseek",
+                serde_json::json!({"origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        assert_eq!(json["default_provider"], "deepseek", "{json}");
+        // Another project has not allowed it: still no default there.
+        let (_, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=q")).await;
+        assert!(json["default_provider"].is_null(), "{json}");
     }
 
     /// The listing no longer forces `images` for Claude Code: nexus declares it,
@@ -2303,6 +2425,27 @@ mod tests {
     // ====================================================================
     // Provider settings: instances, consent, roles, aliases, policy
     // ====================================================================
+
+    const ROOT_EMAIL: &str = "root@ffs.holdings";
+
+    /// A JSON request signed as the root account of `mock_server_state`.
+    fn root_json(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+        let token = crate::auth::jwt::encode_jwt(
+            Uuid::new_v5(&Uuid::NAMESPACE_URL, ROOT_EMAIL.as_bytes()),
+            ROOT_EMAIL,
+            "Root",
+            "test-secret-key-minimum-32-chars!!",
+            3600,
+        )
+        .unwrap();
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
 
     fn auth_json(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
         Request::builder()
@@ -3267,6 +3410,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_consent_for_chats_outside_a_project_follows_the_same_rules() {
+        // B3: PUT/GET/DELETE /api/chat/llm-consents[/{id}], same body and rules as a
+        // project's consent, stored apart from every project.
+        let app = test_app().await;
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        // The origin the person was shown must still be the instance's.
+        let (status, body) = call_json(
+            &app,
+            root_json(
+                "PUT",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({"origin": "https://1.1.1.1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        // claude-code needs none; an unknown instance is a 404.
+        let (status, _) = call_json(
+            &app,
+            root_json(
+                "PUT",
+                "/api/chat/llm-consents/claude-code",
+                serde_json::json!({"origin": "x"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call_json(
+            &app,
+            root_json(
+                "PUT",
+                "/api/chat/llm-consents",
+                serde_json::json!({"provider_id": "ghost", "origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = call_json(
+            &app,
+            root_json(
+                "PUT",
+                "/api/chat/llm-consents",
+                serde_json::json!({"provider_id": "deepseek", "origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["valid"], true);
+        let (_, rows) = call_json(&app, auth_get("/api/chat/llm-consents")).await;
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["provider_id"], "deepseek");
+        // The listing without a project reads that scope (nit 6); a project does not.
+        let allowed = |listing: &serde_json::Value| {
+            listing["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == "deepseek")
+                .unwrap()["allowed_for_project"]
+                .clone()
+        };
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers")).await;
+        assert_eq!(allowed(&listing), true);
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        assert_eq!(allowed(&listing), false);
+        // Not a project's consent.
+        let (_, rows) = call_json(&app, auth_get("/api/projects/p/llm-consents")).await;
+        assert!(rows.as_array().unwrap().is_empty(), "{rows}");
+
+        let (status, _) = call_json(
+            &app,
+            root_json(
+                "DELETE",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, rows) = call_json(&app, auth_get("/api/chat/llm-consents")).await;
+        assert!(rows.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_root_allows_or_withdraws_a_provider_for_the_chats_outside_a_project() {
+        // Review of #722, finding 1: the no-project consent decides where EVERY user's
+        // no-project chats may go (and makes an instance their default): root only.
+        let app = test_app().await;
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        let allow = serde_json::json!({"provider_id": "deepseek", "origin": "https://8.8.8.8"});
+        let origin = serde_json::json!({"origin": "https://8.8.8.8"});
+        for (method, uri, body) in [
+            ("PUT", "/api/chat/llm-consents", allow.clone()),
+            ("PUT", "/api/chat/llm-consents/deepseek", origin.clone()),
+        ] {
+            let (status, body) = call_json(&app, auth_json(method, uri, body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {body}");
+        }
+        let (_, rows) = call_json(&app, auth_get("/api/chat/llm-consents")).await;
+        assert!(rows.as_array().unwrap().is_empty(), "nothing was stored");
+        let (status, _) = call_json(&app, root_json("PUT", "/api/chat/llm-consents", allow)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, rows) = call_json(&app, auth_get("/api/chat/llm-consents")).await;
+        assert_eq!(rows.as_array().unwrap().len(), 1, "still there");
+        // A project's consent stays open to any signed-in person.
+        let (status, body) = call_json(
+            &app,
+            auth_json("PUT", "/api/projects/p/llm-consents/deepseek", origin),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
     async fn roles_aliases_and_policy_round_trip_and_are_validated() {
         let app = test_app().await;
         call_json(
@@ -3282,13 +3566,19 @@ mod tests {
         let (_, roles) = call_json(&app, auth_get("/api/chat/roles")).await;
         assert_eq!(roles, serde_json::json!({}), "absent = single provider");
         let want = serde_json::json!({"pilot": {"provider": "claude-code"}, "executor": {"provider": "deepseek", "alias": "fast"}});
-        let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/roles", want.clone())).await;
+        // The global pilot routes every user's chats: another signed-in person gets 403.
+        let (status, body) =
+            call_json(&app, auth_json("PUT", "/api/chat/roles", want.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let (_, unchanged) = call_json(&app, auth_get("/api/chat/roles")).await;
+        assert_eq!(unchanged, serde_json::json!({}));
+        let (status, _) = call_json(&app, root_json("PUT", "/api/chat/roles", want.clone())).await;
         assert_eq!(status, StatusCode::OK);
         let (_, got) = call_json(&app, auth_get("/api/chat/roles")).await;
         assert_eq!(got, want);
         let (status, _) = call_json(
             &app,
-            auth_json(
+            root_json(
                 "PUT",
                 "/api/chat/roles",
                 serde_json::json!({"pilot": {"provider": "ghost"}}),
@@ -3596,7 +3886,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn providers_answers_null_consent_without_a_project() {
+    async fn providers_answers_the_no_project_consent_without_a_project() {
+        // Review of #722, nit 6: with no project asked, the scope is the chats outside any
+        // project; claude-code needs no consent there either.
         let app = test_app().await;
         let resp = app.oneshot(auth_get("/api/chat/providers")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3604,7 +3896,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["providers"][0]["allowed_for_project"].is_null());
+        assert_eq!(json["providers"][0]["allowed_for_project"], true);
     }
 
     #[tokio::test]
@@ -4050,7 +4342,15 @@ mod tests {
                 crate::events::EventBus::default(),
             ))),
             nats_emitter: None,
-            auth_config: Some(crate::test_helpers::test_auth_config()),
+            // A root account is configured; the usual test token is NOT root.
+            auth_config: Some(crate::AuthConfig {
+                root_account: Some(crate::RootAccountConfig {
+                    email: ROOT_EMAIL.to_string(),
+                    name: "Root".to_string(),
+                    password_hash: "unused".to_string(),
+                }),
+                ..crate::test_helpers::test_auth_config()
+            }),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
@@ -4339,7 +4639,15 @@ mod tests {
             chat_manager: Some(manager.clone()),
             event_bus: base.event_bus.clone(),
             nats_emitter: None,
-            auth_config: Some(crate::test_helpers::test_auth_config()),
+            // A root account is configured; the usual test token is NOT root.
+            auth_config: Some(crate::AuthConfig {
+                root_account: Some(crate::RootAccountConfig {
+                    email: ROOT_EMAIL.to_string(),
+                    name: "Root".to_string(),
+                    password_hash: "unused".to_string(),
+                }),
+                ..crate::test_helpers::test_auth_config()
+            }),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
@@ -5290,13 +5598,13 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
                     retryable: false,
                     retry_after_ms: None,
                     fallbacks: None,
+                    consent_scope: None,
+                    candidates: None,
                 }))
             }
             None => AppError::BadRequest(refusal.to_string()),
         },
-        None => {
-            AppError::from_open_error(error, Some(crate::chat::provider::resolver::CLAUDE_CODE))
-        }
+        None => AppError::from_open_error(error, None),
     }
 }
 
@@ -5366,10 +5674,7 @@ mod switch_provider_tests {
                 "no default model",
             ))
         };
-        let kept = AppError::from_open_error(
-            open_failure(),
-            Some(crate::chat::provider::resolver::CLAUDE_CODE),
-        );
+        let kept = AppError::from_open_error(open_failure(), None);
         let told = switch_error(open_failure(), "abc");
         assert_eq!(
             format!("{told:?}"),

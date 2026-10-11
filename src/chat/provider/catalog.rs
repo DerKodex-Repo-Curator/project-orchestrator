@@ -12,41 +12,44 @@ use super::settings::{
     ConsentRecord, InstanceRecord, ModelAlias, ModelPolicy, RoleAssignments, RoleTarget,
 };
 
-/// Facts about the instances for ONE project (or none).
+/// Facts about the instances for ONE consent scope: a project, or the sessions
+/// outside any project.
 #[derive(Debug, Clone, Default)]
 pub struct StoreCatalog {
     instances: HashMap<String, InstanceRecord>,
     consented: HashSet<String>,
     unhealthy: HashSet<String>,
+    /// The Claude Code CLI is NOT on the server (B2): the built-in instance is no default.
+    claude_cli_missing: bool,
 }
 
 impl StoreCatalog {
     /// Builds the catalog. A consent counts only while it is tied to the
-    /// instance's CURRENT origin (A28); `project_given` is whether the opening
-    /// has a project at all (without one only claude-code is allowed).
-    pub fn new(
-        instances: Vec<InstanceRecord>,
-        consents: &[ConsentRecord],
-        project_given: bool,
-    ) -> Self {
-        let consented = if project_given {
-            instances
-                .iter()
-                .filter(|i| {
-                    consents
-                        .iter()
-                        .any(|c| super::settings::consent_holds(c, i))
-                })
-                .map(|i| i.id.clone())
-                .collect()
-        } else {
-            HashSet::new()
-        };
+    /// instance's CURRENT origin (A28). `consents` are those of the scope the
+    /// opening is in (`store::consents_for`): the project's, or, outside any
+    /// project, the ones a person gave for the sessions without one (B3).
+    pub fn new(instances: Vec<InstanceRecord>, consents: &[ConsentRecord]) -> Self {
+        let consented = instances
+            .iter()
+            .filter(|i| {
+                consents
+                    .iter()
+                    .any(|c| super::settings::consent_holds(c, i))
+            })
+            .map(|i| i.id.clone())
+            .collect();
         Self {
             instances: instances.into_iter().map(|i| (i.id.clone(), i)).collect(),
             consented,
             unhealthy: HashSet::new(),
+            claude_cli_missing: false,
         }
+    }
+
+    /// Whether the Claude Code CLI is on the server (`ChatManager::claude_code_usable`).
+    pub fn with_claude_cli(mut self, present: bool) -> Self {
+        self.claude_cli_missing = !present;
+        self
     }
 
     /// Marks instances a health check found unusable.
@@ -72,6 +75,16 @@ impl InstanceCatalog for StoreCatalog {
 
     fn is_allowed_for_project(&self, provider_id: &str) -> bool {
         provider_id == CLAUDE_CODE || self.consented.contains(provider_id)
+    }
+
+    fn claude_code_installed(&self) -> bool {
+        !self.claude_cli_missing
+    }
+
+    fn instance_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.instances.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 }
 
@@ -212,27 +225,19 @@ mod tests {
     }
 
     #[test]
-    fn consent_counts_only_for_the_current_origin_and_with_a_project() {
+    fn consent_counts_only_for_the_current_origin_of_its_scope() {
         let inst = vec![instance("ds", "https://a.example.com")];
-        let ok = StoreCatalog::new(
-            inst.clone(),
-            &[consent("ds", "https://a.example.com")],
-            true,
-        );
+        let ok = StoreCatalog::new(inst.clone(), &[consent("ds", "https://a.example.com")]);
         assert!(ok.is_allowed_for_project("ds"));
-        let moved = StoreCatalog::new(
-            inst.clone(),
-            &[consent("ds", "https://old.example.com")],
-            true,
-        );
+        let moved = StoreCatalog::new(inst.clone(), &[consent("ds", "https://old.example.com")]);
         assert!(!moved.is_allowed_for_project("ds"), "origin changed");
-        let no_project = StoreCatalog::new(inst, &[consent("ds", "https://a.example.com")], false);
-        assert!(
-            !no_project.is_allowed_for_project("ds"),
-            "no project: claude-code only"
-        );
-        assert!(no_project.is_allowed_for_project(CLAUDE_CODE));
-        assert!(no_project.exists(CLAUDE_CODE) && !no_project.exists("ghost"));
+        // A scope with no consent (a project that never consented, or no project and
+        // nothing allowed for the sessions without one): claude-code only.
+        let none = StoreCatalog::new(inst, &[]);
+        assert!(!none.is_allowed_for_project("ds"));
+        assert!(none.is_allowed_for_project(CLAUDE_CODE));
+        assert!(none.exists(CLAUDE_CODE) && !none.exists("ghost"));
+        assert_eq!(none.instance_ids(), vec!["ds".to_string()]);
     }
 
     #[test]
@@ -261,7 +266,6 @@ mod tests {
         let catalog = StoreCatalog::new(
             vec![instance("ds", "https://a.example.com")],
             &[consent("ds", "https://a.example.com")],
-            true,
         );
         let input = resolve_input(Role::Pilot, None, None, None, &global, &project, &aliases);
         let choice = resolve(&input, &catalog).unwrap();
@@ -309,7 +313,7 @@ mod tests {
             }),
             executor: None,
         };
-        let catalog = StoreCatalog::new(vec![instance("ds", "https://a.example.com")], &[], true);
+        let catalog = StoreCatalog::new(vec![instance("ds", "https://a.example.com")], &[]);
         let input = resolve_input(
             Role::Pilot,
             None,
@@ -322,6 +326,45 @@ mod tests {
         assert_eq!(
             resolve(&input, &catalog).unwrap_err().code(),
             "endpoint_not_allowed"
+        );
+    }
+
+    #[test]
+    fn without_the_claude_cli_claude_code_is_no_default_but_stays_nameable() {
+        let none = RoleAssignments::default();
+        let catalog = StoreCatalog::new(
+            vec![instance("local", "http://127.0.0.1:9")],
+            &[consent("local", "http://127.0.0.1:9")],
+        )
+        .with_claude_cli(false);
+        // Nothing named: the only allowed instance, not a missing CLI (B2).
+        let input = resolve_input(Role::Pilot, None, None, None, &none, &none, &[]);
+        let choice = resolve(&input, &catalog).unwrap();
+        assert_eq!(
+            (choice.provider_id.as_str(), choice.routed_by),
+            ("local", RoutedBy::SoleInstance)
+        );
+        // Named: claude-code is still chosen, the opening tells the CLI is missing (424).
+        let input = resolve_input(
+            Role::Pilot,
+            Some(CLAUDE_CODE),
+            None,
+            None,
+            &none,
+            &none,
+            &[],
+        );
+        assert_eq!(resolve(&input, &catalog).unwrap().provider_id, CLAUDE_CODE);
+        // With the CLI, nothing changes: claude-code is the default.
+        let catalog = StoreCatalog::new(
+            vec![instance("local", "http://127.0.0.1:9")],
+            &[consent("local", "http://127.0.0.1:9")],
+        )
+        .with_claude_cli(true);
+        let input = resolve_input(Role::Pilot, None, None, None, &none, &none, &[]);
+        assert_eq!(
+            resolve(&input, &catalog).unwrap().routed_by,
+            RoutedBy::BuiltinClaudeCode
         );
     }
 
@@ -363,7 +406,6 @@ mod tests {
                 consent("ds", "https://a.example.com"),
                 consent("other", "https://b.example.com"),
             ],
-            true,
         );
         let none = RoleAssignments::default();
         let by_run = resolve_input(

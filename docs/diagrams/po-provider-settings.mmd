@@ -43,6 +43,8 @@ flowchart TD
 
     subgraph consent["Consentement par projet"]
         CONSENT["✅ PUT /api/projects/{slug}/llm-consent[s][/id] : l'origine montrée doit être l'actuelle (409 origin_mismatch) ; enregistre qui, quand, quelle origine ET quelle référence ; DELETE retire<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes, changing_the_credential_reference_after_consent_stops_the_sending"]
+        NOPROJ["✅ M1/B3 — GET/PUT /api/chat/llm-consents, PUT/DELETE /api/chat/llm-consents/{provider_id} : le consentement des chats HORS de tout projet (portée no_project) ;<br/>mêmes règles que celui d'un projet (put_consent / delete_consent partagés) MAIS écriture par le compte ROOT seulement (require_scope_writer → require_root, 403 root_required : la portée décide pour les chats de TOUS les utilisateurs ; revue de #722) ; PUT /api/chat/roles (pilote global) idem ;<br/> instance connue, claude-code refusé 400, origine montrée = actuelle sinon 409 origin_mismatch,<br/>lié à l'origine ET à la référence d'identifiant) ; un projet n'en hérite jamais ; allowed_here(portée) sert le default_provider du listing<br/>test : the_consent_for_chats_outside_a_project_follows_the_same_rules, only_root_allows_or_withdraws_a_provider_for_the_chats_outside_a_project,<br/>roles_aliases_and_policy_round_trip_and_are_validated (403 hors root), providers_answers_the_no_project_consent_without_a_project, agent_token_cannot_mutate_human_only_routes (middleware) ;<br/>sans projet demandé, le listing évalue allowed_for_project dans la portée no_project"]
+        CONSENT --> NOPROJ
     end
 
     subgraph routing["Rôles, alias, politique"]

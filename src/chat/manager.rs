@@ -855,6 +855,9 @@ pub struct ChatManager {
     /// Open cognitive decisions of live chat sessions (session id -> decision id),
     /// closed with what happened when the session is closed.
     pub(crate) open_decisions: std::sync::Mutex<std::collections::HashMap<String, Uuid>>,
+    /// Whether the Claude Code CLI is on this server (B2): what the resolver knows of the
+    /// built-in instance's health. See [`super::cli_version::ClaudeCliProbe`].
+    claude_cli: super::cli_version::ClaudeCliProbe,
     /// Native providers built for stored instances, by instance id; an entry is
     /// reused while the stored record is unchanged.
     pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
@@ -3108,6 +3111,7 @@ impl ChatManager {
             provider_source,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            claude_cli: super::cli_version::ClaudeCliProbe::default(),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
@@ -3198,6 +3202,7 @@ impl ChatManager {
             provider_source,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            claude_cli: super::cli_version::ClaudeCliProbe::default(),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
@@ -3892,7 +3897,37 @@ impl ChatManager {
 
     /// Update the explicit Claude CLI binary path.
     pub async fn update_claude_cli_path(&self, path: Option<String>) {
+        super::cli_version::set_configured_cli_path(path.clone());
         self.env_config.write().await.claude_cli_path = path;
+        self.claude_cli.forget();
+    }
+
+    /// Looks for the Claude Code CLI on the machine before a default chat is routed to it
+    /// (B2): without it, the built-in instance is unhealthy for the resolver. What the
+    /// server runs with; a manager built without it assumes the CLI is there.
+    pub fn detecting_claude_cli(mut self) -> Self {
+        self.claude_cli = super::cli_version::ClaudeCliProbe::detecting();
+        self
+    }
+
+    /// A fixed answer to "is the Claude Code CLI on this server?": tests that must not
+    /// depend on the machine they run on (CI has no `claude`).
+    #[cfg(test)]
+    pub(crate) fn with_claude_cli_present(mut self, present: bool) -> Self {
+        self.claude_cli = super::cli_version::ClaudeCliProbe::Fixed(present);
+        self
+    }
+
+    /// Whether the built-in Claude Code instance can open a session here: its CLI is on
+    /// the server (the configured path, else the usual places). Cached for a minute.
+    pub async fn claude_code_usable(&self) -> bool {
+        let configured = self.env_config.read().await.claude_cli_path.clone();
+        self.claude_cli.present(configured.as_deref())
+    }
+
+    /// The CLI was just installed or upgraded: look for it again at the next opening.
+    pub fn forget_claude_cli_detection(&self) {
+        self.claude_cli.forget();
     }
 
     /// Update the auto-update CLI toggle.
@@ -6207,6 +6242,27 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
+        let mut opened_on: Option<String> = None;
+        let result = self
+            .create_session_resolved(request, relay, session_id, &mut opened_on)
+            .await;
+        // A failure once the provider is resolved names THAT provider (B6), not the one the
+        // HTTP layer would assume.
+        result.map_err(|e| match opened_on {
+            Some(provider_id) => super::provider::errors::on_provider(&provider_id, e),
+            None => e,
+        })
+    }
+
+    /// [`Self::create_session_in_place`]; `opened_on` receives the provider as soon as it
+    /// is resolved.
+    async fn create_session_resolved(
+        &self,
+        request: &ChatRequest,
+        relay: Option<&super::relay::RelayedFrom>,
+        session_id: Uuid,
+        opened_on: &mut Option<String>,
+    ) -> Result<CreateSessionResponse> {
         // Who the session belongs to, settled before anything is opened: a refusal (no owner
         // can be named for a delegated session) leaves nothing behind.
         let owner = self.session_owner(request.user_claims.as_ref()).await?;
@@ -6264,6 +6320,7 @@ impl ChatManager {
         let provider_choice = self
             .resolve_provider_choice_for(request, project_slug.as_deref(), Some(session_id))
             .await?;
+        *opened_on = Some(provider_choice.provider_id.clone());
         // A conversation routed among its pool opens on the model PO chose among it; the
         // pilot the menu names is only the fallback when no decision applied (R-S4).
         let decided_among_pool = request.routes_among_pool()
@@ -10769,6 +10826,27 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         from: ResumeFrom,
     ) -> Result<()> {
+        let mut opened_on: Option<String> = None;
+        let result = self
+            .resume_session_on(session_id, message, user_claims, from, &mut opened_on)
+            .await;
+        // A failure once the session is read names ITS provider (B6).
+        result.map_err(|e| match opened_on {
+            Some(provider_id) => super::provider::errors::on_provider(&provider_id, e),
+            None => e,
+        })
+    }
+
+    /// [`Self::resume_session_from`]; `opened_on` receives the session's provider as soon
+    /// as the session is read.
+    async fn resume_session_on(
+        &self,
+        session_id: &str,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        from: ResumeFrom,
+        opened_on: &mut Option<String>,
+    ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
         let seen = from.0;
 
@@ -10779,6 +10857,13 @@ impl ChatManager {
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
+        *opened_on = Some(
+            session_node
+                .provider_id
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string()),
+        );
         self.ready_for_resume(&mut session_node).await?;
 
         // A session opened by the agent engine carries its capability snapshot:
@@ -13120,10 +13205,9 @@ impl ChatManager {
     ) -> Result<super::provider::resolver::ProviderChoice> {
         use super::provider::{catalog, resolver, settings, store};
         let instances = store::instances(self.graph.as_ref()).await?;
-        let consents = match project_slug {
-            Some(slug) => store::consents(self.graph.as_ref(), slug).await?,
-            None => Vec::new(),
-        };
+        // The project's consents, or outside any project those given for the sessions
+        // without one (B3).
+        let consents = store::consents_for(self.graph.as_ref(), project_slug).await?;
         let global = store::roles(self.graph.as_ref(), settings::GLOBAL).await?;
         let project = match project_slug {
             Some(slug) => store::roles(self.graph.as_ref(), &settings::project_scope(slug)).await?,
@@ -13136,8 +13220,11 @@ impl ChatManager {
             resolver::Role::Pilot
         };
         let routing_instances = self.cognitive_routing.as_ref().map(|_| instances.clone());
-        let store_catalog =
-            catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
+        // Without its CLI on the server, the built-in instance is not a default (B2): a chat
+        // that names nothing goes to the only other usable instance, never to a 424. One
+        // that names claude-code still gets the typed 424 `cli_not_found` (install action).
+        let store_catalog = catalog::StoreCatalog::new(instances, &consents)
+            .with_claude_cli(self.claude_code_usable().await);
         let policy: settings::ModelPolicy = self
             .graph
             .get_llm_setting(settings::GLOBAL, settings::POLICY_KEY)
@@ -13279,9 +13366,10 @@ impl ChatManager {
                 input.project_rule = declared_project_rule;
                 input.request = pool_fallback.flatten();
                 auto_pick = None;
-                resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?
+                resolver::resolve(&input, &store_catalog)
+                    .map_err(|e| anyhow::Error::new(e.in_scope(project_slug)))?
             }
-            Err(refused) => return Err(anyhow::Error::new(refused)),
+            Err(refused) => return Err(anyhow::Error::new(refused.in_scope(project_slug))),
         };
         choice.decision_id = cognitive.as_ref().map(|d| d.id);
         if let Some(p) = &pick {
@@ -13355,14 +13443,10 @@ impl ChatManager {
         let Ok(instances) = store::instances(self.graph.as_ref()).await else {
             return Vec::new();
         };
-        let consents = match project_slug {
-            Some(slug) => store::consents(self.graph.as_ref(), slug)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let store_catalog =
-            catalog::StoreCatalog::new(instances.clone(), &consents, project_slug.is_some());
+        let consents = store::consents_for(self.graph.as_ref(), project_slug)
+            .await
+            .unwrap_or_default();
+        let store_catalog = catalog::StoreCatalog::new(instances.clone(), &consents);
         self.routing_pool(routing, &instances, &store_catalog, scope)
             .await
     }
@@ -14171,17 +14255,18 @@ impl ChatManager {
         let record = store::instance(self.graph.as_ref(), provider_id)
             .await?
             .ok_or_else(|| refuse(resolver::ResolveError::UnknownProvider(provider_id.into())))?;
-        let slug = project_slug
-            .ok_or_else(|| refuse(resolver::ResolveError::NotAllowed(provider_id.into())))?;
-        let consented = store::consents(self.graph.as_ref(), slug)
+        // The project's consent, or outside any project the one given for the sessions
+        // without one (B3) — never the other scope's.
+        let consented = store::consents_for(self.graph.as_ref(), project_slug)
             .await?
             .iter()
             .any(|c| super::provider::settings::consent_holds(c, &record));
         if !consented {
-            return Err(refuse(resolver::ResolveError::NotAllowed(
-                provider_id.into(),
-            )));
+            return Err(refuse(
+                resolver::ResolveError::NotAllowed(provider_id.into()).in_scope(project_slug),
+            ));
         }
+        let slug = project_slug;
         // A codex / acp instance is a local process: there is no endpoint to guard.
         let guard = if super::provider::settings::is_process_kind(&record.kind) {
             Ok(())
@@ -14199,7 +14284,7 @@ impl ChatManager {
                 code = refusal.code(),
                 "endpoint refused by the guard"
             );
-            return Err(refuse(resolver::ResolveError::NotAllowed(
+            return Err(refuse(resolver::ResolveError::EndpointRefused(
                 provider_id.into(),
             )));
         }
