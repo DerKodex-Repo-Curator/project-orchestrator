@@ -666,13 +666,21 @@ impl AgentSessionHandle {
             tool_policy.get_or_insert_with(|| self.tool_policy.clone());
         }
         let mut covered = None;
+        // A command the shell may have moved with: lasting rules stop covering commands.
+        if let Some(call) = super::session_grants::observed_call(self.asker, &event) {
+            self.session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .observe_tool_use(&call);
+        }
         if let ChatEvent::PermissionRequest {
             id,
             tool,
             input,
             canonical,
+            always,
             ..
-        } = &event
+        } = &mut event
         {
             let call = super::session_grants::AskedCall {
                 asker: self.asker,
@@ -680,7 +688,15 @@ impl AgentSessionHandle {
                 canonical: canonical.clone(),
                 input: input.clone(),
             };
-            covered = super::session_grants::cover(&self.session_grants, &call)
+            // Whether this very call may be answered `always` (the client offers it then).
+            *always = self
+                .session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .lasting_grant_for(&call)
+                .map(|_| true);
+            covered = Box::pin(super::session_grants::cover(&self.session_grants, &call))
+                .await
                 .map(|cover| (id.clone(), cover));
             self.asked_calls
                 .lock()
@@ -2751,6 +2767,7 @@ mod adopt_tests {
             category: Some("edit".into()),
             canonical: Some("Edit".into()),
             tool_use_id: None,
+            always: None,
         };
         // The first patch (README.md): `session` refused, nothing answered; `once` goes.
         handle.emit(patch("patch-readme")).await;
@@ -2804,6 +2821,7 @@ mod adopt_tests {
             category: Some("edit".into()),
             canonical: Some("Write".into()),
             tool_use_id: None,
+            always: None,
         };
         native.emit(write("write-1")).await;
         native
@@ -3950,6 +3968,7 @@ mod tool_timing_tests {
                 category: None,
                 canonical: None,
                 tool_use_id: Some("t1".into()),
+                always: None,
             })
             .await;
         let hold = Arc::new(tokio::sync::Notify::new());
@@ -4030,6 +4049,7 @@ mod tool_timing_tests {
                 category: None,
                 canonical: None,
                 tool_use_id: Some("t1".into()),
+                always: None,
             })
             .await;
         let hold = Arc::new(tokio::sync::Notify::new());
@@ -4106,6 +4126,7 @@ mod tool_timing_tests {
             category: Some("edit".into()),
             canonical: Some("Write".into()),
             tool_use_id: Some(call.to_string()),
+            always: None,
         };
         handle.emit(write("write-1", "t1")).await;
         handle
@@ -4221,6 +4242,7 @@ mod tool_timing_tests {
                 category: None,
                 canonical: None,
                 tool_use_id: Some("t1".into()),
+                always: None,
             })
             .await;
         handle.answer_permission("req-1", true).await.unwrap();

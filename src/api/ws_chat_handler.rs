@@ -950,7 +950,11 @@ async fn handle_ws_chat_loop(
 
                                         // Only the person the session belongs to answers it, as on REST
                                         // (review #679 finding 6).
-                                        if let Err(why) = may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
+                                        let refused = match may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
+                                            Err(why) => Some(why),
+                                            Ok(()) => lasting_answer_refused(&claims, allow, scope),
+                                        };
+                                        if let Some(why) = refused {
                                             warn!(session_id = %session_id, request_id = %request_id, reason = why.reason(), "permission response refused before delivery");
                                             let err = permission_forbidden_frame(&request_id, why);
                                             let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
@@ -1369,6 +1373,9 @@ pub(crate) enum AnswerRefusal {
     /// The session, hence its owner, cannot be read right now (`owner_unreadable`):
     /// refused, never let through (fail closed), the person may answer again.
     OwnerUnreadable,
+    /// An `always` answer from credentials that may not keep a lasting approval
+    /// (`not_a_person`: an MCP token, the anonymous user...; review of #714, S1).
+    NotAPerson,
 }
 
 impl AnswerRefusal {
@@ -1376,6 +1383,7 @@ impl AnswerRefusal {
         match self {
             Self::NotOwner => "not_owner",
             Self::OwnerUnreadable => "owner_unreadable",
+            Self::NotAPerson => "not_a_person",
         }
     }
 }
@@ -1401,6 +1409,19 @@ pub(crate) async fn may_answer_permissions(
     }
 }
 
+/// An `always` answer these claims may not give (`Claims::may_keep_lasting_approvals`),
+/// checked before delivery like the owner.
+pub(crate) fn lasting_answer_refused(
+    claims: &Claims,
+    allow: bool,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> Option<AnswerRefusal> {
+    (allow
+        && scope == crate::chat::types::PermissionAnswerScope::Always
+        && !claims.may_keep_lasting_approvals())
+    .then_some(AnswerRefusal::NotAPerson)
+}
+
 /// The `error` frame refusing a `permission_response` before delivery: nothing was
 /// answered, the request still waits (for the session's owner, or for a retry when the
 /// owner could not be read).
@@ -1414,6 +1435,9 @@ pub(crate) fn permission_forbidden_frame(
         }
         AnswerRefusal::OwnerUnreadable => {
             "Who this conversation belongs to could not be checked: nothing was answered, try again."
+        }
+        AnswerRefusal::NotAPerson => {
+            "Only the person, signed in with their own session, can allow a call for good: nothing was answered."
         }
     };
     serde_json::to_value(crate::chat::types::ChatEvent::Error {

@@ -70,6 +70,10 @@ pub struct LastingRule {
     pub id: Uuid,
     /// The project slug it holds for.
     pub project: String,
+    /// The project's root directory, canonical (symbolic links resolved), where it was
+    /// approved: it only covers a call of a session running in that very directory.
+    #[serde(default)]
+    pub root: String,
     /// Who asked: `claude_code` or `native` (the comparator's [`Asker`]).
     pub asker: String,
     /// The tool's name as the provider gave it (`Bash`, `mcp__nexus__Bash`).
@@ -147,6 +151,21 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
 }
 
+/// Logs why the rules were ignored, at most once a minute (they are read at each request).
+fn warn_rarely(e: &StoreError) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = Utc::now().timestamp();
+    let last = LAST.load(Ordering::Relaxed);
+    if now - last >= 60
+        && LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(error = %e, "lasting permission rules ignored");
+    }
+}
+
 /// The lasting rules of every person, in one directory.
 #[derive(Debug, Clone)]
 pub struct LastingRuleStore {
@@ -182,7 +201,7 @@ impl LastingRuleStore {
         match self.read(owner) {
             Ok(file) => file.rules,
             Err(e) => {
-                tracing::warn!(error = %e, "lasting permission rules ignored");
+                warn_rarely(&e);
                 Vec::new()
             }
         }
@@ -228,11 +247,20 @@ impl LastingRuleStore {
     /// existing rule is returned).
     pub fn add(&self, owner: &str, rule: LastingRule) -> Result<LastingRule, StoreError> {
         self.update(owner, |rules| {
+            // The same call is every field the grant compares (canonical input), not
+            // what it reads as (review of #714, S3).
+            let key = |r: &LastingRule| {
+                r.call()
+                    .and_then(|c| super::session_grants::canonical_input(&c))
+            };
+            let wanted = key(&rule);
             if let Some(same) = rules.iter().find(|r| {
                 r.project == rule.project
+                    && r.root == rule.root
                     && r.asker == rule.asker
                     && r.tool == rule.tool
-                    && r.rule == rule.rule
+                    && wanted.is_some()
+                    && key(r) == wanted
             }) {
                 return Ok(same.clone());
             }
@@ -260,23 +288,59 @@ pub struct LastingScope {
     pub store: LastingRuleStore,
     pub owner: String,
     pub project: String,
+    /// The project's root as its record names it, and canonical when the session opened.
+    root_given: PathBuf,
+    root: PathBuf,
+    /// The session's working directory, as given.
+    cwd: PathBuf,
 }
 
 impl LastingScope {
     /// The scope of a session, `None` when it keeps no lasting rule: no store configured,
-    /// no owner, no project.
+    /// no owner, no project, or a session that does not run IN the project's root (review
+    /// of #714, S2): its working directory, symbolic links resolved, must be the very
+    /// directory the project's root resolves to (`project_root`: the root of the project
+    /// the session's slug names). A rule is bound to that root: `cat .env` approved in one
+    /// directory never runs in another under the same slug.
     pub fn of_session(
         store: Option<&LastingRuleStore>,
         owner: Option<&str>,
         project: Option<&str>,
+        project_root: Option<&Path>,
+        cwd: &Path,
     ) -> Option<Self> {
         let owner = owner.filter(|o| !o.trim().is_empty())?;
         let project = project.filter(|p| !p.trim().is_empty())?;
+        let root_given = project_root?.to_path_buf();
+        let root = std::fs::canonicalize(&root_given).ok()?;
+        if std::fs::canonicalize(cwd).ok()? != root {
+            tracing::info!(
+                project,
+                "lasting approvals not offered: the session does not run in the project's root"
+            );
+            return None;
+        }
         Some(Self {
             store: store?.clone(),
             owner: owner.to_string(),
             project: project.to_string(),
+            root_given,
+            root,
+            cwd: cwd.to_path_buf(),
         })
+    }
+
+    /// Whether the session still runs in the root its rules are bound to: its directory and
+    /// the project's root both resolve, NOW, to the root resolved at the opening (a link
+    /// swapped since then is caught).
+    pub fn in_place(&self) -> bool {
+        let resolved = |p: &Path| std::fs::canonicalize(p).ok();
+        resolved(&self.root_given).as_ref() == Some(&self.root)
+            && resolved(&self.cwd).as_ref() == Some(&self.root)
+    }
+
+    fn root_text(&self) -> String {
+        self.root.display().to_string()
     }
 
     /// The rule of this person and project that covers `grant` (the grant the comparator
@@ -288,8 +352,13 @@ impl LastingScope {
         read_only_mcp: &[String],
     ) -> Option<LastingRule> {
         let asker = asker_name(asker)?;
+        if !self.in_place() {
+            return None;
+        }
+        let root = self.root_text();
         self.store.rules(&self.owner).into_iter().find(|rule| {
             rule.project == self.project
+                && rule.root == root
                 && rule.asker == asker
                 && rule.grant(read_only_mcp).as_ref() == Some(grant)
         })
@@ -304,11 +373,17 @@ impl LastingScope {
         session_id: &str,
     ) -> Result<LastingRule, StoreError> {
         let asker = asker_name(call.asker).ok_or(StoreError::Unsupported)?;
+        if !self.in_place() {
+            return Err(StoreError::UnsafeDir(
+                "the session no longer runs in the project's root".to_string(),
+            ));
+        }
         self.store.add(
             &self.owner,
             LastingRule {
                 id: Uuid::new_v4(),
                 project: self.project.clone(),
+                root: self.root_text(),
                 asker: asker.to_string(),
                 tool: call.tool.clone(),
                 canonical: call.canonical.clone(),
@@ -506,8 +581,18 @@ mod tests {
         (dir, store)
     }
 
+    /// The project's root of these tests: a directory next to the store.
+    fn project_root(store: &LastingRuleStore) -> std::path::PathBuf {
+        let root = store.root().parent().unwrap().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A session of `owner` on `project`, running in the project's root.
     fn scope(store: &LastingRuleStore, owner: &str, project: &str) -> LastingScope {
-        LastingScope::of_session(Some(store), Some(owner), Some(project)).unwrap()
+        let root = project_root(store);
+        LastingScope::of_session(Some(store), Some(owner), Some(project), Some(&root), &root)
+            .unwrap()
     }
 
     fn bash(command: &str) -> AskedCall {
@@ -544,9 +629,104 @@ mod tests {
             &bash("cat README.md")
         ));
         // No owner or no project: no scope at all.
-        assert!(LastingScope::of_session(Some(&store), None, Some("proj")).is_none());
-        assert!(LastingScope::of_session(Some(&store), Some("alice"), None).is_none());
-        assert!(LastingScope::of_session(None, Some("alice"), Some("proj")).is_none());
+        let root = project_root(&store);
+        let r = Some(root.as_path());
+        assert!(LastingScope::of_session(Some(&store), None, Some("proj"), r, &root).is_none());
+        assert!(LastingScope::of_session(Some(&store), Some("alice"), None, r, &root).is_none());
+        assert!(LastingScope::of_session(None, Some("alice"), Some("proj"), r, &root).is_none());
+        assert!(
+            LastingScope::of_session(Some(&store), Some("alice"), Some("proj"), None, &root)
+                .is_none()
+        );
+    }
+
+    /// Review of #714, S2: a rule is bound to the project's root, not to its slug. A session
+    /// of the same person and slug that does not run in that very directory keeps no
+    /// lasting rule (asked), a working directory that is a link out of the root neither,
+    /// and a root swapped for a link after the opening stops every rule.
+    #[test]
+    fn a_rule_holds_only_in_the_projects_root_never_elsewhere_under_the_same_slug() {
+        let (d, store) = store();
+        let alice = scope(&store, "alice", "proj");
+        keep(&alice, &bash("cat .env"));
+        let root = project_root(&store);
+        // Same slug, another directory (a subdirectory, a sibling): no scope at all.
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let elsewhere = d.path().join("payments");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for cwd in [&sub, &elsewhere] {
+            assert!(
+                LastingScope::of_session(
+                    Some(&store),
+                    Some("alice"),
+                    Some("proj"),
+                    Some(&root),
+                    cwd
+                )
+                .is_none(),
+                "{cwd:?}"
+            );
+        }
+        // A rule kept under the same slug for another root never covers here.
+        let other = LastingScope::of_session(
+            Some(&store),
+            Some("alice"),
+            Some("proj"),
+            Some(&elsewhere),
+            &elsewhere,
+        )
+        .unwrap();
+        assert!(!covered(&other, &bash("cat .env")));
+        // A working directory inside the root that is a link escaping it.
+        let link = root.join("escape");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(LastingScope::of_session(
+            Some(&store),
+            Some("alice"),
+            Some("proj"),
+            Some(&root),
+            &link
+        )
+        .is_none());
+        // A link TO the root resolves to it: the same place.
+        let alias = d.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let via_alias = LastingScope::of_session(
+            Some(&store),
+            Some("alice"),
+            Some("proj"),
+            Some(&root),
+            &alias,
+        )
+        .unwrap();
+        assert!(covered(&via_alias, &bash("cat .env")));
+        // The root swapped for a link after the opening: nothing covers any more.
+        assert!(covered(&alice, &bash("cat .env")));
+        let moved = d.path().join("project-moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        assert!(!covered(&alice, &bash("cat .env")));
+    }
+
+    /// Review of #714, S3: the same call is every field the grant compares. A rule for
+    /// `ls` with a timeout is not `ls`: both are kept, and they read differently.
+    #[test]
+    fn two_calls_that_differ_in_a_compared_field_are_two_rules() {
+        let (_d, store) = store();
+        let alice = scope(&store, "alice", "proj");
+        let timed = AskedCall {
+            input: json!({ "command": "ls", "timeout": 5000 }),
+            ..bash("ls")
+        };
+        let a = keep(&alice, &timed);
+        let b = keep(&alice, &bash("ls"));
+        assert_ne!(a.id, b.id);
+        assert_ne!(a.rule, b.rule, "they read differently");
+        assert_eq!(a.rule, "Bash: ls [timeout=5000]");
+        assert!(covered(&alice, &bash("ls")));
+        assert!(covered(&alice, &timed));
+        assert_eq!(store.rules("alice").len(), 2);
     }
 
     #[test]
@@ -717,5 +897,42 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(store.rules("alice").len(), 8 * 15);
+    }
+
+    /// Review of #714, S2 (the persisted `cd`): once the session's shell may have left the
+    /// root (a command that is not one plain read-only command ran), no lasting rule covers
+    /// a COMMAND in that session any more; a read of an absolute path still is.
+    #[tokio::test]
+    async fn after_a_command_that_may_move_the_shell_no_lasting_rule_covers_a_command() {
+        use super::super::session_grants::{cover, SessionGrants};
+        let (_d, store) = store();
+        let alice = scope(&store, "alice", "proj");
+        let read = AskedCall {
+            asker: Asker::ClaudeCode,
+            tool: "Read".into(),
+            canonical: None,
+            input: json!({ "file_path": "/etc/hosts" }),
+        };
+        keep(&alice, &bash("cat README.md"));
+        keep(&alice, &read);
+        let grants =
+            std::sync::Mutex::new(SessionGrants::declaring(Vec::new()).with_lasting(Some(alice)));
+        let lasting = |c: Option<super::super::session_grants::Cover>| c.is_some_and(|c| c.lasting);
+        assert!(lasting(cover(&grants, &bash("cat README.md")).await));
+        // A plain read-only command, or an input not complete yet: nothing changes.
+        grants.lock().unwrap().observe_tool_use(&bash("ls"));
+        grants.lock().unwrap().observe_tool_use(&AskedCall {
+            input: json!({}),
+            ..bash("")
+        });
+        assert!(lasting(cover(&grants, &bash("cat README.md")).await));
+        // A `cd` (or anything else): commands are asked again, the absolute read is not.
+        grants
+            .lock()
+            .unwrap()
+            .observe_tool_use(&bash("cd ../payments"));
+        assert!(grants.lock().unwrap().shell_moved());
+        assert!(cover(&grants, &bash("cat README.md")).await.is_none());
+        assert!(lasting(cover(&grants, &read).await));
     }
 }

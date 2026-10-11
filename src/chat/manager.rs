@@ -5189,18 +5189,38 @@ impl ChatManager {
             .map(super::lasting_rules::LastingRuleStore::new)
     }
 
-    /// The lasting rules a session of `owner` on `project` keeps and obeys; `None` (no
-    /// `always` offered) without a store, an owner or a project.
-    pub(crate) fn lasting_scope(
+    /// The lasting rules a session of `owner` on `project`, running in `cwd`, keeps and
+    /// obeys; `None` (no `always` offered) without a store, an owner, a project whose
+    /// record can be read, or when `cwd` is not the project's root (symbolic links
+    /// resolved): a rule is bound to that root (`LastingScope::of_session`).
+    pub(crate) async fn lasting_scope(
         &self,
         owner: Option<&str>,
         project: Option<&str>,
+        cwd: &str,
     ) -> Option<super::lasting_rules::LastingScope> {
-        super::lasting_rules::LastingScope::of_session(
-            self.lasting_rule_store().as_ref(),
-            owner,
-            project,
-        )
+        let store = self.lasting_rule_store()?;
+        let (owner, slug) = (owner?.to_string(), project?.to_string());
+        let root = self
+            .graph
+            .get_project_by_slug(&slug)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| std::path::PathBuf::from(crate::expand_tilde(&p.root_path)))?;
+        let cwd = std::path::PathBuf::from(crate::expand_tilde(cwd));
+        tokio::task::spawn_blocking(move || {
+            super::lasting_rules::LastingScope::of_session(
+                Some(&store),
+                Some(owner.as_str()),
+                Some(slug.as_str()),
+                Some(&root),
+                &cwd,
+            )
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Environment of the project-orchestrator MCP server of one session: the
@@ -6333,6 +6353,14 @@ impl ChatManager {
         } else {
             OOB_TRIGGER_CAP_INTERACTIVE
         };
+        // Resolved before the sessions are locked (it reads the project's record).
+        // Boxed: the opening's future is already large.
+        let lasting = Box::pin(self.lasting_scope(
+            session_node.owner.as_deref(),
+            session_node.project_slug.as_deref(),
+            &request.cwd,
+        ))
+        .await;
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -6394,10 +6422,7 @@ impl ChatManager {
                                 Some(std::path::Path::new(&crate::expand_tilde(&request.cwd))),
                             ),
                         )
-                        .with_lasting(self.lasting_scope(
-                            session_node.owner.as_deref(),
-                            session_node.project_slug.as_deref(),
-                        )),
+                        .with_lasting(lasting),
                     )),
                     oob_trigger_cap,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -7573,7 +7598,8 @@ impl ChatManager {
                                               next_seq: &std::sync::atomic::AtomicI64,
                                               current_parent: Option<String>|
                      -> Option<ChatEvent> {
-                        let event = parse_permission_control_msg(&control_msg, current_parent)?;
+                        let mut event = parse_permission_control_msg(&control_msg, current_parent)?;
+                        mark_always_eligibility(&mut event, &session_grants);
                         tool_clock.observe(&event, chrono::Utc::now());
 
                         match &event {
@@ -7968,6 +7994,15 @@ impl ChatManager {
                                 let events = Self::message_to_events(msg);
                                 for event in events {
                                     let event = offer_lasting_scope(event, &session_grants);
+                                    if let Some(call) = super::session_grants::observed_call(
+                                        super::session_grants::Asker::ClaudeCode,
+                                        &event,
+                                    ) {
+                                        session_grants
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .observe_tool_use(&call);
+                                    }
                                     // Deduplicate ToolUse events — ContentBlockStart and
                                     // AssistantMessage can both produce the same tool_use.
                                     //
@@ -10608,6 +10643,14 @@ impl ChatManager {
                 .await
                 .unwrap_or(self.config.auto_continue),
         ));
+        // Resolved before the sessions are locked (it reads the project's record).
+        // Boxed: the opening's future is already large.
+        let lasting = Box::pin(self.lasting_scope(
+            session_node.owner.as_deref(),
+            session_node.project_slug.as_deref(),
+            &session_node.cwd,
+        ))
+        .await;
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -10678,10 +10721,7 @@ impl ChatManager {
                                 ))),
                             ),
                         )
-                        .with_lasting(self.lasting_scope(
-                            session_node.owner.as_deref(),
-                            session_node.project_slug.as_deref(),
-                        )),
+                        .with_lasting(lasting),
                     )),
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -14139,6 +14179,14 @@ impl ChatManager {
             }
         }
         cleanup.disarm();
+        // Lasting approvals only for a session whose files are on this machine, running in
+        // its project's root.
+        let lasting = match &project_dir {
+            Some(dir) => {
+                Box::pin(self.lasting_scope(owner, project_slug, &dir.display().to_string())).await
+            }
+            None => None,
+        };
         self.finish_agent_open(
             &sid,
             provider_id,
@@ -14149,7 +14197,7 @@ impl ChatManager {
             host_missing,
             !per_session_mcp || without_mcp,
             project_dir,
-            self.lasting_scope(owner, project_slug),
+            lasting,
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -14767,6 +14815,17 @@ impl ChatManager {
             .await
             .unwrap_or(0);
         cleanup.disarm();
+        let lasting = match &project_dir {
+            Some(dir) => {
+                Box::pin(self.lasting_scope(
+                    node.owner.as_deref(),
+                    node.project_slug.as_deref(),
+                    &dir.display().to_string(),
+                ))
+                .await
+            }
+            None => None,
+        };
         self.finish_agent_open(
             &sid,
             &provider_id,
@@ -14777,7 +14836,7 @@ impl ChatManager {
             host_missing,
             !per_session_mcp || without_mcp,
             project_dir,
-            self.lasting_scope(node.owner.as_deref(), node.project_slug.as_deref()),
+            lasting,
         )
         .await;
         let handle = self
@@ -15287,6 +15346,34 @@ fn legacy_asked_call(pending: &PendingPermission) -> super::session_grants::Aske
     }
 }
 
+/// Marks a permission request of the CLI that may be answered `always` (the session keeps
+/// lasting rules and the comparator would approve this very call for good): the client
+/// offers `always` only then.
+fn mark_always_eligibility(
+    event: &mut ChatEvent,
+    grants: &std::sync::Mutex<super::session_grants::SessionGrants>,
+) {
+    if let ChatEvent::PermissionRequest {
+        tool,
+        input,
+        always,
+        ..
+    } = event
+    {
+        let call = super::session_grants::AskedCall {
+            asker: super::session_grants::Asker::ClaudeCode,
+            tool: tool.clone(),
+            canonical: None,
+            input: input.clone(),
+        };
+        *always = grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lasting_grant_for(&call)
+            .map(|_| true);
+    }
+}
+
 /// `system_init` of a legacy session, offering `always` when the session keeps lasting
 /// rules (`SessionGrants::keeps_lasting`): what [`ChatManager::deliver_permission_answer`]
 /// accepts. Any other event is returned as it is.
@@ -15355,7 +15442,7 @@ async fn answer_granted_request(
         canonical: None,
         input: input.clone(),
     };
-    let cover = super::session_grants::cover(grants, &call)?;
+    let cover = Box::pin(super::session_grants::cover(grants, &call)).await?;
     let tx = stdin_tx?;
     let line = serde_json::json!({
         "type": "control_response",
@@ -15491,6 +15578,8 @@ fn parse_permission_control_msg(
             .and_then(|v| v.as_str())
             .filter(|id| !id.is_empty())
             .map(str::to_string),
+        // Set by the session (`mark_always_eligibility`), which knows its lasting rules.
+        always: None,
     })
 }
 
@@ -23080,6 +23169,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
@@ -29315,6 +29405,7 @@ mod granted_answer_clock_tests {
                 category: None,
                 canonical: None,
                 tool_use_id: Some("t1".into()),
+                always: None,
             },
             chrono::Utc::now(),
         );

@@ -436,13 +436,28 @@ impl SessionGrant {
     pub fn describe(&self) -> String {
         match self {
             Self::Exact { tool, input } => {
-                // A command reads as the command line; anything else as its input.
-                let command = serde_json::from_str::<Value>(input)
-                    .ok()
-                    .and_then(|v| v.get("command").and_then(Value::as_str).map(str::to_string));
-                match command {
-                    Some(command) => format!("{tool}: {command}"),
-                    None => format!("{tool} {input}"),
+                // A command reads as the command line, then every other field the grant
+                // compares (`timeout`, `run_in_background`, `dangerouslyDisableSandbox`...),
+                // sorted: two grants that differ never read the same. Anything else reads as
+                // its input.
+                let value = serde_json::from_str::<Value>(input).ok();
+                let command = value
+                    .as_ref()
+                    .and_then(|v| v.get("command").and_then(Value::as_str));
+                match (command, value.as_ref().and_then(Value::as_object)) {
+                    (Some(command), Some(fields)) => {
+                        let extras: Vec<String> = fields
+                            .iter()
+                            .filter(|(k, _)| k.as_str() != "command")
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect();
+                        if extras.is_empty() {
+                            format!("{tool}: {command}")
+                        } else {
+                            format!("{tool}: {command} [{}]", extras.join(", "))
+                        }
+                    }
+                    _ => format!("{tool} {input}"),
                 }
             }
         }
@@ -474,7 +489,7 @@ fn canonical_json(value: &Value) -> String {
 /// trimmed, and every other field (`timeout`, `run_in_background`, a sandbox switch...)
 /// but the cosmetic `description`, which the model rewrites freely. `None`: a command
 /// with no command line (an argv is not one: its words joined lose where each begins).
-fn canonical_input(call: &AskedCall) -> Option<String> {
+pub(crate) fn canonical_input(call: &AskedCall) -> Option<String> {
     if call.is_command() {
         let mut input = call.input.clone();
         let Value::String(line) = input.get("command")? else {
@@ -720,6 +735,17 @@ pub(crate) fn lasting_grant_with(
     if pattern(&call.tool) || call.canonical.as_deref().is_some_and(pattern) {
         return None;
     }
+    // A call that asks to run outside the sandbox is never approved for good (review of
+    // #714, S3); nor one holding a bidi or format character (U+202E...), which could make
+    // the approval and the rule list read otherwise than the call runs (N3).
+    if call
+        .input
+        .get("dangerouslyDisableSandbox")
+        .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
+        || has_format_char(&call.input)
+    {
+        return None;
+    }
     let kind = call.kind(read_only_mcp)?;
     let name = call.nexus_builtin().unwrap_or(call.tool.as_str());
     if WRITE_TOOLS.contains(&name) {
@@ -729,6 +755,25 @@ pub(crate) fn lasting_grant_with(
         return None;
     }
     grant_with(call, read_only_mcp)
+}
+
+/// Whether some string of `value` (keys included) holds a bidi control or another invisible
+/// format character (Unicode category Cf, the usual ones).
+fn has_format_char(value: &Value) -> bool {
+    let format = |c: char| {
+        matches!(c,
+            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+    };
+    match value {
+        Value::String(text) => text.chars().any(format),
+        Value::Array(items) => items.iter().any(has_format_char),
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(k, v)| k.chars().any(format) || has_format_char(v)),
+        _ => false,
+    }
 }
 
 /// Whether a command call may be approved for good: one simple command, no operator, no
@@ -767,6 +812,35 @@ fn has_unquoted_operator(line: &str) -> bool {
     false
 }
 
+/// The tool call an event shows (a `tool_use`, or the resolved input of one), as the
+/// grants observe it ([`SessionGrants::observe_tool_use`]). A resolved input does not name
+/// its tool: one holding a `command` line is taken for a command (only ever refuses more).
+pub fn observed_call(asker: Asker, event: &crate::chat::types::ChatEvent) -> Option<AskedCall> {
+    use crate::chat::types::ChatEvent;
+    match event {
+        ChatEvent::ToolUse {
+            tool,
+            input,
+            canonical,
+            ..
+        } => Some(AskedCall {
+            asker,
+            tool: tool.clone(),
+            canonical: canonical.clone(),
+            input: input.clone(),
+        }),
+        ChatEvent::ToolUseInputResolved { input, .. } if input.get("command").is_some() => {
+            Some(AskedCall {
+                asker,
+                tool: "Bash".to_string(),
+                canonical: Some("Bash".to_string()),
+                input: input.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// A permission request a grant covers, as answered by the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cover {
@@ -779,7 +853,11 @@ pub struct Cover {
 /// The grant that covers this call, if any: a grant of the session, else a lasting rule of
 /// the session's person and project (read from the store at each request, so a rule
 /// revoked elsewhere stops holding at once). The store is read outside the lock.
-pub fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -> Option<Cover> {
+///
+/// A lasting rule never covers a COMMAND once the session's shell may have left its
+/// directory ([`SessionGrants::observe_tool_use`]): both engines keep the `cd` of one
+/// call for the next, and a rule is bound to the project's root.
+pub async fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -> Option<Cover> {
     let (lasting, read_only_mcp) = {
         let grants = grants.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(grant) = grants.covering(call) {
@@ -798,10 +876,19 @@ pub fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -> Opti
                 }
             }
         }
+        if grants.shell_moved && call.is_command() {
+            return None;
+        }
         (grants.lasting.clone()?, grants.read_only_mcp.clone())
     };
     let grant = lasting_grant_with(call, &read_only_mcp)?;
-    lasting.covering(call.asker, &grant, &read_only_mcp)?;
+    let asker = call.asker;
+    let wanted = grant.clone();
+    // The rule file is read off the async workers.
+    tokio::task::spawn_blocking(move || lasting.covering(asker, &wanted, &read_only_mcp))
+        .await
+        .ok()
+        .flatten()?;
     Some(Cover {
         lasting: true,
         rule: grant.describe(),
@@ -908,6 +995,11 @@ pub struct SessionGrants {
     /// the requests that arrive meanwhile (the CLI may ask the identical call again
     /// before the write ends), then leave ([`Self::end_lasting`]).
     pending_lasting: Vec<SessionGrant>,
+    /// The session's shell may have left the directory it started in: a command tool ran a
+    /// line that is not one plain read-only command (a `cd`, a script, a chain...). From
+    /// then on no lasting rule covers a command in this session (they are bound to the
+    /// project's root, and the shell's directory cannot be checked from here).
+    shell_moved: bool,
 }
 
 impl SessionGrants {
@@ -919,6 +1011,7 @@ impl SessionGrants {
             read_only_mcp,
             lasting: None,
             pending_lasting: Vec::new(),
+            shell_moved: false,
         }
     }
 
@@ -946,6 +1039,27 @@ impl SessionGrants {
             return None;
         }
         lasting_grant_with(call, &self.read_only_mcp)
+    }
+
+    /// A tool call of the session (a `tool_use`, or its resolved input): a command whose
+    /// line is not one plain read-only command (what a lasting rule may cover) may change
+    /// the shell's directory, so lasting rules stop covering commands here. An input not
+    /// complete yet (no command line) is ignored: its resolved input follows.
+    pub fn observe_tool_use(&mut self, call: &AskedCall) {
+        if self.shell_moved {
+            return;
+        }
+        let Some(Value::String(_)) = call.input.get("command") else {
+            return;
+        };
+        if call.is_command() && !(command_is_lasting(call) && command_is_grantable(call)) {
+            self.shell_moved = true;
+        }
+    }
+
+    /// Whether the session's shell may have left its directory ([`Self::observe_tool_use`]).
+    pub fn shell_moved(&self) -> bool {
+        self.shell_moved
     }
 
     /// A lasting grant the provider just took: covers the requests that arrive while its
@@ -2329,5 +2443,65 @@ mod tests {
         let grants = SessionGrants::declaring(Vec::new());
         assert!(!grants.keeps_lasting(Asker::ClaudeCode));
         assert!(grants.lasting_grant_for(&bash("ls")).is_none());
+    }
+
+    /// Review of #714, S3 and N3: a call asking to run outside the sandbox, or holding a bidi
+    /// or format character, is never approved for good; a command grant reads with every
+    /// field it compares.
+    #[test]
+    fn sandbox_disabled_or_invisible_characters_are_never_approved_for_good() {
+        let unsandboxed = call(
+            Asker::ClaudeCode,
+            "Bash",
+            None,
+            json!({"command": "ls", "dangerouslyDisableSandbox": true}),
+        );
+        assert!(
+            grant_for(&unsandboxed).is_some(),
+            "session: the identical call"
+        );
+        assert!(lasting_grant_for(&unsandboxed).is_none());
+        assert_eq!(
+            grant_for(&unsandboxed).unwrap().describe(),
+            "Bash: ls [dangerouslyDisableSandbox=true]"
+        );
+        let sandboxed = call(
+            Asker::ClaudeCode,
+            "Bash",
+            None,
+            json!({"command": "ls", "dangerouslyDisableSandbox": false}),
+        );
+        assert!(lasting_grant_for(&sandboxed).is_some());
+        for line in [
+            "cat README\u{202E}dm.txt",
+            "cat \u{2066}a\u{2069}",
+            "ls\u{200B}",
+        ] {
+            assert!(lasting_grant_for(&bash(line)).is_none(), "{line:?}");
+        }
+        let read = call(
+            Asker::ClaudeCode,
+            "Read",
+            None,
+            json!({"file_path": "/tmp/a\u{202E}b"}),
+        );
+        assert!(lasting_grant_for(&read).is_none());
+    }
+
+    #[test]
+    fn the_shell_is_taken_as_moved_by_any_command_but_one_plain_read_only_command() {
+        let mut grants = SessionGrants::default();
+        grants.observe_tool_use(&bash("cat README.md"));
+        grants.observe_tool_use(&native_bash("ls -la"));
+        assert!(!grants.shell_moved());
+        grants.observe_tool_use(&call(
+            Asker::ClaudeCode,
+            "Read",
+            None,
+            json!({"file_path": "/x"}),
+        ));
+        assert!(!grants.shell_moved());
+        grants.observe_tool_use(&native_bash("cd src && ls"));
+        assert!(grants.shell_moved());
     }
 }

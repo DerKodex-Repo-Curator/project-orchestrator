@@ -220,6 +220,7 @@ impl EventMapper {
                 category: Some(category_name(*category)),
                 canonical: canonical.clone(),
                 tool_use_id: tool_call_id.clone(),
+                always: None,
             }],
             AgentEvent::Question {
                 question_id,

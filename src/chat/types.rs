@@ -713,6 +713,12 @@ pub enum ChatEvent {
         /// `can_use_tool`, the agent engine's `permission_ask`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
+        /// `Some(true)` when THIS call may be answered `always` (P11b): the session keeps
+        /// lasting rules and the backend's comparator would approve this very call for good
+        /// (`session_grants::lasting_grant_for`). Absent: `always` would be refused, typed,
+        /// so a client does not offer it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        always: Option<bool>,
     },
     /// Claude Code called the AskUserQuestion tool — display the interactive
     /// question widget instead of a permission approval dialog.
@@ -2223,6 +2229,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             }
             .event_type(),
             "permission_request"
@@ -2319,6 +2326,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -2745,6 +2753,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),

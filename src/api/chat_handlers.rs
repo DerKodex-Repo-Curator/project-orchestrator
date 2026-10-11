@@ -908,11 +908,7 @@ fn lasting_rules_person(
     claims: &Option<axum::Extension<crate::auth::jwt::Claims>>,
 ) -> Result<String, AppError> {
     match claims {
-        Some(axum::Extension(c))
-            if c.is_human() && !c.is_service_account() && !c.sub.is_empty() =>
-        {
-            Ok(c.sub.clone())
-        }
+        Some(axum::Extension(c)) if c.may_keep_lasting_approvals() => Ok(c.sub.clone()),
         Some(_) => Err(AppError::Forbidden(
             "lasting permission rules are managed by their person only, signed in".to_string(),
         )),
@@ -936,6 +932,12 @@ pub struct PermissionRulesQuery {
 pub struct PermissionRuleView {
     pub id: Uuid,
     pub project: String,
+    /// The project's root directory (canonical) it is bound to: it only covers a call of a
+    /// session running in that very directory.
+    pub root: String,
+    /// The call asked to run outside the sandbox. Never kept by this server (refused for
+    /// good), shown should a rule file say so.
+    pub sandbox_disabled: bool,
     /// The engine it holds on: `claude_code` (the Claude Code CLI) or `native`.
     pub engine: String,
     pub tool: String,
@@ -943,8 +945,10 @@ pub struct PermissionRuleView {
     pub rule: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub session_id: Option<String>,
-    /// Whether the backend's comparator still grants it (a rule edited by hand, or whose
-    /// read-only declaration was withdrawn, is listed but holds nothing).
+    /// Whether the backend's comparator still grants it, decided as a session of its project
+    /// would (a rule edited by hand, one whose read-only declaration was withdrawn or is
+    /// redefined by the project's `.mcp.json` is listed but holds nothing). It still needs
+    /// a session running in its root to apply.
     pub holds: bool,
 }
 
@@ -976,9 +980,22 @@ pub async fn list_permission_rules(
             .into_iter()
             .filter(|r| query.project.as_ref().is_none_or(|p| *p == r.project))
             .map(|r| PermissionRuleView {
-                holds: r.grant(&declared).is_some(),
+                // Decided as a session of that project would decide it: the declared
+                // read-only MCP tools its `.mcp.json` does not redefine (review of #714,
+                // N2); a rule with no root (older format) holds nothing.
+                holds: !r.root.is_empty()
+                    && r.grant(&crate::chat::session_grants::declarations_for_project(
+                        &declared,
+                        Some(std::path::Path::new(&r.root)),
+                    ))
+                    .is_some(),
+                sandbox_disabled: r
+                    .input
+                    .get("dangerouslyDisableSandbox")
+                    .is_some_and(|v| !v.is_null() && *v != serde_json::Value::Bool(false)),
                 id: r.id,
                 project: r.project,
+                root: r.root,
                 engine: r.asker,
                 tool: r.tool,
                 rule: r.rule,
@@ -1070,6 +1087,19 @@ pub async fn respond_permission(
     if !session.answerable_by(caller) {
         return Err(AppError::Forbidden(
             "only the person this conversation belongs to can answer its permission requests"
+                .to_string(),
+        ));
+    }
+    // A lasting approval only from the person, signed in with their own session token (review
+    // of #714, S1): an MCP token or the server's account answers once or for the session.
+    if body.allow
+        && body.scope == crate::chat::types::PermissionAnswerScope::Always
+        && !claims
+            .as_ref()
+            .is_some_and(|axum::Extension(c)| c.may_keep_lasting_approvals())
+    {
+        return Err(AppError::Forbidden(
+            "only the person, signed in with their own session, can allow a call for good"
                 .to_string(),
         ));
     }
@@ -4374,6 +4404,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
         )
         .await;
@@ -4518,10 +4549,14 @@ mod tests {
         let h = action_harness_keeping(None, true, Some(root.clone())).await;
         let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
         let store = crate::chat::lasting_rules::LastingRuleStore::new(root);
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
         let place = crate::chat::lasting_rules::LastingScope::of_session(
             Some(&store),
             Some(&alice.to_string()),
             Some("proj"),
+            Some(&project_root),
+            &project_root,
         )
         .unwrap();
         let asked = crate::chat::session_grants::AskedCall {
@@ -4583,6 +4618,66 @@ mod tests {
             .unwrap();
         let (status, _) = call(&h.app, anonymous).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Review of #714, S1: an MCP token of the session's owner may answer once or for the
+    /// session, never `always` (403, nothing answered); the person's own session token goes
+    /// through (here 410: the CLI is gone).
+    #[tokio::test]
+    async fn an_mcp_token_cannot_allow_a_call_for_good() {
+        let h = action_harness(None).await;
+        let owner = Uuid::new_v4();
+        let session = crate::neo4j::models::ChatSessionNode {
+            owner: Some(owner.to_string()),
+            ..test_chat_session(None)
+        };
+        h.graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        seed_permission_request(&h, sid, 1, "req-mcp").await;
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let (mcp, jti) = crate::auth::jwt::encode_mcp_token(
+            owner,
+            "owner@ffs.holdings",
+            "Owner",
+            "mcp:read mcp:write",
+            secret,
+            3600,
+        )
+        .unwrap();
+        h.graph
+            .create_mcp_token(
+                owner,
+                &jti,
+                "client",
+                "mcp:read mcp:write",
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let human =
+            crate::auth::jwt::encode_jwt(owner, "owner@ffs.holdings", "Owner", secret, 3600)
+                .unwrap();
+        let post = |token: &str, scope: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(perm_uri(sid, "req-mcp"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(r#"{{"allow":true,"scope":"{scope}"}}"#)))
+                .unwrap()
+        };
+        let (status, body) = call(&h.app, post(&mcp, "always")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let events = h.graph.get_attention_events(&[sid]).await.unwrap();
+        assert_eq!(
+            crate::chat::attention::permission_status(&events, "req-mcp"),
+            crate::chat::attention::PermissionStatus::Pending,
+        );
+        // The same token answering for the session is not refused by this rule.
+        let (status, body) = call(&h.app, post(&mcp, "session")).await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        let (status, body) = call(&h.app, post(&human, "always")).await;
+        assert_eq!(status, StatusCode::GONE, "the person goes through: {body}");
     }
 
     /// An agent's token, an MCP token, the server's account, the anonymous user: never

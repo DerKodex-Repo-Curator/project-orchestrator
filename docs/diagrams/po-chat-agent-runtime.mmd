@@ -1,11 +1,12 @@
 %% name: po-chat-agent-runtime
-%% covers: backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants}.rs backend:src/chat/provider/transcripts.rs
+%% covers: backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules}.rs backend:src/chat/provider/transcripts.rs
 %% verified: 4983fbcd
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
 %% ---
 %% SOURCES LUES :
+%%   src/chat/lasting_rules.rs — LastingRuleStore, LastingScope (P11b : règles « toujours » par personne + racine de projet)
 %%   src/chat/agent_runtime.rs — AgentRuntime, AgentSessionHandle (send_message, answer_permission, interrupt, cancel_tools, cancel_task, active_background_tasks, cancel_refused,
 %%                               set_model, set_policy_mode), mask_agent_event, degraded_features, retry,
 %%                               pump_out_of_band, BuiltinProviders, fake (tests), sync_resume_token, count_user_message, add_turn_cost (src/chat/session_record.rs)

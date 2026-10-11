@@ -112,6 +112,15 @@ impl Claims {
     pub fn is_human(&self) -> bool {
         self.token_type.is_none() && self.sub != ANONYMOUS_USER_ID.to_string()
     }
+
+    /// Whether these claims may create, list or revoke LASTING approvals (`always`, P11b): a
+    /// person signed in with their own session token. Never an agent session's token, an MCP
+    /// token (any client holding it would make a call auto-approved in every later session),
+    /// a vault token, the server's account or the anonymous user. One predicate for the
+    /// answer paths (REST, WebSocket) and the list / revoke routes.
+    pub fn may_keep_lasting_approvals(&self) -> bool {
+        self.is_human() && !self.is_service_account() && !self.sub.is_empty()
+    }
 }
 
 /// Encode a JWT token for the given user.

@@ -8320,6 +8320,7 @@ mod permission_scopes {
         };
         let rules = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
+        project_at(&graph, dir.path()).await;
         let manager = {
             let dyn_graph: Arc<dyn GraphStore> = graph.clone();
             let config = super::super::config::ChatConfig {
@@ -8688,6 +8689,8 @@ mod permission_scopes {
             calls(key, id, "mcp__nexus__Bash", json!({ "command": command }))
         };
         let mut routes = vec![
+            bash("ALWAYS-ELSEWHERE", "a6", "cat README.md"),
+            says("ALWAYS-ELSEWHERE", "done elsewhere"),
             bash("ALWAYS-BOB", "a5", "cat README.md"),
             says("ALWAYS-BOB", "done bob"),
             bash("ALWAYS-REVOKED", "a4", "cat README.md"),
@@ -8701,6 +8704,14 @@ mod permission_scopes {
         ];
         routes.extend(script().as_array().cloned().unwrap());
         Value::Array(routes)
+    }
+
+    /// The project `proj`, rooted at `root`: lasting rules are bound to that root.
+    pub(super) async fn project_at(graph: &MockGraphStore, root: &std::path::Path) {
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "proj".into();
+        project.root_path = root.display().to_string();
+        graph.create_project(&project).await.unwrap();
     }
 
     /// A native session of `sub` on project `proj`, its lasting rules kept in `rules`.
@@ -8729,6 +8740,7 @@ mod permission_scopes {
         let graph = stage(&fake).await;
         let cwd = tempfile::tempdir().unwrap();
         std::fs::write(cwd.path().join("README.md"), "readme").unwrap();
+        project_at(&graph, cwd.path()).await;
         let rules = tempfile::tempdir().unwrap();
         let manager = {
             let mut m = native_manager(graph.clone()).await;
@@ -8836,6 +8848,58 @@ mod permission_scopes {
             .await
             .unwrap();
         manager.close_session(&sid3).await.unwrap();
+
+        // Review of #714, S2: the same person and slug, another directory (a rule kept
+        // again first, so one exists): `always` is not offered there and the identical
+        // call is asked.
+        let place = manager
+            .lasting_scope(
+                Some("alice"),
+                Some("proj"),
+                &cwd.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input: json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        place.keep(&call, &grant, "seed").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("README.md"), "secret").unwrap();
+        let sid4 = open_as(&manager, elsewhere.path(), "alice").await;
+        let handle = manager.agent_runtime.get(&sid4).await.unwrap();
+        assert!(
+            !handle
+                .offered_capabilities()
+                .permission_scopes
+                .contains(&nexus_claude::agent::PermissionScope::Always),
+            "not offered outside the project's root"
+        );
+        manager
+            .send_message(&sid4, "ALWAYS-ELSEWHERE")
+            .await
+            .unwrap();
+        let asked_there = asked(&graph, &sid4, "cat README.md", Duration::from_secs(10)).await;
+        assert!(asked_there.is_some(), "asked outside the project's root");
+        assert!(
+            decisions(&graph, &sid4, 1).await.is_empty(),
+            "never answered by a rule"
+        );
+        manager
+            .route_permission_response(
+                &sid4,
+                &asked_there.unwrap(),
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+        manager.close_session(&sid4).await.unwrap();
     }
 
     /// The id of the request holding `needle` asked after the first `skip` ones.

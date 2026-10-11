@@ -217,16 +217,29 @@ writes nor reads it. What `always` covers is decided by the same comparator, str
 (`session_grants::lasting_grant_for`): the **identical** call only (never a prefix), no file
 tool (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`), and for a command ONE simple command of the
 allowlist above with no operator (`;`, `&`, `|`, `(`, `)`, a new line), no redirection and no
-glob outside quotes; only on the Claude Code CLI and the native engine. A rule belongs to a
-**person and a project** (the session's owner and project slug): `always` is offered
-(`capabilities.permission_scopes` of `system_init`) only to a session that has both and when
-the server keeps lasting rules (`CHAT_PERMISSION_RULES_DIR`, default `<config>/project-orchestrator/permission-rules`,
+glob outside quotes; never a call asking `dangerouslyDisableSandbox`, never one holding a bidi
+or invisible format character; only on the Claude Code CLI and the native engine. A rule belongs
+to a **person and a project's root directory** (the session's owner, its project slug, and the
+canonical root the slug names, symbolic links resolved): `always` is offered
+(`capabilities.permission_scopes` of `system_init`) only to a session that has an owner and a
+project, runs IN that root (its canonical working directory equals the project's canonical root;
+a subdirectory, a sibling or a link out of it gets no lasting rule), and when the server keeps
+lasting rules (`CHAT_PERMISSION_RULES_DIR`, default `<config>/project-orchestrator/permission-rules`,
 unix only). The rule is written after the provider took the answer, in a `0700` directory, one
 file per person (written to a fresh `O_EXCL` temporary file renamed over it, under an
 inter-process lock); a file or a directory another user could write, or a symbolic link, is
 ignored, and every stored rule goes through the comparator again (a rule edited by hand into
 `Bash(*)` holds nothing). The backend answers the later requests a rule covers, in any session
-of that person on that project, with `permission_decision {scope: "always", rule}`; a rule
+of that person running in that project's root on this machine, with
+`permission_decision {scope: "always", rule}` (the rule reads with every compared field:
+`Bash: ls [timeout=5000]`). Both engines keep the `cd` of one command for the next: once a
+command that is not one plain read-only command ran in a session (a `cd`, a chain, a script),
+no lasting rule covers a COMMAND in that session any more (the shell's directory cannot be
+checked), it is asked. Each `permission_request` carries `"always": true` when that very call
+may be approved for good (absent: `always` would be refused). Only a person signed in with
+their own session token answers `always`: an MCP token, an agent's, the server's account or the
+anonymous user get 403 on REST and an `error` frame `{"code": "permission_forbidden", "reason":
+"not_a_person"}` on the WebSocket (`once` and `session` unchanged); a rule
 that cannot be written leaves the call granted for the session and the decision says
 `session`. The rules are read at each request: `GET /api/chat/permission-rules[?project=<slug>]`
 lists the caller's rules and `DELETE /api/chat/permission-rules/{id}` revokes one, effective at

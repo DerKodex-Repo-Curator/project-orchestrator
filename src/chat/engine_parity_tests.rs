@@ -1841,6 +1841,38 @@ fn lasting_rules_of(manager: &ChatManager, rule: &str) -> bool {
     })
 }
 
+/// Whether the NEXT session of [`parity_person`] on `proj`, running in `cwd` (the project's
+/// root), would have this call answered by a lasting rule (`session_grants::cover` on a
+/// fresh session's grants, its lasting scope resolved like an opening's).
+async fn next_session_covers(
+    manager: &ChatManager,
+    cwd: &str,
+    asker: crate::chat::session_grants::Asker,
+    tool: &str,
+    canonical: Option<&str>,
+    command: &str,
+) -> bool {
+    let person = parity_person();
+    let Some(place) = manager
+        .lasting_scope(Some(&person.sub), Some("proj"), cwd)
+        .await
+    else {
+        return false;
+    };
+    let grants = std::sync::Mutex::new(
+        crate::chat::session_grants::SessionGrants::declaring(Vec::new()).with_lasting(Some(place)),
+    );
+    let call = crate::chat::session_grants::AskedCall {
+        asker,
+        tool: tool.to_string(),
+        canonical: canonical.map(str::to_string),
+        input: json!({ "command": command }),
+    };
+    crate::chat::session_grants::cover(&grants, &call)
+        .await
+        .is_some_and(|c| c.lasting)
+}
+
 /// A Claude Code turn asking `req` then `again` (the identical call): `req` is answered
 /// with `scope`, `again` is left to the backend (answered `once` when it is still asked,
 /// to unblock the turn). Whether `req` was routed, and the line the CLI read for it.
@@ -1984,6 +2016,13 @@ fn excerpt(s: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
+    // On the heap: the scenario's future outgrew the test thread's stack (block_on keeps
+    // the future it drives on the stack).
+    Box::pin(the_scenario()).await;
+}
+
+/// The body of [`the_same_scenario_on_both_engines_gives_the_parity_matrix`].
+async fn the_scenario() {
     let stage = Stage::new().await;
     let cwd = stage.cwd();
     let claims = crate::auth::jwt::Claims::service_account("parity");
@@ -2250,7 +2289,16 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
                 && *s == crate::chat::types::PermissionAnswerScope::Always
                 && r == "Bash: cat README.md")
     });
-    let cc_kept = lasting_rules_of(&manager, "Bash: cat README.md");
+    let cc_kept = lasting_rules_of(&manager, "Bash: cat README.md")
+        && Box::pin(next_session_covers(
+            &manager,
+            &cwd,
+            crate::chat::session_grants::Asker::ClaudeCode,
+            "Bash",
+            None,
+            "cat README.md",
+        ))
+        .await;
     cc_sent += 1;
     let second = cli
         .wait_line(0, "req-perm-t", WAIT)
@@ -2884,10 +2932,16 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         .await
         .unwrap();
     na_sent += 1;
-    let ran_always = wait_body_nth(&fake, &kn.k("TURN-ALWAYS2"), 1, WAIT)
-        .await
-        .is_some();
-    let asked_always = wn.permission_ids("cat always.txt").await;
+    // The identical call is asked by nexus again (no rule was handed to it): wait for that
+    // second request, answered by the backend or left to the user.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let mut asked_always = wn.permission_ids("cat always.txt").await;
+    while asked_always.len() < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        asked_always = wn.permission_ids("cat always.txt").await;
+    }
+    // Leave the backend a moment to answer it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let events = wn.all().await;
     let always_by_backend = asked_always.len() == 2
         && events.iter().any(|e| {
@@ -2906,17 +2960,34 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
             )
             .await;
     }
+    let ran_always = wait_body_nth(&fake, &kn.k("TURN-ALWAYS2"), 1, WAIT)
+        .await
+        .is_some();
     wn.said(WAIT, "answered always two").await;
     wn.settle(ends, &manager).await;
     let na_kept = lasting_rules_of(&manager, "mcp__nexus__Bash: cat always.txt");
+    // This session's shell ran commands that may have moved it (`echo FIVE-$((1+1))`...):
+    // the backend no longer answers a COMMAND from a lasting rule here (review of #714, S2),
+    // the identical call was asked. The next session of the person in the project's root
+    // is answered: measured on what it obeys (its lasting scope, read at each request).
+    let moved_here = !always_by_backend;
+    let next_session = Box::pin(next_session_covers(
+        &manager,
+        &cwd,
+        crate::chat::session_grants::Asker::Native,
+        "mcp__nexus__Bash",
+        Some("Bash"),
+        "cat always.txt",
+    ))
+    .await;
     na.check(
         "permissions.always",
-        offers_always && granted_always && ran_always && always_by_backend && na_kept,
+        offers_always && granted_always && ran_always && na_kept && next_session,
         Cause::Harness,
         format!(
-            "portée offerte={offers_always}, accordée={granted_always}, appel identique \
-             demandé par nexus et répondu par le backend (always)={always_by_backend}, règle \
-             gardée pour la personne et le projet={na_kept}"
+            "portée offerte={offers_always}, accordée={granted_always}, règle gardée pour la \
+             personne et la racine du projet={na_kept}, couvre la session suivante={next_session} \
+             (dans cette session, shell possiblement déplacé : redemandé={moved_here})"
         ),
     );
 

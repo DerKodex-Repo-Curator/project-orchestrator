@@ -94,3 +94,63 @@ async fn an_answer_is_refused_by_the_websocket_loop_when_the_owner_cannot_be_rea
     assert_eq!(refused["reason"], "owner_unreadable", "{refused}");
     assert_eq!(refused["request_id"], "pr_unread", "{refused}");
 }
+
+/// Review of #714, S1: an `always` answer from credentials that may not keep a lasting
+/// approval (here the anonymous user of a server without authentication, on a session
+/// nobody owns, which it may otherwise answer) is refused by the loop, naming its request;
+/// nothing reaches the routing.
+#[tokio::test]
+async fn an_always_answer_from_a_non_person_is_refused_by_the_websocket_loop() {
+    let session = test_chat_session(None);
+    let (_graph, mut ws) = connected(&session).await;
+    let frame =
+        json!({"type": "permission_response", "id": "pr_always", "allow": true, "scope": "always"});
+    ws.send(WsMessage::text(frame.to_string())).await.unwrap();
+    let refused = frame_where(&mut ws, |v| {
+        v["type"] == "error" && v["code"] == "permission_forbidden"
+    })
+    .await;
+    assert_eq!(refused["reason"], "not_a_person", "{refused}");
+    assert_eq!(refused["request_id"], "pr_always", "{refused}");
+}
+
+/// The predicate the loop applies: an MCP token, an agent's, the server's account or the
+/// anonymous user never answer `always`; a person's session token does; `once` / `session`
+/// and a denial are not concerned.
+#[test]
+fn only_a_person_signed_in_answers_always_on_the_websocket() {
+    use crate::api::ws_chat_handler::{lasting_answer_refused, AnswerRefusal};
+    use crate::auth::jwt::Claims;
+    use crate::chat::types::PermissionAnswerScope::{Always, Once, Session};
+    let person = Claims {
+        sub: uuid::Uuid::new_v4().to_string(),
+        email: "a@ffs.holdings".into(),
+        name: "A".into(),
+        iat: 0,
+        exp: 0,
+        token_type: None,
+        scope: None,
+        jti: None,
+    };
+    assert_eq!(lasting_answer_refused(&person, true, Always), None);
+    for kind in ["mcp", "agent_session", "vault"] {
+        let c = Claims {
+            token_type: Some(kind.into()),
+            ..person.clone()
+        };
+        assert_eq!(
+            lasting_answer_refused(&c, true, Always),
+            Some(AnswerRefusal::NotAPerson),
+            "{kind}"
+        );
+        assert_eq!(lasting_answer_refused(&c, true, Session), None, "{kind}");
+        assert_eq!(lasting_answer_refused(&c, true, Once), None, "{kind}");
+        assert_eq!(lasting_answer_refused(&c, false, Always), None, "{kind}");
+    }
+    for c in [Claims::service_account("po"), Claims::anonymous()] {
+        assert_eq!(
+            lasting_answer_refused(&c, true, Always),
+            Some(AnswerRefusal::NotAPerson)
+        );
+    }
+}
