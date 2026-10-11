@@ -242,15 +242,19 @@ impl ParentEnvelope {
         request: &mut ChatRequest,
         default_mode: &str,
     ) -> Result<(), EnvelopeError> {
-        // Directories: the child works inside what the parent can already see.
-        if !self.roots.iter().any(|r| is_within(r, &request.cwd)) {
+        // Directories: the child works inside what the parent can already see,
+        // UNLESS the parent is in trust mode (rock'n roll).
+        let enforce_scope = self.ceiling != "trust";
+        if enforce_scope && !self.roots.iter().any(|r| is_within(r, &request.cwd)) {
             return Err(EnvelopeError::CwdOutsideParent {
                 cwd: request.cwd.clone(),
             });
         }
-        for dir in request.add_dirs.iter().flatten() {
-            if !self.roots.iter().any(|r| is_within(r, dir)) {
-                return Err(EnvelopeError::AddDirOutsideParent { dir: dir.clone() });
+        if enforce_scope {
+            for dir in request.add_dirs.iter().flatten() {
+                if !self.roots.iter().any(|r| is_within(r, dir)) {
+                    return Err(EnvelopeError::AddDirOutsideParent { dir: dir.clone() });
+                }
             }
         }
 
@@ -667,6 +671,27 @@ mod tests {
                 dir: "/home/me/.ssh".into()
             }
         );
+    }
+
+    #[test]
+    fn trust_mode_allows_cwd_outside_parent() {
+        // In trust mode (rock'n roll), scope checks are bypassed
+        for cwd in ["/tmp/worktree", "/Users/other/project", "/anywhere"] {
+            let mut req = request(cwd, None);
+            envelope("trust").apply(&mut req, "default").unwrap();
+        }
+    }
+
+    #[test]
+    fn trust_mode_allows_add_dirs_outside_parent() {
+        // In trust mode, add_dirs can point anywhere
+        let mut req = request("/work/repo", None);
+        req.add_dirs = Some(vec![
+            "/tmp/worktree".into(),
+            "/home/me/.ssh".into(),
+            "/anywhere/else".into(),
+        ]);
+        envelope("trust").apply(&mut req, "default").unwrap();
     }
 
     #[test]
