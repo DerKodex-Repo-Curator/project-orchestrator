@@ -7,10 +7,15 @@ you register, allow per project, and (when it needs a key) grant a key to.
 
 | Provider | Engine | Notes |
 |---|---|---|
-| `claude-code` (built in) | the historical engine | hooks, message queue, auto-continue, retry, compaction, NATS and images all work |
+| `claude-code` (built in) | the **agent engine** (default), or the historical engine with `CHAT_PROVIDER_PATH=legacy` | hooks, message queue, auto-continue, retry, compaction, NATS and images work on both |
 | a registered instance (OpenAI-compatible, Codex, ACP) | the **agent engine** | always, whatever `CHAT_PROVIDER_PATH` says |
 
-`CHAT_PROVIDER_PATH=agent` puts **Claude Code on the agent engine** too. Default is `legacy`.
+Since M2 the agent engine is the default for Claude Code too: the parity matrix
+(`docs/parity/engines.md`) measures it on the same transcript as the historical engine.
+`CHAT_PROVIDER_PATH=legacy` keeps Claude Code on the historical engine.
+One difference is measured: on the agent engine, the compaction instructions the knowledge
+graph builds (`PreCompact`) are not handed to the CLI (the nexus façade has no slot for them;
+task M2c checks whether the CLI reads them at all).
 The agent engine ports hooks, message queue, auto-continue, retry, compaction and NATS.
 Every `system_init` of an agent session carries `engine: "agent"` and `degraded_features`,
 the list of what that session does not do, for instance:
@@ -24,8 +29,10 @@ the list of what that session does not do, for instance:
 
 For a Claude Code session the server logs a warning naming that list, and nothing when it is
 empty.
-A session opened on the agent engine cannot be resumed once that engine is switched off:
-the answer is `409 engine_unavailable`.
+The engine is frozen when a conversation opens, like its provider: a conversation resumes on
+the engine it was opened on, whatever `CHAT_PROVIDER_PATH` says now. A conversation opened
+on the historical engine before the switch keeps it, and moving back to `legacy` breaks no
+conversation opened on the agent engine.
 
 ## Before the first connection
 
@@ -216,7 +223,7 @@ Two counters: *marginal* (reported or priced: real spend, the only one that can 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHAT_PROVIDER_PATH` | `legacy` | `agent` forces Claude Code onto the agent engine (degraded, warned) |
+| `CHAT_PROVIDER_PATH` | `agent` | `legacy` keeps Claude Code on the historical engine (new conversations only; an unknown value is the default) |
 | `CHAT_PROVIDER_ENV_CREDENTIALS` | empty | server variables an instance may name as `env:<VAR>` |
 | `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch: `name: [argv]` or `name: {"argv": [...], "per_session_mcp": false}` |
 | `CHAT_CHILD_ENV_INHERIT` | empty | extra variables handed to agent processes (never the server's own secrets) |

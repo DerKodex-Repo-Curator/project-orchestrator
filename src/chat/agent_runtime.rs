@@ -2118,27 +2118,59 @@ async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent:
     handle.sync_resume_token().await;
 }
 
-/// The built-in provider instances: Claude Code, with the CLI path of the
-/// server configuration. The nexus registry replaces this.
+/// The CLI path of the built-in Claude Code, shared by the chat manager (which changes it
+/// at runtime: `ChatManager::update_claude_cli_path`, the CLI installed from the UI) and
+/// [`BuiltinProviders`] (which reads it at every opening).
+pub type ClaudeCliPath = Arc<std::sync::RwLock<Option<String>>>;
+
+/// The built-in provider instances: Claude Code, on the CLI path the server is
+/// configured with NOW. The nexus registry replaces this.
 pub struct BuiltinProviders {
-    claude: Arc<dyn AgentProvider>,
+    cli_path: ClaudeCliPath,
+    /// The provider built for the path it was built with: rebuilt when the path changes
+    /// (the historical engine reads the path at every opening; so does this one, M2).
+    claude: std::sync::Mutex<(Option<String>, Arc<dyn AgentProvider>)>,
 }
 
 impl BuiltinProviders {
-    /// The built-in instances.
+    /// The built-in instances, on a path nobody changes afterwards.
     pub fn new(claude_cli_path: Option<String>) -> Self {
+        Self::following(Arc::new(std::sync::RwLock::new(claude_cli_path)))
+    }
+
+    /// The built-in instances, on the path `cli_path` holds at each opening.
+    pub fn following(cli_path: ClaudeCliPath) -> Self {
+        let path = cli_path.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let claude = Self::claude_on(path.clone());
+        Self {
+            cli_path,
+            claude: std::sync::Mutex::new((path, claude)),
+        }
+    }
+
+    fn claude_on(path: Option<String>) -> Arc<dyn AgentProvider> {
         use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
         let mut config = ClaudeCodeConfig::default();
-        config.cli_path = claude_cli_path.map(std::path::PathBuf::from);
-        Self {
-            claude: Arc::new(ClaudeCodeProvider::new(config)),
-        }
+        config.cli_path = path.map(std::path::PathBuf::from);
+        Arc::new(ClaudeCodeProvider::new(config))
     }
 }
 
 impl ProviderSource for BuiltinProviders {
     fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
-        (provider_id == super::provider::resolver::CLAUDE_CODE).then(|| Arc::clone(&self.claude))
+        if provider_id != super::provider::resolver::CLAUDE_CODE {
+            return None;
+        }
+        let path = self
+            .cli_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut built = self.claude.lock().unwrap_or_else(|e| e.into_inner());
+        if built.0 != path {
+            *built = (path.clone(), Self::claude_on(path));
+        }
+        Some(Arc::clone(&built.1))
     }
 }
 

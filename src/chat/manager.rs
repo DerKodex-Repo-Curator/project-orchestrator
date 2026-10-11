@@ -849,6 +849,9 @@ pub struct ChatManager {
     pub(crate) agent_runtime: Arc<super::agent_runtime::AgentRuntime>,
     /// Where the agent path finds a provider instance.
     pub(crate) provider_source: Arc<dyn super::agent_runtime::ProviderSource>,
+    /// The CLI path the built-in Claude Code of the agent engine opens with: the one
+    /// `update_claude_cli_path` sets, as the historical engine reads it (M2).
+    builtin_cli_path: super::agent_runtime::ClaudeCliPath,
     /// The cognitive router (R2), when wired. `None` keeps the declarative
     /// resolution exactly as it was.
     pub(crate) cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
@@ -3112,8 +3115,10 @@ impl ChatManager {
             super::agent_runtime::AgentRuntime::new(graph.clone())
                 .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
         );
+        let builtin_cli_path: super::agent_runtime::ClaudeCliPath =
+            Arc::new(std::sync::RwLock::new(config.claude_cli_path.clone()));
         let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
-            super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
+            super::agent_runtime::BuiltinProviders::following(Arc::clone(&builtin_cli_path)),
         );
         Self {
             graph,
@@ -3122,6 +3127,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            builtin_cli_path,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
@@ -3203,8 +3209,10 @@ impl ChatManager {
             super::agent_runtime::AgentRuntime::new(graph.clone())
                 .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
         );
+        let builtin_cli_path: super::agent_runtime::ClaudeCliPath =
+            Arc::new(std::sync::RwLock::new(config.claude_cli_path.clone()));
         let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
-            super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
+            super::agent_runtime::BuiltinProviders::following(Arc::clone(&builtin_cli_path)),
         );
         Self {
             graph,
@@ -3213,6 +3221,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            builtin_cli_path,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
@@ -3911,6 +3920,10 @@ impl ChatManager {
     /// Update the explicit Claude CLI binary path.
     pub async fn update_claude_cli_path(&self, path: Option<String>) {
         super::cli_version::set_configured_cli_path(path.clone());
+        *self
+            .builtin_cli_path
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = path.clone();
         self.env_config.write().await.claude_cli_path = path;
         self.claude_cli.forget();
     }
@@ -11372,10 +11385,11 @@ impl ChatManager {
     /// used to skip it: review of #697, finding 9): a session stored without a slug
     /// (all-projects mode) gets the project inferred from its cwd, as `create_session`
     /// does; its provider stays the one frozen at open (A16) — the legacy path only drives
-    /// Claude Code, so a session bound to another provider cannot be resumed there — and a
-    /// session of the agent engine resumes only when that engine is switched on (a Claude
-    /// Code session forced onto it needs the flag still on: otherwise a typed, explicit
-    /// error, not a mute `provider_unavailable`).
+    /// Claude Code, so a session bound to another provider cannot be resumed there — and its
+    /// ENGINE is frozen too (M2): a session opened on the agent engine resumes there and a
+    /// legacy one on the legacy engine, whatever `CHAT_PROVIDER_PATH` says now. Switching
+    /// the default to the agent engine breaks no conversation, and neither does switching
+    /// back to `legacy`.
     pub(crate) async fn ready_for_resume(&self, node: &mut ChatSessionNode) -> Result<()> {
         if node.project_slug.is_none() {
             node.project_slug = infer_session_project(
@@ -11394,22 +11408,18 @@ impl ChatManager {
             &super::provider::resolver::BuiltinCatalog,
         )
         .map_err(anyhow::Error::new)?;
-        if node.capabilities.is_none() {
-            if frozen.provider_id != super::provider::resolver::CLAUDE_CODE {
-                return Err(anyhow::Error::new(
-                    super::provider::resolver::ResolveError::Unavailable {
-                        provider_id: frozen.provider_id,
-                        role: super::provider::resolver::Role::Pilot,
-                    },
-                ));
-            }
-        } else if !self.engine_is_agent(&frozen.provider_id) {
+        if node.capabilities.is_none()
+            && frozen.provider_id != super::provider::resolver::CLAUDE_CODE
+        {
             return Err(anyhow::Error::new(
-                super::provider::resolver::ResolveError::EngineUnavailable {
+                super::provider::resolver::ResolveError::Unavailable {
                     provider_id: frozen.provider_id,
+                    role: super::provider::resolver::Role::Pilot,
                 },
             ));
         }
+        // A session of the agent engine (its capability snapshot) resumes there whatever
+        // `CHAT_PROVIDER_PATH` says now: the engine is frozen at opening, like the provider.
         Ok(())
     }
 
@@ -14473,6 +14483,11 @@ impl ChatManager {
         // bridge, `per_session_mcp`): the PO tools are NOT given to it, and
         // `system_init.degraded_features` says so (`project_orchestrator_tools`,
         // [`host_degraded`]).
+        // The vault token minted for the session's PO server, for a local Claude Code's own
+        // shell too (below), as the historical engine gives it.
+        let vault_token = po_env
+            .as_ref()
+            .and_then(|env| env.get("PO_VAULT_TOKEN").cloned());
         if let Some(env) = po_env {
             spec.mcp_servers.insert(
                 PO_MCP_SERVER.to_string(),
@@ -14560,6 +14575,21 @@ impl ChatManager {
             inherit: Self::child_env_inherit_names(),
             set: Default::default(),
         };
+        // What the historical engine sets in a local Claude CLI's environment, so its shell
+        // behaves the same on the agent engine (M2): the operator's PATH (`process_path`),
+        // and what `orchestrator secret get` needs to read a granted secret through a pipe.
+        if kind == nexus_claude::agent::ProviderKind::ClaudeCode && remote_cwd.is_none() {
+            if let Some(path) = self.env_config.read().await.process_path.clone() {
+                spec.env.set.insert("PATH".to_string(), path);
+            }
+            if let Some(token) = vault_token {
+                spec.env.set.insert("PO_VAULT_TOKEN".to_string(), token);
+                spec.env.set.insert(
+                    "PO_SERVER_URL".to_string(),
+                    format!("http://127.0.0.1:{}", self.config.server_port),
+                );
+            }
+        }
         // The knowledge graph's hooks, for the providers that run hooks in their loop. A
         // remote session has no local project to resolve a file against.
         let runs_hooks = remote_cwd.is_none()
@@ -16319,9 +16349,11 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    /// The configuration of the manager tests: Claude Code on the HISTORICAL engine, which
+    /// most of them exercise (the default is the agent engine since M2: `agent_manager`).
     fn test_config() -> ChatConfig {
         ChatConfig {
-            provider_path: Default::default(),
+            provider_path: crate::chat::config::ProviderPath::Legacy,
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             nexus_tools_path: None,
             nexus_browser_path: None,
@@ -17410,6 +17442,96 @@ mod tests {
         assert!(!has_hooks(ProviderKind::ClaudeCode, Some("~/w"), scope(false)).await);
         // No scope, no hooks.
         assert!(!has_hooks(ProviderKind::Native, None, None).await);
+    }
+
+    /// M2: a local Claude Code on the agent engine gets in its own environment what the
+    /// historical engine gives its CLI (`build_options`): the operator's PATH, and what
+    /// `orchestrator secret get` needs in its shell. Not a remote one, not another provider.
+    #[tokio::test]
+    async fn a_local_claude_code_on_the_agent_engine_gets_the_shell_environment_of_the_historical_engine(
+    ) {
+        use nexus_claude::agent::ProviderKind;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        config.server_port = 18123;
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config)
+            .with_vault(crate::vault::VaultService::ephemeral());
+        manager
+            .update_process_path(Some("/opt/tools/bin:/usr/bin:/bin".into()))
+            .await;
+        let claims = crate::auth::jwt::Claims::service_account("env");
+        let env_of = |kind: ProviderKind, remote: Option<&'static str>| {
+            let manager = &manager;
+            let claims = &claims;
+            async move {
+                manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(claims),
+                        session_id: "env-s1",
+                        third_party: kind != ProviderKind::ClaudeCode,
+                        max_tokens: None,
+                        kind,
+                        remote_cwd: remote,
+                        per_session_mcp: true,
+                        hooks: None,
+                    })
+                    .await
+                    .unwrap()
+                    .env
+                    .set
+            }
+        };
+        let env = env_of(ProviderKind::ClaudeCode, None).await;
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/tools/bin:/usr/bin:/bin")
+        );
+        assert!(
+            env.get("PO_VAULT_TOKEN").is_some_and(|t| !t.is_empty()),
+            "{:?}",
+            env.keys()
+        );
+        assert_eq!(
+            env.get("PO_SERVER_URL").map(String::as_str),
+            Some("http://127.0.0.1:18123")
+        );
+        // A remote machine gets none of it; the native harness has its own shell (nexus-tools).
+        assert!(env_of(ProviderKind::ClaudeCode, Some("~/w"))
+            .await
+            .is_empty());
+        assert!(env_of(ProviderKind::Native, None).await.is_empty());
+    }
+
+    /// M2: the built-in Claude Code of the agent engine opens with the CLI path set NOW
+    /// (`update_claude_cli_path`: the CLI installed or moved at runtime), as the historical
+    /// engine reads it at every opening — not the path the server started with.
+    #[tokio::test]
+    async fn the_builtin_claude_code_follows_the_cli_path_changed_at_runtime() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let cc = crate::chat::provider::resolver::CLAUDE_CODE;
+        let first = manager.provider_source.get(cc).expect("built in");
+        let same = manager.provider_source.get(cc).expect("built in");
+        assert!(
+            Arc::ptr_eq(&first, &same),
+            "unchanged path: the same provider"
+        );
+        manager
+            .update_claude_cli_path(Some("/opt/claude/bin/claude".into()))
+            .await;
+        assert_eq!(
+            manager.builtin_cli_path.read().unwrap().as_deref(),
+            Some("/opt/claude/bin/claude")
+        );
+        let moved = manager.provider_source.get(cc).expect("built in");
+        assert!(!Arc::ptr_eq(&first, &moved), "rebuilt on the new path");
+        crate::chat::cli_version::set_configured_cli_path(None);
     }
 
     #[tokio::test]
@@ -20500,15 +20622,16 @@ mod tests {
         assert_eq!(fake.state.turns_started.lock().unwrap().len(), 1);
     }
 
-    /// Finding 9 of #697: the recovery checks what a person's resume checks. A Claude Code
-    /// session forced onto the agent engine, after a restart WITHOUT the flag, is not
-    /// reopened on the agent engine behind the person's back: closed, typed refusal.
+    /// Finding 9 of #697, M2: the recovery checks what a person's resume checks, and the
+    /// engine is frozen at opening. A Claude Code session of the agent engine, after a
+    /// restart with `CHAT_PROVIDER_PATH=legacy` (a rollback of the default), is resumed on
+    /// the agent engine it was opened on — no longer closed with `engine_unavailable`.
     #[tokio::test]
-    async fn the_recovery_refuses_a_session_whose_engine_was_switched_off() {
-        let (manager, graph, fake, sid) = restarted_with(
+    async fn the_recovery_resumes_an_agent_session_on_its_engine_after_a_rollback_to_legacy() {
+        let (manager, _graph, fake, _sid) = restarted_with(
             &[("user_message", "{}"), ("assistant_text", "{}")],
             chrono::Duration::zero(),
-            |config| config.provider_path = Default::default(),
+            |config| config.provider_path = crate::chat::config::ProviderPath::Legacy,
         )
         .await;
         let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
@@ -20516,9 +20639,8 @@ mod tests {
         let report = manager
             .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
             .await;
-        assert_eq!((report.resumed, report.failed), (0, 1));
-        assert!(fake.state.turns_started.lock().unwrap().is_empty());
-        assert_closed_by_recovery(&events_of(&graph, sid).await);
+        assert_eq!((report.resumed, report.failed), (1, 0));
+        assert_eq!(fake.state.turns_started.lock().unwrap().len(), 1);
     }
 
     /// Finding 7 of #697: a locked vault holds back only the sessions whose provider reads
@@ -22030,7 +22152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_code_stays_on_the_legacy_engine_by_default_hooks_included() {
+    async fn claude_code_stays_on_the_legacy_engine_when_the_operator_says_legacy() {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let dyn_graph: Arc<dyn GraphStore> = graph.clone();
         let state = mock_app_state();
@@ -22043,7 +22165,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
             .with_provider_source(Arc::new(fake.clone()));
         // The Claude CLI is not there in tests: the call may fail, but it must
-        // NOT have gone through the agent engine: the default keeps Claude Code legacy.
+        // NOT have gone through the agent engine: `CHAT_PROVIDER_PATH=legacy` holds.
         let _ = manager.create_session(&agent_request("hello")).await;
         assert_eq!(manager.agent_runtime.len().await, 0);
         assert!(
@@ -22056,6 +22178,34 @@ mod tests {
             nodes[0].capabilities.is_none(),
             "no agent snapshot: it is a legacy session"
         );
+    }
+
+    /// M2: with nothing configured, Claude Code opens on the agent engine — and says it
+    /// lacks nothing a local Claude Code has (hooks in protocol, MCP per session, nested
+    /// sub-agents, its own compaction).
+    #[tokio::test]
+    async fn claude_code_opens_on_the_agent_engine_by_default() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::default();
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        {
+            use nexus_claude::agent::{HookSupport, SubagentSupport};
+            let mut caps = fake.caps.lock().unwrap();
+            caps.hooks = HookSupport::InProtocol;
+            caps.per_session_mcp = true;
+            caps.subagents = SubagentSupport::Nested;
+            caps.compaction_signal = true;
+            caps.images = true;
+        }
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert_eq!(wire["engine"], "agent", "{wire}");
+        assert_eq!(wire["degraded_features"], serde_json::json!([]), "{wire}");
+        let nodes: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert!(nodes[0].capabilities.is_some(), "an agent snapshot");
     }
 
     #[tokio::test]
@@ -22381,27 +22531,35 @@ mod tests {
         assert!(matches!(result, ChatEvent::Result { is_error: true, .. }));
     }
 
+    /// M2: the engine is frozen at opening. A Claude Code session opened on the agent
+    /// engine (the default) still resumes there once the operator rolls back to
+    /// `CHAT_PROVIDER_PATH=legacy` — it used to be refused with `409 engine_unavailable`.
     #[tokio::test]
-    async fn an_agent_session_of_claude_code_resumed_without_the_engine_is_a_typed_engine_error() {
-        let (manager, graph, _fake) = agent_manager();
+    async fn an_agent_session_of_claude_code_resumes_on_the_agent_engine_after_a_rollback() {
+        let (manager, graph, fake) = agent_manager();
         let sid = manager
             .create_session(&agent_request("one"))
             .await
             .unwrap()
             .session_id;
         manager.agent_runtime.close(&sid).await.unwrap();
-        // The flag is back to its default: the engine of that session is not available.
+        // The operator sets the flag back to legacy (test_config) and restarts.
         let state = mock_app_state();
         let dyn_graph: Arc<dyn GraphStore> = graph.clone();
-        let legacy = ChatManager::new_without_memory(dyn_graph, state.meili, test_config());
-        let err = legacy.resume_session(&sid, "two", None).await.unwrap_err();
-        let failure =
-            crate::chat::provider::errors::classify_open_error(&err, None).expect("typed");
-        assert_eq!((failure.status, failure.code), (409, "engine_unavailable"));
+        let legacy = ChatManager::new_without_memory(dyn_graph, state.meili, test_config())
+            .with_provider_source(Arc::new(fake.clone()));
+        assert_eq!(
+            legacy.config.provider_path,
+            crate::chat::config::ProviderPath::Legacy
+        );
+        legacy
+            .resume_session(&sid, "two", None)
+            .await
+            .expect("resumed on the engine it was opened on");
+        assert!(legacy.agent_runtime.owns(&sid).await, "the agent engine");
         assert!(
-            failure.message.contains("CHAT_PROVIDER_PATH"),
-            "{}",
-            failure.message
+            legacy.active_sessions.read().await.get(&sid).is_none(),
+            "not legacy"
         );
     }
 
