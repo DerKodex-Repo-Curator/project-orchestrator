@@ -10,9 +10,20 @@ you register, allow per project, and (when it needs a key) grant a key to.
 | `claude-code` (built in) | the historical engine | hooks, message queue, auto-continue, retry, compaction, NATS and images all work |
 | a registered instance (OpenAI-compatible, Codex, ACP) | the **agent engine** | always, whatever `CHAT_PROVIDER_PATH` says |
 
-`CHAT_PROVIDER_PATH=agent` only **forces Claude Code onto the agent engine**, to try it. The
-server logs a warning and every `system_init` of that session carries `engine: "agent"` and
-`degraded_features` (the list of what the session does not do). Default is `legacy`.
+`CHAT_PROVIDER_PATH=agent` puts **Claude Code on the agent engine** too. Default is `legacy`.
+The agent engine ports hooks, message queue, auto-continue, retry, compaction and NATS.
+Every `system_init` of an agent session carries `engine: "agent"` and `degraded_features`,
+the list of what that session does not do, for instance:
+
+- `subagents`: an ACP agent has no sub-agents, and the backend runs `Agent` calls as child
+  sessions for the native harness only;
+- `compaction`: a native model whose context window is unknown (the endpoint's probe and
+  catalogue give none) is never compacted: the native harness compacts against that window;
+- `images`, `project_orchestrator_tools`, `nexus_tools`: what the model, the provider or the
+  installation lacks.
+
+For a Claude Code session the server logs a warning naming that list, and nothing when it is
+empty.
 A session opened on the agent engine cannot be resumed once that engine is switched off:
 the answer is `409 engine_unavailable`.
 

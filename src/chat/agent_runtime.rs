@@ -352,15 +352,26 @@ pub const NEXUS_TOOLS_FEATURE: &str = "nexus_tools";
 /// `ChatManager::carries_per_session_mcp`).
 pub const PO_TOOLS_FEATURE: &str = "project_orchestrator_tools";
 
+/// The identifier of a session whose provider has no sub-agents of its own
+/// (`SubagentSupport::None`) and that the host gives no fallback: the backend runs the
+/// `Agent` calls as child sessions for the native harness only
+/// (`super::subagents::SubagentHooks`), so an ACP agent has none (M2, gap D3 of M0).
+pub const SUBAGENTS_FEATURE: &str = "subagents";
+
 /// What a session on the agent engine does NOT do, as the identifiers the
-/// frontend knows (`hooks`, `message_queue`, `auto_continue`, `compaction`,
-/// `nats`, `enrichment`, `images`, and [`NEXUS_TOOLS_FEATURE`] added by the host).
+/// frontend knows (`hooks`, `compaction`, `images`, [`PO_TOOLS_FEATURE`]; the
+/// host adds [`NEXUS_TOOLS_FEATURE`] and [`kind_degraded`]).
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
-///   nothing any more (enrichment, message queue, auto-continue, NATS are ported);
+///   nothing any more (enrichment, message queue, auto-continue, retry, NATS are
+///   ported);
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
+///
+/// `thinking` is never listed: a model that does not reason has nothing the engine
+/// drops (the reasoning a provider emits is carried on every engine), and the frozen
+/// capabilities already say `thinking: false` (M2, gap D4 of M0: refuted).
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // `retry` is NOT listed: the engine retries a retryable `done.error` (B15).
     // `enrichment` is NOT listed: every turn gets the graph context (`TurnServices::prepare`).
@@ -387,6 +398,28 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
         missing.push(PO_TOOLS_FEATURE);
     }
     missing.into_iter().map(str::to_string).collect()
+}
+
+/// What a session of `kind` lacks that its capabilities do not say by themselves, as
+/// `degraded_features` entries (M2, gaps D2 and D3 of M0):
+/// - `compaction` for a native session whose context window is unknown: the native
+///   harness compacts against the window (`should_compact` of nexus returns `false`
+///   without one), so its `compaction_signal: true` would be a promise nobody keeps.
+///   Measured: an OpenAI-compatible endpoint that reports no window (`fake_openai`,
+///   `probe.context_window: null`). Claude Code and Codex compact in their own loop;
+/// - [`SUBAGENTS_FEATURE`] for a provider without sub-agents of its own
+///   (`SubagentSupport::None`) other than the native harness, the only one the host
+///   runs child sessions for.
+pub fn kind_degraded(kind: nexus_claude::agent::ProviderKind, caps: &Capabilities) -> Vec<String> {
+    use nexus_claude::agent::{ProviderKind, SubagentSupport};
+    let mut missing = Vec::new();
+    if kind == ProviderKind::Native && caps.compaction_signal && caps.context_window.is_none() {
+        missing.push("compaction".to_string());
+    }
+    if kind != ProviderKind::Native && caps.subagents == SubagentSupport::None {
+        missing.push(SUBAGENTS_FEATURE.to_string());
+    }
+    missing
 }
 
 /// What a turn of the agent engine did, for what the host does after it
@@ -2498,6 +2531,59 @@ mod mask_tests {
         // ...unless it cannot carry the MCP server either (remote Claude Code: given no hooks).
         caps.per_session_mcp = false;
         assert!(degraded_features(&caps).iter().any(|f| f == "hooks"));
+    }
+
+    /// M2 (gaps D2, D3 of M0): compaction and sub-agents, by provider kind.
+    #[test]
+    fn kind_degraded_says_compaction_without_a_window_and_subagents_without_a_fallback() {
+        use nexus_claude::agent::{
+            ContextWindow, ContextWindowSource, ProviderKind, SubagentSupport,
+        };
+        let mut caps = Capabilities::none();
+        caps.compaction_signal = true;
+        // The native harness compacts against the window: none known, none done.
+        assert_eq!(
+            kind_degraded(ProviderKind::Native, &caps),
+            vec!["compaction"]
+        );
+        // Claude Code, Codex, ACP compact in their own loop (or say they do not).
+        for kind in [
+            ProviderKind::ClaudeCode,
+            ProviderKind::Codex,
+            ProviderKind::Acp,
+        ] {
+            assert!(
+                !kind_degraded(kind, &caps).iter().any(|f| f == "compaction"),
+                "{kind:?}"
+            );
+        }
+        caps.context_window = Some(ContextWindow {
+            value: 64_000,
+            source: ContextWindowSource::Configured,
+        });
+        assert!(kind_degraded(ProviderKind::Native, &caps).is_empty());
+        // No compaction signal at all is `degraded_features`' to say, not listed twice.
+        caps.compaction_signal = false;
+        caps.context_window = None;
+        assert!(kind_degraded(ProviderKind::Native, &caps).is_empty());
+
+        // Sub-agents: an ACP agent has none and the host has no fallback for it...
+        assert_eq!(
+            kind_degraded(ProviderKind::Acp, &caps),
+            vec![SUBAGENTS_FEATURE]
+        );
+        // ...the native harness gets child sessions from the host (A18)...
+        assert!(!kind_degraded(ProviderKind::Native, &caps)
+            .iter()
+            .any(|f| f == SUBAGENTS_FEATURE));
+        // ...and a provider that reports its own is not told it lacks them.
+        for (kind, support) in [
+            (ProviderKind::ClaudeCode, SubagentSupport::Nested),
+            (ProviderKind::Codex, SubagentSupport::SeparateThread),
+        ] {
+            caps.subagents = support;
+            assert!(kind_degraded(kind, &caps).is_empty(), "{kind:?}");
+        }
     }
 
     /// VERIFIER: the engine retries (B15), so `retry` must not be announced as missing.
