@@ -11813,17 +11813,86 @@ mod native_subagents {
     use super::parity::{caps, Tapped};
     use super::*;
     use nexus_claude::agent::{
-        AgentEvent, AgentProvider, AgentSession, Capabilities, ModelInfo, ProviderError,
-        ProviderHealth, ProviderKind, ResumeToken, SessionSpec, StopReason, SubagentRequest,
+        AgentEvent, AgentProvider, AgentSession, CancelOutcome, CancelScope, Capabilities,
+        EventStream, InterruptOutcome, InterruptScope, ModelInfo, PermissionDecision, PolicyMode,
+        ProviderError, ProviderHealth, ProviderKind, QuestionAnswer, ResumeToken, SessionSpec,
+        StopReason, SubagentRequest, TurnInput,
     };
     use nexus_claude::testkit::{steps, Script, ScriptedProvider, Step};
 
+    /// A session whose FIRST turn takes `ms` to be accepted by the provider. That is the
+    /// window INSIDE `create_session` where the child is already live — registered in the
+    /// runtime, its first message on the way — while its id is not yet known to the caller
+    /// of `run_subagent` (P18b, fix 2).
+    struct SlowFirstTurn {
+        inner: Arc<dyn AgentSession>,
+        ms: u64,
+        first: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for SlowFirstTurn {
+        fn capabilities(&self) -> &Capabilities {
+            self.inner.capabilities()
+        }
+        fn resume_token(&self) -> Option<ResumeToken> {
+            self.inner.resume_token()
+        }
+        async fn send_turn(&self, input: TurnInput) -> Result<EventStream, ProviderError> {
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(self.ms)).await;
+            }
+            self.inner.send_turn(input).await
+        }
+        async fn answer_permission(
+            &self,
+            request_id: &str,
+            decision: PermissionDecision,
+        ) -> Result<(), ProviderError> {
+            self.inner.answer_permission(request_id, decision).await
+        }
+        async fn answer_question(
+            &self,
+            question_id: &str,
+            answer: QuestionAnswer,
+        ) -> Result<(), ProviderError> {
+            self.inner.answer_question(question_id, answer).await
+        }
+        async fn interrupt(
+            &self,
+            scope: InterruptScope,
+        ) -> Result<InterruptOutcome, ProviderError> {
+            self.inner.interrupt(scope).await
+        }
+        async fn cancel_tools(&self, scope: CancelScope) -> Result<CancelOutcome, ProviderError> {
+            self.inner.cancel_tools(scope).await
+        }
+        async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
+            self.inner.set_model(model).await
+        }
+        async fn set_policy_mode(
+            &self,
+            mode: PolicyMode,
+            native: Option<&str>,
+        ) -> Result<(), ProviderError> {
+            self.inner.set_policy_mode(mode, native).await
+        }
+        fn out_of_band(&self) -> Option<EventStream> {
+            self.inner.out_of_band()
+        }
+        async fn close(&self) -> Result<(), ProviderError> {
+            self.inner.close().await
+        }
+    }
+
     /// The scripted provider, each opening taking `open_ms`: the window between the count of
     /// the live children and the registration of a new one that a real endpoint opens too.
+    /// `turn_ms` stretches the FIRST turn of every session it opens ([`SlowFirstTurn`]).
     #[derive(Clone)]
     struct SlowOpen {
         inner: Tapped,
         open_ms: u64,
+        turn_ms: u64,
     }
 
     #[async_trait::async_trait]
@@ -11845,7 +11914,15 @@ mod native_subagents {
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
             tokio::time::sleep(Duration::from_millis(self.open_ms)).await;
-            self.inner.open(spec).await
+            let session = self.inner.open(spec).await?;
+            if self.turn_ms == 0 {
+                return Ok(session);
+            }
+            Ok(Arc::new(SlowFirstTurn {
+                inner: session,
+                ms: self.turn_ms,
+                first: std::sync::atomic::AtomicBool::new(true),
+            }))
         }
         async fn resume(
             &self,
@@ -11871,10 +11948,16 @@ mod native_subagents {
 
     /// A native parent session opened in `mode`; every child plays `child_turn`.
     async fn rig(child_turn: Vec<Step>, mode: &str) -> Rig {
-        rig_slow(child_turn, mode, 0).await
+        rig_with(child_turn, mode, 0, 0).await
     }
 
     async fn rig_slow(child_turn: Vec<Step>, mode: &str, open_ms: u64) -> Rig {
+        rig_with(child_turn, mode, open_ms, 0).await
+    }
+
+    /// [`rig`], the provider taking `open_ms` to open a session and `turn_ms` to accept its
+    /// first turn.
+    async fn rig_with(child_turn: Vec<Step>, mode: &str, open_ms: u64, turn_ms: u64) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let mut project = crate::test_helpers::test_project();
@@ -11907,6 +11990,7 @@ mod native_subagents {
                 Arc::new(SlowOpen {
                     inner: provider,
                     open_ms,
+                    turn_ms,
                 }),
             ),
         );
@@ -11945,6 +12029,38 @@ mod native_subagents {
                 .clone()
                 .run_subagent(&self.parent, None, &SubagentRequest::new(call, "do it"))
                 .await
+        }
+
+        fn parent_uuid(&self) -> Uuid {
+            Uuid::parse_str(&self.parent).unwrap()
+        }
+
+        async fn parent_node(&self) -> crate::neo4j::models::ChatSessionNode {
+            self.graph
+                .get_chat_session(self.parent_uuid())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// A child of the parent opened the way `chat(send_message)` opens one: `spawned_by`
+        /// says `conversation`, with NO `tool_use_id`.
+        async fn open_send_message_child(&self) -> String {
+            let parent = self.parent_node().await;
+            let mut req = request(None, parent.project_slug.as_deref(), "default");
+            req.message = "you too".into();
+            req.cwd = parent.cwd.clone();
+            req.spawned_by = Some(crate::chat::envelope::conversation_spawned_by(
+                self.parent_uuid(),
+            ));
+            self.manager.create_session(&req).await.unwrap().session_id
+        }
+
+        async fn events_of(&self, sid: &str) -> Vec<crate::neo4j::models::ChatEventRecord> {
+            self.graph
+                .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+                .await
+                .unwrap_or_default()
         }
     }
 
@@ -12068,6 +12184,180 @@ mod native_subagents {
         let out = r.run("ca1").await;
         assert!(out.as_ref().is_err_and(|e| e.contains("failed")), "{out:?}");
         assert!(r.none_alive().await);
+    }
+
+    /// P18b, fix 2: the parent's turn is interrupted while the child is still OPENING — the
+    /// child is already live (registered, its first message on the way) but `run_subagent`
+    /// does not know its id yet. The child must not be left running with nobody awaiting it.
+    ///
+    /// Red before the fix: the whole `run_subagent` future, `create_session` included, was
+    /// dropped mid-open, and the `CloseOnDrop` guard was only armed on its return — the
+    /// child ran on for ever.
+    #[tokio::test]
+    async fn a_call_cancelled_while_the_child_opens_still_closes_it() {
+        let r = Arc::new(rig_with(vec![Step::AwaitInterrupt], "default", 0, 2_000).await);
+        let call = {
+            let r = r.clone();
+            tokio::spawn(async move { r.run("c0").await })
+        };
+        // The window of the defect: the child is live, the call has not returned.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r.none_alive().await || r.children().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!call.is_finished(), "the opening is still running");
+        let child = r.children().await[0].id.to_string();
+        call.abort();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !r.none_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a call cancelled during the opening must still close its child"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(r.children().await.len(), 1, "one child, and it is closed");
+        assert!(
+            r.events_of(&child)
+                .await
+                .iter()
+                .any(|e| e.event_type == "session_closed"),
+            "the close is on the child's thread: {:?}",
+            r.events_of(&child)
+                .await
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_none());
+    }
+
+    /// P18b, fix 3: after a restart, the child of an `Agent` call is NOT resumed. Its
+    /// parent's own resume re-issues the call, so resuming the child too would run the same
+    /// work twice (two agents editing the same files), its answer would reach nobody, and it
+    /// would hold one of the parent's four slots. It is closed instead (it stays resumable
+    /// and visible). A child opened by `chat(send_message)` — `conversation` with no
+    /// `tool_use_id` — keeps its behaviour: it is resumed.
+    #[tokio::test]
+    async fn after_a_restart_the_child_of_an_agent_call_is_closed_not_resumed() {
+        let r = Arc::new(rig(vec![Step::AwaitInterrupt], "default").await);
+        let call = {
+            let r = r.clone();
+            tokio::spawn(async move { r.run("c0").await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r.children().await.is_empty() || r.none_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sub-agent's child never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let agent_child = r.children().await[0].id.to_string();
+        let plain_child = r.open_send_message_child().await;
+        assert_ne!(agent_child, plain_child);
+
+        // The server after the restart, over the same graph: neither child is live for it.
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        let next =
+            ChatManager::new_without_memory(graph, mock_app_state().meili, Default::default());
+        let (pending, scan) = next.scan_interrupted_turns().await.unwrap();
+        let resumed: Vec<String> = pending.iter().map(|p| p.node.id.to_string()).collect();
+        assert!(
+            !resumed.contains(&agent_child),
+            "the child of an `Agent` call is not resumed: {resumed:?}"
+        );
+        assert!(
+            resumed.contains(&plain_child),
+            "a chat(send_message) child is still resumed: {resumed:?}"
+        );
+        assert!(scan.closed >= 1, "{scan:?}");
+        let closed = r.events_of(&agent_child).await;
+        assert!(
+            closed
+                .iter()
+                .any(|e| e.event_type == "error" && e.data.contains("restart_interrupted")),
+            "the child is closed on its thread: {:?}",
+            closed
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+
+        call.abort();
+        let _ = r.manager.close_session(&plain_child).await;
+    }
+
+    /// P18b, fix 4: the child's `result` was among the events the broadcast dropped. The
+    /// parent must read the thread back instead of waiting for its own 30-minute turn
+    /// timeout. Red before the fix: `Lagged` was a bare `continue`, so the call ended on the
+    /// stream closing ("ended before it answered") and, in production, on the timeout.
+    #[tokio::test]
+    async fn a_lagged_subscription_reads_the_answer_back_from_the_thread() {
+        let r = Arc::new(rig(answer("UNUSED"), "default").await);
+        // A child's id with nothing on its thread yet: only the thread is read here, so no
+        // session has to be opened for it.
+        let uuid = Uuid::new_v4();
+        let sid = uuid.to_string();
+
+        let said = |t: &str| ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: None,
+        };
+        // Two slots: what the reader does not take in time is overwritten.
+        let (tx, rx) = broadcast::channel::<ChatEvent>(2);
+        tx.send(said("working")).unwrap();
+        let waiting = {
+            let manager = r.manager.clone();
+            let sid = sid.clone();
+            tokio::spawn(async move { manager.answer_from(&sid, rx).await })
+        };
+        // The reader took "working", found no `result` on the thread, and now waits.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "it waits for the child's result");
+
+        // The child's turn ends: its `result` is stored...
+        r.graph
+            .store_chat_events(
+                uuid,
+                vec![crate::neo4j::models::ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: 1,
+                    event_type: "result".into(),
+                    data: json!({
+                        "type": "result", "session_id": sid, "duration_ms": 1,
+                        "subtype": "success", "is_error": false, "result_text": "LATE-ANSWER",
+                    })
+                    .to_string(),
+                    created_at: Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+        // ... and the stream loses it: eight events into two slots, sent without ever
+        // yielding to the waiting reader (a `#[tokio::test]` runtime is single-threaded, so
+        // the reader cannot be polled between two `send` calls) — it is overrun.
+        for i in 0..8 {
+            tx.send(said(&format!("chatter {i}"))).unwrap();
+        }
+        drop(tx);
+
+        let out = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the parent must not wait for its turn timeout")
+            .unwrap();
+        assert_eq!(out, Ok("LATE-ANSWER".to_string()));
     }
 }
 

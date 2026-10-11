@@ -232,8 +232,8 @@ pub struct ParentEnvelope {
 
 impl ParentEnvelope {
     /// Fit a new-session request inside the envelope: clamp what can be
-    /// clamped (permission mode), fill what is inherited (project), refuse
-    /// what would escape (directories, project, workspace).
+    /// clamped (permission mode), fill what is inherited (project, workspace),
+    /// refuse what would escape (directories, project, workspace).
     ///
     /// `default_mode` is the mode the child would get if the request names
     /// none (the global config) — it is clamped too.
@@ -254,10 +254,19 @@ impl ParentEnvelope {
             }
         }
 
-        // Workspace: resolved server-side into extra directories, so only the
-        // parent's own workspace is acceptable.
-        if request.workspace_slug.is_some() && request.workspace_slug != self.workspace_slug {
-            return Err(EnvelopeError::WorkspaceMismatch);
+        // Workspace: the parent's, exactly like the project just below. It is resolved
+        // server-side into knowledge context and extra directories, so a request naming
+        // ANOTHER workspace (or one when the parent has none) is refused — but a request
+        // that names none INHERITS the parent's: a child opened without it (every
+        // sub-agent of the `Agent` tool, every child of `chat(send_message)`) used to
+        // lose the workspace's context and its extra directories (P18b, fix 1).
+        match (&request.workspace_slug, &self.workspace_slug) {
+            (Some(requested), Some(parent)) if requested != parent => {
+                return Err(EnvelopeError::WorkspaceMismatch);
+            }
+            (Some(_), None) => return Err(EnvelopeError::WorkspaceMismatch),
+            (None, Some(parent)) => request.workspace_slug = Some(parent.clone()),
+            _ => {}
         }
 
         // Project: the parent's. A request may omit it; it may not differ.
@@ -678,6 +687,43 @@ mod tests {
         req.workspace_slug = Some("other-ws".into());
         let err = envelope("default").apply(&mut req, "default").unwrap_err();
         assert_eq!(err, EnvelopeError::WorkspaceMismatch);
+    }
+
+    /// P18b, fix 1: the workspace is inherited like the project. Before it, a child that
+    /// named no workspace got NONE — a sub-agent of a native session lost the workspace's
+    /// knowledge context and its extra directories.
+    #[test]
+    fn the_child_inherits_the_parents_workspace_and_cannot_name_another() {
+        let in_workspace = || ParentEnvelope {
+            workspace_slug: Some("ws".into()),
+            ..envelope("default")
+        };
+
+        let mut req = request("/work/repo", None);
+        in_workspace().apply(&mut req, "default").unwrap();
+        assert_eq!(req.workspace_slug.as_deref(), Some("ws"), "inherited");
+
+        let mut req = request("/work/repo", None);
+        req.workspace_slug = Some("ws".into());
+        in_workspace().apply(&mut req, "default").unwrap();
+        assert_eq!(
+            req.workspace_slug.as_deref(),
+            Some("ws"),
+            "the same one: kept"
+        );
+
+        let mut req = request("/work/repo", None);
+        req.workspace_slug = Some("other-ws".into());
+        assert_eq!(
+            in_workspace().apply(&mut req, "default").unwrap_err(),
+            EnvelopeError::WorkspaceMismatch,
+            "another workspace is still refused"
+        );
+
+        // A parent outside any workspace gives its child none.
+        let mut req = request("/work/repo", None);
+        envelope("default").apply(&mut req, "default").unwrap();
+        assert_eq!(req.workspace_slug, None);
     }
 
     // ── who is calling ─────────────────────────────────────────────────────

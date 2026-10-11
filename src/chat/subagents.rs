@@ -18,7 +18,19 @@
 //!
 //! The call waits for the child's first `result` and answers its text; the child is then
 //! closed (it stays resumable and visible). A dropped call (the parent's turn interrupted or
-//! the call cancelled) closes the child too.
+//! the call cancelled) closes the child too — at ANY point of the call, the opening
+//! included: [`ChatManager::run_subagent`] opens, awaits and closes the child in a task of
+//! its own and only AWAITS that task, so a drop cannot cut the opening halfway. That matters
+//! because `create_session` runs as long as the provider's open timeout and has already sent
+//! the child's first message when it returns: a future dropped inside it used to leave a
+//! child running that nobody knew the id of. The caller's drop closes a one-shot channel the
+//! task watches; the task then closes the child as soon as the opening gives its id.
+//!
+//! The child's answer is read from its live event stream, and from its stored thread
+//! whenever the stream cannot be trusted: before the first wait (a turn that ended before
+//! the subscription) and after a `Lagged` (the `result` may have been among the dropped
+//! events; waiting on would last until the parent's turn timeout). What is kept from the
+//! stream is bounded ([`keep_for_answer`]): a chatty child cannot grow it.
 //!
 //! Depth is held three times: the backend gives [`SubagentHooks`] only to a native session
 //! whose record has no `spawned_by` (`ChatManager::build_agent_spec_with_access`); a spawned
@@ -120,27 +132,6 @@ impl SessionHooks for SubagentHooks {
     }
 }
 
-/// Closes the child session if the call ends before the child did (the future dropped).
-struct CloseOnDrop {
-    manager: Weak<ChatManager>,
-    child: Option<String>,
-}
-
-impl Drop for CloseOnDrop {
-    fn drop(&mut self) {
-        let (Some(child), Some(manager)) = (self.child.take(), self.manager.upgrade()) else {
-            return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(e) = manager.close_session(&child).await {
-                    tracing::debug!(child = %child, error = %e, "sub-agent close after a cut call");
-                }
-            });
-        }
-    }
-}
-
 /// One running sub-agent of a parent (module documentation): taken before the envelope
 /// counts the parent's live children, given back when the sub-agent ends or its call is dropped.
 pub(crate) struct SubagentSlot {
@@ -204,13 +195,49 @@ fn bounded(text: String) -> String {
     )
 }
 
+/// A question the child asked: the call fails on it.
+fn is_question(event: &ChatEvent) -> bool {
+    matches!(event, ChatEvent::AskUserQuestion { .. })
+}
+
+/// Something the child said in its own voice (not inside one of its own tool calls).
+fn is_said(event: &ChatEvent) -> bool {
+    matches!(
+        event,
+        ChatEvent::AssistantText {
+            parent_tool_use_id: None,
+            ..
+        }
+    )
+}
+
+/// The end of the child's turn.
+fn is_result(event: &ChatEvent) -> bool {
+    matches!(event, ChatEvent::Result { .. })
+}
+
+/// Adds `event` to what [`answer_of`] will be given, keeping only what it actually reads:
+/// the first question, the LAST thing said, and the first `result` — at most three events,
+/// whatever the child emits. Without this bound a chatty child (thousands of deltas and
+/// tool results) grew the parent's vector for the whole call.
+fn keep_for_answer(seen: &mut Vec<ChatEvent>, event: ChatEvent) {
+    if is_said(&event) {
+        // `answer_of` falls back to the LAST thing said: replace it in place.
+        match seen.iter_mut().find(|e| is_said(e)) {
+            Some(held) => *held = event,
+            None => seen.push(event),
+        }
+    } else if (is_question(&event) && !seen.iter().any(is_question))
+        || (is_result(&event) && !seen.iter().any(is_result))
+    {
+        seen.push(event);
+    }
+}
+
 /// The answer of a sub-agent from its `result`: the result text, else what it said. A
 /// sub-agent that asked the user a question fails the call: nobody sees a child's question.
 fn answer_of(events: &[ChatEvent]) -> Option<Result<String, String>> {
-    if events
-        .iter()
-        .any(|e| matches!(e, ChatEvent::AskUserQuestion { .. }))
-    {
+    if events.iter().any(is_question) {
         return Some(Err(
             "the sub-agent asked the user a question; a sub-agent cannot ask: give it what it needs in the prompt".to_owned(),
         ));
@@ -315,19 +342,51 @@ impl ChatManager {
             }
             .to_json_string(),
         );
+        // The opening must not be droppable (module documentation): it is done in a task of
+        // its own, and this future only awaits that task. `alive` is dropped with this
+        // future — whether it ends normally (the task is over by then) or is cut — and that
+        // is how the task learns nobody awaits the child any more.
+        let (alive, cancelled) = tokio::sync::oneshot::channel::<std::convert::Infallible>();
+        let opening = {
+            let manager = Arc::clone(&self);
+            let parent = parent_session_id.to_string();
+            let tool_use_id = request.tool_call_id.clone();
+            tokio::spawn(async move {
+                manager
+                    .open_wait_close(child, cancelled, &parent, &tool_use_id)
+                    .await
+            })
+        };
+        let _alive = alive;
+        opening
+            .await
+            .unwrap_or_else(|e| Err(refused(format!("the sub-agent's opening ended: {e}"))))
+    }
+
+    /// Opens the child of one sub-agent call, waits for its answer and closes it. Runs in a
+    /// task of its own ([`Self::run_subagent`]) so no drop can cut the opening halfway;
+    /// `cancelled` resolves when nobody awaits the call any more, and the child is then
+    /// closed as soon as the opening has given its id.
+    async fn open_wait_close(
+        self: Arc<Self>,
+        child: ChatRequest,
+        cancelled: tokio::sync::oneshot::Receiver<std::convert::Infallible>,
+        parent_session_id: &str,
+        tool_use_id: &str,
+    ) -> Result<String, String> {
         let opened = self
             .create_session(&child)
             .await
-            .map_err(|e| refused(format!("{e:#}")))?;
+            .map_err(|e| format!("the sub-agent could not start: {e:#}"))?;
         let child_id = opened.session_id;
-        let mut guard = CloseOnDrop {
-            manager: Arc::downgrade(&self),
-            child: Some(child_id.clone()),
+        tracing::info!(parent = %parent_session_id, child = %child_id, tool_use_id = %tool_use_id, "sub-agent started");
+        // The child exists from here: whatever ends this task, it is closed first (it stays
+        // resumable and visible).
+        let answer = tokio::select! {
+            biased;
+            _ = cancelled => Err("the sub-agent's call was cancelled".to_owned()),
+            answer = self.wait_for_answer(&child_id) => answer,
         };
-        tracing::info!(parent = %parent_session_id, child = %child_id, tool_use_id = %request.tool_call_id, "sub-agent started");
-        let answer = self.wait_for_answer(&child_id).await;
-        // The child ended: close it (it stays resumable); the guard has nothing left to do.
-        guard.child = None;
         if let Err(e) = self.close_session(&child_id).await {
             tracing::debug!(child = %child_id, error = %e, "sub-agent close");
         }
@@ -336,31 +395,31 @@ impl ChatManager {
 
     /// The first `result` of the session `sid`, live or already persisted.
     async fn wait_for_answer(&self, sid: &str) -> Result<String, String> {
-        let mut rx = self
+        let rx = self
             .subscribe(sid)
             .await
             .map_err(|e| format!("the sub-agent cannot be followed: {e:#}"))?;
-        let mut seen: Vec<ChatEvent> = Vec::new();
+        self.answer_from(sid, rx).await
+    }
+
+    /// [`Self::wait_for_answer`] on a subscription already taken — the seam the test of a
+    /// lagged subscription drives.
+    pub(super) async fn answer_from(
+        &self,
+        sid: &str,
+        mut rx: tokio::sync::broadcast::Receiver<ChatEvent>,
+    ) -> Result<String, String> {
         // A turn that ended before the subscription is in the store.
-        if let Ok(uuid) = Uuid::parse_str(sid) {
-            let persisted: Vec<ChatEvent> = self
-                .graph
-                .get_chat_events(uuid, 0, 5_000)
-                .await
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|r| serde_json::from_str(&r.data).ok())
-                .collect();
-            if let Some(answer) = answer_of(&persisted) {
-                return answer;
-            }
+        if let Some(answer) = self.persisted_answer(sid).await {
+            return answer;
         }
+        let mut seen: Vec<ChatEvent> = Vec::new();
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    let done = matches!(event, ChatEvent::Result { .. });
+                    let done = is_result(&event);
                     let closed = matches!(event, ChatEvent::SessionClosed { .. });
-                    seen.push(event);
+                    keep_for_answer(&mut seen, event);
                     if done {
                         return answer_of(&seen).unwrap_or_else(|| Ok(String::new()));
                     }
@@ -368,12 +427,34 @@ impl ChatManager {
                         return Err("the sub-agent's session was closed before it answered".into());
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // Events were dropped, and the child's `result` may have been among them:
+                // waiting on would last until the parent's 30-minute turn timeout. The
+                // thread is the truth — read it back (P18b, fix 4).
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                    tracing::warn!(child = %sid, dropped, "sub-agent events dropped: its thread is read back");
+                    if let Some(answer) = self.persisted_answer(sid).await {
+                        return answer;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     return Err("the sub-agent's session ended before it answered".into())
                 }
             }
         }
+    }
+
+    /// The answer of `sid` as its STORED thread tells it, when its `result` is already there.
+    async fn persisted_answer(&self, sid: &str) -> Option<Result<String, String>> {
+        let uuid = Uuid::parse_str(sid).ok()?;
+        let persisted: Vec<ChatEvent> = self
+            .graph
+            .get_chat_events(uuid, 0, 5_000)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| serde_json::from_str(&r.data).ok())
+            .collect();
+        answer_of(&persisted)
     }
 }
 
@@ -470,5 +551,81 @@ mod tests {
         };
         let out = answer_of(&[asked, ok_result("asked")]).unwrap();
         assert!(out.is_err_and(|e| e.contains("cannot ask")));
+    }
+
+    /// P18b, fix 4: what the parent holds of a child's stream is bounded — at most the
+    /// question, the last thing said and the `result` — and `answer_of` still reads the
+    /// same answer out of it.
+    #[test]
+    fn what_is_kept_of_a_chatty_child_is_bounded() {
+        let said = |t: &str| ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: None,
+        };
+        let inside = ChatEvent::AssistantText {
+            content: "inside a tool call".into(),
+            parent_tool_use_id: Some("toolu_1".into()),
+        };
+        let mut seen = Vec::new();
+        for i in 0..5_000 {
+            keep_for_answer(&mut seen, said(&format!("line {i}")));
+            keep_for_answer(&mut seen, inside.clone());
+            keep_for_answer(
+                &mut seen,
+                ChatEvent::ToolUse {
+                    id: "t".into(),
+                    tool: "Read".into(),
+                    input: serde_json::json!({}),
+                    parent_tool_use_id: None,
+                    category: None,
+                    canonical: None,
+                },
+            );
+        }
+        assert_eq!(seen.len(), 1, "only the last thing said is held: {seen:?}");
+        keep_for_answer(&mut seen, ok_result("FINAL"));
+        keep_for_answer(&mut seen, ok_result("A SECOND RESULT"));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(answer_of(&seen), Some(Ok("FINAL".into())));
+
+        // Without a result text, the fallback is the LAST thing said, not the first.
+        let mut seen = Vec::new();
+        keep_for_answer(&mut seen, said("first"));
+        keep_for_answer(&mut seen, said("last"));
+        keep_for_answer(
+            &mut seen,
+            ChatEvent::Result {
+                session_id: "s".into(),
+                duration_ms: 1,
+                cost_usd: None,
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
+            },
+        );
+        assert_eq!(answer_of(&seen), Some(Ok("last".into())));
+
+        // A question is kept once, whatever follows.
+        let question = ChatEvent::AskUserQuestion {
+            id: "q".into(),
+            tool_call_id: "cq".into(),
+            questions: serde_json::json!([{"question": "Which?"}]),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+            synthetic: Some(true),
+        };
+        let mut seen = Vec::new();
+        keep_for_answer(&mut seen, question.clone());
+        keep_for_answer(&mut seen, question);
+        keep_for_answer(&mut seen, ok_result("whatever"));
+        assert_eq!(seen.len(), 2);
+        assert!(answer_of(&seen)
+            .unwrap()
+            .is_err_and(|e| e.contains("cannot ask")));
     }
 }
