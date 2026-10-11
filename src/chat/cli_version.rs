@@ -280,9 +280,103 @@ fn is_local_build(cli_path: &Path) -> bool {
     true
 }
 
+/// Whether the Claude Code CLI is on this machine: the configured path when one is set
+/// (`CLAUDE_CLI_PATH`, `chat.claude_cli_path`), else nexus's search (PATH, the SDK cache,
+/// the usual install locations). Looks at the filesystem only: no process, no download.
+pub fn claude_cli_present(configured: Option<&str>) -> bool {
+    match configured.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => Path::new(path).is_file(),
+        None => find_claude_cli().is_ok(),
+    }
+}
+
+/// How long a detection of the CLI is trusted before the machine is looked at again.
+pub const CLI_DETECTION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the chat manager knows of the Claude Code CLI (B2): the built-in instance is
+/// usable only when its CLI is on the server, and a default chat must not be routed to a
+/// missing CLI when another provider is usable.
+#[derive(Debug, Default)]
+pub enum ClaudeCliProbe {
+    /// Never looked up: the built-in instance counts as usable, its absence surfaces when
+    /// a session opens (424 `cli_not_found`). The default of a manager nobody asked to
+    /// detect (tests, embedders that inject their own Claude Code).
+    #[default]
+    Assumed,
+    /// Looked up on the machine ([`claude_cli_present`]), the answer kept
+    /// [`CLI_DETECTION_TTL`]. What the server runs with.
+    Detect(std::sync::Mutex<Option<(std::time::Instant, bool)>>),
+    /// A fixed answer (tests).
+    Fixed(bool),
+}
+
+impl ClaudeCliProbe {
+    /// The probe that looks at the machine.
+    pub fn detecting() -> Self {
+        Self::Detect(std::sync::Mutex::new(None))
+    }
+
+    /// Whether the CLI is there, `configured` being the path the server is set to use.
+    pub fn present(&self, configured: Option<&str>) -> bool {
+        match self {
+            Self::Assumed => true,
+            Self::Fixed(present) => *present,
+            Self::Detect(cache) => {
+                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((at, present)) = *cache {
+                    if at.elapsed() < CLI_DETECTION_TTL {
+                        return present;
+                    }
+                }
+                let present = claude_cli_present(configured);
+                *cache = Some((std::time::Instant::now(), present));
+                present
+            }
+        }
+    }
+
+    /// Drops what was detected: the next question looks at the machine again (the CLI was
+    /// just installed, or its configured path changed).
+    pub fn forget(&self) {
+        if let Self::Detect(cache) = self {
+            *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_cli_path_is_present_only_when_the_file_is_there() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = dir.path().join("claude");
+        let configured = cli.to_str().unwrap();
+        assert!(!claude_cli_present(Some(configured)), "no file yet");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        assert!(claude_cli_present(Some(configured)));
+        // A directory is not a CLI.
+        assert!(!claude_cli_present(Some(dir.path().to_str().unwrap())));
+    }
+
+    #[test]
+    fn the_detection_is_cached_until_forgotten() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = dir.path().join("claude");
+        let configured = cli.to_str().unwrap();
+        let probe = ClaudeCliProbe::detecting();
+        assert!(!probe.present(Some(configured)));
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        assert!(!probe.present(Some(configured)), "still the cached answer");
+        probe.forget();
+        assert!(
+            probe.present(Some(configured)),
+            "looked at again once forgotten"
+        );
+        assert!(ClaudeCliProbe::Assumed.present(Some("/nowhere/claude")));
+        assert!(!ClaudeCliProbe::Fixed(false).present(None));
+    }
 
     #[test]
     fn test_is_local_build_standard_paths() {

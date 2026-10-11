@@ -43,7 +43,12 @@ the answer is `409 engine_unavailable`.
    model lists, **can call a tool**, and how large its context window is.
 5. **Allow the project**: `PUT /api/projects/{slug}/llm-consent` with `{provider_id, origin}`, the origin
    you were shown. The consent is tied to the origin **and** the credential reference: change either
-   and it stops holding. A conversation with no project can only use Claude Code.
+   and it stops holding. A project never inherits another scope's consent.
+   For the conversations outside any project (the welcome chat, a chat with no `project_slug` and
+   no project cwd), a person allows the instance for those: `PUT /api/chat/llm-consents/{provider_id}`
+   with `{origin}` (same rules; list with `GET /api/chat/llm-consents`, withdraw with `DELETE`).
+   A refused opening says which consent is missing (`403 endpoint_not_allowed`, `consent_scope`:
+   `project` or `no_project`).
 6. **Open a session** with `provider: "deepseek"`, or set a role (`/api/chat/roles`,
    `/api/projects/{slug}/llm-roles`) so the project uses it by default.
 
@@ -182,8 +187,11 @@ token gets `403`).
 ## Routing, roles, aliases, policy
 
 Resolution order: existing session (frozen) > explicit request > task alias > run > project role >
-global role (or an enforced policy rule) > default > Claude Code. The level that decided is stored as
-`routed_by` on the session and the execution. The model policy ships `off`; `shadow` records what it
+global role (or an enforced policy rule) > default > Claude Code **when its CLI is on the server** >
+the only other instance allowed here (`routed_by: sole_instance`; never a remote machine). Without the
+Claude Code CLI and with several instances allowed, the opening is refused (`409 provider_not_chosen`,
+`candidates`): name one, or set the pilot role. A request that names `claude-code` is never swapped.
+The level that decided is stored as `routed_by` on the session and the execution. The model policy ships `off`; `shadow` records what it
 would have chosen without applying it; `enforce` applies it.
 
 ## Cost

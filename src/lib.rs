@@ -1598,7 +1598,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // Native sessions resume after a restart: their transcripts live on disk (P14).
         .with_native_transcripts(chat::provider::transcripts::default_root())
         .with_event_emitter(event_bus.clone())
-        .with_vault(vault.clone());
+        .with_vault(vault.clone())
+        // A default chat goes to Claude Code only when its CLI is on this machine (B2).
+        .detecting_claude_cli();
         // Pass config.yaml path so permission changes can be persisted to disk
         if let Some(ref yaml_path) = config.config_yaml_path {
             cm = cm.with_config_yaml_path(yaml_path.clone());
@@ -1636,6 +1638,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Auto-configure Claude Code MCP integration (idempotent — safe to call on every start).
     // Configures ~/.claude/mcp.json with stdio mode pointing to this instance,
     // and updates it if the config is stale (e.g., was SSE mode from an older version).
+    // Only when Claude Code is on this machine: without it, ~/.claude is left alone (M1).
     boot.start("claude_mcp");
     {
         let setup_config = setup_claude::SetupConfig {
@@ -1643,7 +1646,31 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             server_port: config.server_port,
             jwt_secret: config.auth_config.as_ref().map(|a| a.jwt_secret.clone()),
         };
-        match setup_claude::setup_claude_code(&setup_config) {
+        // The CLI the server is set to use, else the one on the machine.
+        let cli = match config
+            .chat_claude_cli_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            Some(configured) => std::path::Path::new(configured)
+                .is_file()
+                .then(|| configured.to_string()),
+            None => setup_claude::detect_claude_cli().or_else(|| {
+                nexus_claude::find_claude_cli()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            }),
+        };
+        let setup = match dirs::home_dir() {
+            Some(home) => setup_claude::setup_claude_code_at_boot(&setup_config, &home, cli),
+            None => Err(anyhow::anyhow!("Cannot determine home directory")),
+        };
+        match setup {
+            Ok(setup_claude::SetupResult::SkippedCliAbsent) => {
+                tracing::info!("Claude Code absent: MCP integration skipped");
+                boot.done_with("claude_mcp", "skipped: Claude Code is not installed");
+            }
             Ok(setup_claude::SetupResult::AlreadyConfigured { .. }) => {
                 tracing::debug!("Claude Code MCP: already configured");
                 boot.done_with("claude_mcp", "already configured");

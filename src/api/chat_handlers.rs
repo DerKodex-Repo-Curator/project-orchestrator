@@ -98,9 +98,7 @@ pub async fn create_session(
         chat_manager
             .check_provider_binding(&sid, request.provider.as_deref())
             .await
-            .map_err(|e| {
-                AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
-            })?;
+            .map_err(|e| AppError::from_open_error(e, request.provider.as_deref()))?;
 
         // Read before the liveness check and the NATS RPC (up to its timeout): a resume
         // that completes meanwhile then receives this message instead of being resumed
@@ -130,10 +128,7 @@ pub async fn create_session(
                     if !typed && e.to_string().contains("not found") {
                         AppError::NotFound(format!("Session {} not found", sid))
                     } else {
-                        AppError::from_open_error(
-                            e,
-                            Some(crate::chat::provider::resolver::CLAUDE_CODE),
-                        )
+                        AppError::from_open_error(e, request.provider.as_deref())
                     }
                 })?;
         }
@@ -164,9 +159,10 @@ pub async fn create_session(
     }
 
     // ── Create path (no session_id) ────────────────────────────────────────
-    let response = chat_manager.create_session(&request).await.map_err(|e| {
-        AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
-    })?;
+    let response = chat_manager
+        .create_session(&request)
+        .await
+        .map_err(|e| AppError::from_open_error(e, request.provider.as_deref()))?;
 
     // T4.3: Extract code entities from the first message and create DISCUSSED relations (non-blocking)
     super::ws_chat_handler::spawn_entity_extraction(&state, &response.session_id, &request.message);
@@ -1451,6 +1447,8 @@ pub async fn set_session_routing(
                     retryable: false,
                     retry_after_ms: None,
                     fallbacks: None,
+                    consent_scope: None,
+                    candidates: None,
                 }))
             }
             None => AppError::Internal(error),
@@ -1847,7 +1845,17 @@ pub async fn list_providers(
         .map(|m| m.resolve_model(None))
         .unwrap_or_else(|| crate::chat::ChatConfig::from_env().default_model);
 
-    let provider = ClaudeCodeProvider::new(ClaudeCodeConfig::default());
+    // The CLI the server is set to use (`CLAUDE_CLI_PATH`), as a session would.
+    let mut claude_config = ClaudeCodeConfig::default();
+    if let Some(manager) = state.chat_manager.as_ref() {
+        claude_config.cli_path = manager
+            .get_env_config()
+            .await
+            .claude_cli_path
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from);
+    }
+    let provider = ClaudeCodeProvider::new(claude_config);
     let health = HealthEntry::from_nexus(&provider.health().await);
     let mut models: Vec<ModelEntry> = provider
         .catalog()
@@ -1901,7 +1909,19 @@ pub async fn list_providers(
             serde_json::from_str::<crate::chat::provider::settings::RoleAssignments>(&raw).ok()
         })
         .and_then(|roles| roles.pilot.map(|p| p.provider));
-    let mut body = listing::assemble(entries, configured.as_deref());
+    // Without the Claude CLI, what a chat naming nothing would open (B2).
+    let usable_here = super::provider_handlers::allowed_here(
+        state.orchestrator.neo4j(),
+        query.project_slug.as_deref(),
+    )
+    .await?;
+    let claude_cli = match state.chat_manager.as_ref() {
+        Some(manager) => manager.claude_code_usable().await,
+        None => entries
+            .first()
+            .is_some_and(|p| p.health.state != "cli_not_found"),
+    };
+    let mut body = listing::assemble(entries, configured.as_deref(), claude_cli, &usable_here);
     // The routing mode in force for the asked project (R2): who chooses the
     // provider, and how far the learnt choices are trusted. Shown, not applied.
     let (routing, scope) = crate::chat::provider::cognitive::load_routing(
@@ -1926,9 +1946,15 @@ pub struct InstallCliRequest {
 /// Always returns 200 with `success: true/false` — the frontend displays the message.
 /// No 500 for installation failures (they are expected user-facing scenarios).
 pub async fn install_cli(
+    State(state): State<OrchestratorState>,
     Json(body): Json<InstallCliRequest>,
 ) -> Json<crate::chat::cli_version::CliInstallResult> {
-    Json(crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await)
+    let result = crate::chat::cli_version::install_or_upgrade_cli(body.version.as_deref()).await;
+    // A CLI that just appeared becomes the default again at the next opening (B2).
+    if let Some(manager) = state.chat_manager.as_ref() {
+        manager.forget_claude_cli_detection();
+    }
+    Json(result)
 }
 
 // ============================================================================
@@ -3264,6 +3290,85 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_consent_for_chats_outside_a_project_follows_the_same_rules() {
+        // B3: PUT/GET/DELETE /api/chat/llm-consents[/{id}], same body and rules as a
+        // project's consent, stored apart from every project.
+        let app = test_app().await;
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        // The origin the person was shown must still be the instance's.
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({"origin": "https://1.1.1.1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        // claude-code needs none; an unknown instance is a 404.
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/chat/llm-consents/claude-code",
+                serde_json::json!({"origin": "x"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/chat/llm-consents",
+                serde_json::json!({"provider_id": "ghost", "origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/chat/llm-consents",
+                serde_json::json!({"provider_id": "deepseek", "origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["valid"], true);
+        let (_, rows) = call_json(&app, auth_get("/api/chat/llm-consents")).await;
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["provider_id"], "deepseek");
+        // Not a project's consent.
+        let (_, rows) = call_json(&app, auth_get("/api/projects/p/llm-consents")).await;
+        assert!(rows.as_array().unwrap().is_empty(), "{rows}");
+
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/chat/llm-consents/deepseek",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, rows) = call_json(&app, auth_get("/api/chat/llm-consents")).await;
+        assert!(rows.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -5290,13 +5395,13 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
                     retryable: false,
                     retry_after_ms: None,
                     fallbacks: None,
+                    consent_scope: None,
+                    candidates: None,
                 }))
             }
             None => AppError::BadRequest(refusal.to_string()),
         },
-        None => {
-            AppError::from_open_error(error, Some(crate::chat::provider::resolver::CLAUDE_CODE))
-        }
+        None => AppError::from_open_error(error, None),
     }
 }
 
@@ -5366,10 +5471,7 @@ mod switch_provider_tests {
                 "no default model",
             ))
         };
-        let kept = AppError::from_open_error(
-            open_failure(),
-            Some(crate::chat::provider::resolver::CLAUDE_CODE),
-        );
+        let kept = AppError::from_open_error(open_failure(), None);
         let told = switch_error(open_failure(), "abc");
         assert_eq!(
             format!("{told:?}"),

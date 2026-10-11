@@ -65,6 +65,8 @@ fn routing_error(e: RoutingError) -> AppError {
         retryable: false,
         retry_after_ms: None,
         fallbacks: None,
+        consent_scope: None,
+        candidates: None,
     }))
 }
 

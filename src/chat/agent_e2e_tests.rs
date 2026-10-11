@@ -564,6 +564,183 @@ async fn a_pilot_role_routes_a_project_to_the_instance_and_consent_still_applies
     assert_eq!(node.routed_by.as_deref(), Some("project_rule"));
 }
 
+/// A person allowed `id` for the chats outside any project (B3).
+async fn consent_no_project(graph: &MockGraphStore, id: &str, origin: &str) {
+    let record = ConsentRecord {
+        provider_id: id.into(),
+        origin: origin.into(),
+        consented_by: "me@example.com".into(),
+        consented_at: Utc::now().to_rfc3339(),
+        credential_ref: Some("none".into()),
+        ..Default::default()
+    };
+    graph
+        .put_llm_setting(
+            super::provider::settings::NO_PROJECT_SCOPE,
+            &format!("{CONSENT_PREFIX}{id}"),
+            &serde_json::to_string(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+/// A server WITHOUT the Claude Code CLI: the configured path points at nothing, and the
+/// manager looks for the CLI as the server does (`detecting_claude_cli`). Never a real CLI.
+fn manager_without_claude_cli(graph: Arc<MockGraphStore>) -> ChatManager {
+    let state = mock_app_state();
+    let dyn_graph: Arc<dyn GraphStore> = graph;
+    let config = super::config::ChatConfig {
+        provider_path: ProviderPath::Agent,
+        mcp_server_path: fake_bin("fake_mcp"),
+        nexus_tools_path: None,
+        nexus_browser_path: None,
+        jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+        claude_cli_path: Some("/nonexistent/m1/claude".to_string()),
+        max_sessions: 10,
+        ..Default::default()
+    };
+    ChatManager::new_without_memory(dyn_graph, state.meili, config).detecting_claude_cli()
+}
+
+#[tokio::test]
+async fn without_the_claude_cli_a_chat_naming_nothing_opens_on_the_only_usable_instance() {
+    // B2 (M0 A/O): no pilot role, no provider in the request, no CLI on the server. Was 424
+    // cli_not_found on claude-code; opens on the one instance the project consented to.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager_without_claude_cli(graph.clone());
+    assert!(!manager.claude_code_usable().await);
+
+    let created = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("a chat naming nothing must open on the instance: {e:#}"));
+    let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+    next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+    let node = graph
+        .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.provider_id.as_deref(), Some("local"));
+    assert_eq!(node.routed_by.as_deref(), Some("sole_instance"));
+    assert_eq!(node.model, "m", "the instance's own default model");
+
+    // Naming claude-code is still honoured (never swapped for the instance): the opening
+    // fails on the missing CLI and says it was claude-code's.
+    let err = manager
+        .create_session(&request(Some("claude-code"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, Some("local")).expect("typed");
+    assert_eq!(f.provider_id.as_deref(), Some("claude-code"), "{err:#}");
+}
+
+#[tokio::test]
+async fn outside_any_project_an_instance_opens_once_a_person_allowed_it_for_those_chats() {
+    // B3 (M0 G): outside any project only claude-code was allowed (403). A consent for the
+    // chats without a project now lets the instance serve them, bound to its origin (A28).
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    // A project's consent does not reach the chats outside any project.
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager_without_claude_cli(graph.clone());
+    let err = manager
+        .create_session(&request(Some("local"), None, "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!((f.status, f.code), (403, "endpoint_not_allowed"));
+    assert_eq!(
+        f.consent_scope,
+        Some("no_project"),
+        "says which consent is missing"
+    );
+    assert_eq!(f.provider_id.as_deref(), Some("local"));
+    // Nothing named and the CLI missing: the refusal names the instance to allow.
+    let err = manager
+        .create_session(&request(None, None, "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!(
+        (f.code, f.consent_scope, f.provider_id.as_deref()),
+        ("endpoint_not_allowed", Some("no_project"), Some("local"))
+    );
+    assert!(
+        fake.chat_requests().is_empty(),
+        "nothing reached the endpoint"
+    );
+
+    // A consent for another origin does not hold (A28).
+    consent_no_project(&graph, "local", "https://old.example.com").await;
+    assert!(manager
+        .create_session(&request(Some("local"), None, "default"))
+        .await
+        .is_err());
+
+    consent_no_project(&graph, "local", &fake.origin()).await;
+    for provider in [Some("local"), None] {
+        let created = manager
+            .create_session(&request(provider, None, "default"))
+            .await
+            .unwrap_or_else(|e| panic!("open outside a project ({provider:?}): {e:#}"));
+        let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        manager.close_session(&created.session_id).await.unwrap();
+    }
+    // Journaled like any sending, with no project.
+    let journal = graph.list_llm_settings("journal", "send:").await.unwrap();
+    assert_eq!(journal.len(), 2);
+    let entry: Value = serde_json::from_str(&journal[0].1).unwrap();
+    assert!(entry["project"].is_null());
+    assert_eq!(entry["provider"], "local");
+
+    // The consent outside any project does not reach a project that never consented.
+    let err = manager
+        .create_session(&request(Some("local"), Some("other"), "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!(
+        (f.code, f.consent_scope),
+        ("endpoint_not_allowed", Some("project"))
+    );
+}
+
+#[tokio::test]
+async fn an_opening_error_names_the_instance_it_happened_on_not_claude_code() {
+    // B6 (M0 K, M): the pilot role routes to `local`, whose key is in a locked vault. The
+    // HTTP layer knows no provider (the request names none): the 423 must still name `local`.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "vault:endpoint-key")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    graph
+        .put_llm_setting(
+            GLOBAL,
+            "roles",
+            &json!({"pilot": {"provider": "local"}}).to_string(),
+        )
+        .await
+        .unwrap();
+    let manager = manager(graph.clone(), true).with_vault(VaultService::ephemeral());
+    let err = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!((f.status, f.code), (423, "credentials_locked"));
+    assert_eq!(f.provider_id.as_deref(), Some("local"));
+    // What the handler used to pass is overridden by what the opening knew.
+    let f = super::provider::errors::classify_open_error(&err, Some("claude-code")).unwrap();
+    assert_eq!(f.provider_id.as_deref(), Some("local"));
+    assert!(fake.chat_requests().is_empty());
+}
+
 #[tokio::test]
 async fn a_third_party_runs_on_the_agent_engine_without_any_flag() {
     // CHAT_PROVIDER_PATH is at its default (`legacy`): a registered instance still opens,

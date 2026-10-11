@@ -94,13 +94,31 @@ async fn load_aliases(graph: &dyn GraphStore) -> Result<Vec<ModelAlias>, AppErro
         .unwrap_or_default())
 }
 
-async fn load_consents(graph: &dyn GraphStore, slug: &str) -> Result<Vec<ConsentRecord>, AppError> {
+async fn load_scope_consents(
+    graph: &dyn GraphStore,
+    scope: &str,
+) -> Result<Vec<ConsentRecord>, AppError> {
     Ok(graph
-        .list_llm_settings(&st::project_scope(slug), CONSENT_PREFIX)
+        .list_llm_settings(scope, CONSENT_PREFIX)
         .await
         .map_err(AppError::Internal)?
         .iter()
         .filter_map(|(_, v)| parse::<ConsentRecord>(v))
+        .collect())
+}
+
+/// The instances a chat may open in the asked scope: consented by the project, or, with
+/// no project, for the chats outside any project (B3). Bound to the current origin (A28).
+pub async fn allowed_here(
+    graph: &dyn GraphStore,
+    project_slug: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    let consents = load_scope_consents(graph, &st::consent_scope(project_slug)).await?;
+    Ok(load_instances(graph)
+        .await?
+        .into_iter()
+        .filter(|i| consents.iter().any(|c| st::consent_holds(c, i)))
+        .map(|i| i.id)
         .collect())
 }
 
@@ -110,7 +128,7 @@ pub async fn stored_entries(
     project_slug: Option<&str>,
 ) -> Result<Vec<ProviderEntry>, AppError> {
     let consents = match project_slug {
-        Some(slug) => Some(load_consents(graph, slug).await?),
+        Some(slug) => Some(load_scope_consents(graph, &st::project_scope(slug)).await?),
         None => None,
     };
     let aliases = load_aliases(graph).await?;
@@ -741,9 +759,24 @@ pub async fn list_consents(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
 ) -> Result<Json<Vec<st::ConsentView>>, AppError> {
-    let graph = graph(&state);
+    list_scope_consents(&state, &st::project_scope(&slug)).await
+}
+
+/// GET /api/chat/llm-consents — the consents that hold for the chats outside any project
+/// (B3), in the same shape as a project's.
+pub async fn list_no_project_consents(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<Vec<st::ConsentView>>, AppError> {
+    list_scope_consents(&state, st::NO_PROJECT_SCOPE).await
+}
+
+async fn list_scope_consents(
+    state: &OrchestratorState,
+    scope: &str,
+) -> Result<Json<Vec<st::ConsentView>>, AppError> {
+    let graph = graph(state);
     let instances = load_instances(graph.as_ref()).await?;
-    let rows = load_consents(graph.as_ref(), &slug)
+    let rows = load_scope_consents(graph.as_ref(), scope)
         .await?
         .iter()
         .map(|c| {
@@ -754,10 +787,13 @@ pub async fn list_consents(
     Ok(Json(rows))
 }
 
+/// Stores a person's consent for `scope` (a project's, or [`st::NO_PROJECT_SCOPE`]): the
+/// same rules whatever the scope — a human token, a registered instance, the origin the
+/// person was shown, bound to the origin and the credential reference (A28).
 async fn put_consent(
     state: &OrchestratorState,
     claims: &Claims,
-    slug: &str,
+    scope: &str,
     provider_id: &str,
     origin: &str,
 ) -> Result<Json<st::ConsentView>, AppError> {
@@ -791,11 +827,7 @@ async fn put_consent(
     };
     let body = serde_json::to_string(&record).map_err(|e| AppError::Internal(e.into()))?;
     graph
-        .put_llm_setting(
-            &st::project_scope(slug),
-            &format!("{CONSENT_PREFIX}{provider_id}"),
-            &body,
-        )
+        .put_llm_setting(scope, &format!("{CONSENT_PREFIX}{provider_id}"), &body)
         .await
         .map_err(AppError::Internal)?;
     Ok(Json(st::consent_view(&record, Some(&instance))))
@@ -808,11 +840,15 @@ pub async fn allow_consent(
     Path(slug): Path<String>,
     Json(body): Json<ConsentBody>,
 ) -> Result<Json<st::ConsentView>, AppError> {
-    let provider_id = body
-        .provider_id
-        .clone()
-        .ok_or_else(|| AppError::BadRequest("provider_id is required".to_string()))?;
-    put_consent(&state, &claims, &slug, &provider_id, &body.origin).await
+    let provider_id = body_provider(&body)?;
+    put_consent(
+        &state,
+        &claims,
+        &st::project_scope(&slug),
+        &provider_id,
+        &body.origin,
+    )
+    .await
 }
 
 /// PUT /api/projects/{slug}/llm-consents/{provider_id} — body `{ origin }`.
@@ -822,7 +858,55 @@ pub async fn allow_consent_for(
     Path((slug, provider_id)): Path<(String, String)>,
     Json(body): Json<ConsentBody>,
 ) -> Result<Json<st::ConsentView>, AppError> {
-    put_consent(&state, &claims, &slug, &provider_id, &body.origin).await
+    put_consent(
+        &state,
+        &claims,
+        &st::project_scope(&slug),
+        &provider_id,
+        &body.origin,
+    )
+    .await
+}
+
+/// PUT /api/chat/llm-consents — body `{ provider_id, origin }`: a person allows an instance
+/// for the chats outside any project (B3). A project never inherits it.
+pub async fn allow_no_project_consent(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<ConsentBody>,
+) -> Result<Json<st::ConsentView>, AppError> {
+    let provider_id = body_provider(&body)?;
+    put_consent(
+        &state,
+        &claims,
+        st::NO_PROJECT_SCOPE,
+        &provider_id,
+        &body.origin,
+    )
+    .await
+}
+
+/// PUT /api/chat/llm-consents/{provider_id} — body `{ origin }`.
+pub async fn allow_no_project_consent_for(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(provider_id): Path<String>,
+    Json(body): Json<ConsentBody>,
+) -> Result<Json<st::ConsentView>, AppError> {
+    put_consent(
+        &state,
+        &claims,
+        st::NO_PROJECT_SCOPE,
+        &provider_id,
+        &body.origin,
+    )
+    .await
+}
+
+fn body_provider(body: &ConsentBody) -> Result<String, AppError> {
+    body.provider_id
+        .clone()
+        .ok_or_else(|| AppError::BadRequest("provider_id is required".to_string()))
 }
 
 /// DELETE /api/projects/{slug}/llm-consent[s]/{provider_id}.
@@ -831,12 +915,27 @@ pub async fn revoke_consent(
     Extension(claims): Extension<Claims>,
     Path((slug, provider_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    require_human(&state, &claims)?;
-    let removed = graph(&state)
-        .delete_llm_setting(
-            &st::project_scope(&slug),
-            &format!("{CONSENT_PREFIX}{provider_id}"),
-        )
+    delete_consent(&state, &claims, &st::project_scope(&slug), &provider_id).await
+}
+
+/// DELETE /api/chat/llm-consents/{provider_id}.
+pub async fn revoke_no_project_consent(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(provider_id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    delete_consent(&state, &claims, st::NO_PROJECT_SCOPE, &provider_id).await
+}
+
+async fn delete_consent(
+    state: &OrchestratorState,
+    claims: &Claims,
+    scope: &str,
+    provider_id: &str,
+) -> Result<StatusCode, AppError> {
+    require_human(state, claims)?;
+    let removed = graph(state)
+        .delete_llm_setting(scope, &format!("{CONSENT_PREFIX}{provider_id}"))
         .await
         .map_err(AppError::Internal)?;
     if removed {

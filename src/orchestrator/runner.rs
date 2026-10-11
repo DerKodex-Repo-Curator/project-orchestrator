@@ -1258,15 +1258,28 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         use nexus_claude::{ClaudeCodeOptions, InteractiveClient, PermissionMode};
 
+        // The CLI the server is set to use (CLAUDE_CLI_PATH), else the one on the machine;
+        // without Claude Code there is nothing to ask, and that is not an error (M1).
+        let configured_cli = std::env::var("CLAUDE_CLI_PATH")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
+        if !crate::chat::cli_version::claude_cli_present(configured_cli.as_deref()) {
+            tracing::info!("Claude Code absent: feature graph proposal skipped");
+            return None;
+        }
+
         #[allow(deprecated)]
-        let options = ClaudeCodeOptions::builder()
+        let mut builder = ClaudeCodeOptions::builder()
             .model(model)
             .system_prompt("You are a code architecture analyst. Respond only with valid JSON.")
             .permission_mode(PermissionMode::BypassPermissions)
             .max_turns(1)
             // Same clean environment as every other agent process (A33).
-            .env_policy(crate::chat::manager::child_env_policy())
-            .build();
+            .env_policy(crate::chat::manager::child_env_policy());
+        if let Some(cli) = &configured_cli {
+            builder = builder.cli_path(cli);
+        }
+        let options = builder.build();
 
         let mut client = match InteractiveClient::new(options) {
             Ok(c) => c,

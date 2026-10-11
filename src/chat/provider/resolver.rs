@@ -6,7 +6,8 @@
 //!
 //! Precedence (A16): existing session (frozen) > explicit request > task >
 //! persona > run > project rule > global rule > configured default >
-//! `claude-code` when usable > `no_provider`.
+//! `claude-code` when usable > the only other instance usable here (B2) >
+//! `no_provider`.
 
 use std::fmt;
 
@@ -74,6 +75,10 @@ pub enum RoutedBy {
     /// Nothing configured: the built-in Claude Code instance.
     #[serde(rename = "claude_code")]
     BuiltinClaudeCode,
+    /// Nothing configured and Claude Code not usable (its CLI is not on the server): the
+    /// only other instance that is healthy and allowed here (B2).
+    #[serde(rename = "sole_instance")]
+    SoleInstance,
     /// A higher level was skipped (unhealthy or not allowed) for an executor.
     #[serde(rename = "fallback")]
     Fallback,
@@ -97,6 +102,7 @@ impl RoutedBy {
             Self::GlobalRule => "global_rule",
             Self::ConfiguredDefault => "default",
             Self::BuiltinClaudeCode => "claude_code",
+            Self::SoleInstance => "sole_instance",
             Self::Fallback => "fallback",
             Self::Auto => "auto",
         }
@@ -199,6 +205,17 @@ pub trait InstanceCatalog {
     fn is_healthy(&self, provider_id: &str) -> bool;
     /// Whether the project consented to this instance (A28).
     fn is_allowed_for_project(&self, provider_id: &str) -> bool;
+    /// The registered instances other than the built-in one, in a stable order: what the
+    /// resolver may open when nothing is configured and Claude Code is not usable.
+    fn instance_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Whether the Claude Code CLI is on the server. Consulted only when nothing is
+    /// configured: an explicit `claude-code` still opens, and a missing CLI is then the
+    /// typed `cli_not_found` of the opening (with its install action).
+    fn claude_code_installed(&self) -> bool {
+        true
+    }
 }
 
 /// Why no provider could be resolved.
@@ -215,6 +232,9 @@ pub enum ResolveError {
     UnknownProvider(String),
     /// The project did not consent to this instance.
     NotAllowed(String),
+    /// Outside any project, no person allowed this instance for the sessions without one
+    /// (`PUT /api/chat/llm-consents/{provider_id}`, B3).
+    NotAllowedOutsideProject(String),
     /// The instance cannot open sessions and no fallback applies.
     Unavailable {
         /// Instance identifier.
@@ -224,6 +244,12 @@ pub enum ResolveError {
     },
     /// Nothing is configured and Claude Code is not usable.
     NoProvider,
+    /// Nothing is configured, Claude Code is not usable, and several instances are: the
+    /// resolver does not pick one at random (B2). A request names one, or the pilot role does.
+    ProviderNotChosen {
+        /// The usable instances, in a stable order.
+        candidates: Vec<String>,
+    },
     /// The session was opened on the agent engine, which is not switched on
     /// any more (`CHAT_PROVIDER_PATH`): it cannot be resumed as it is.
     EngineUnavailable {
@@ -233,14 +259,24 @@ pub enum ResolveError {
 }
 
 impl ResolveError {
+    /// The same refusal for an opening that has no project: a missing consent is then
+    /// the no-project one (B3), so the client knows which consent a person gives.
+    pub fn in_scope(self, project_slug: Option<&str>) -> Self {
+        match (self, project_slug) {
+            (Self::NotAllowed(id), None) => Self::NotAllowedOutsideProject(id),
+            (other, _) => other,
+        }
+    }
+
     /// Stable error code.
     pub fn code(&self) -> &'static str {
         match self {
             Self::ProviderConflict { .. } => "provider_conflict",
             Self::UnknownProvider(_) => "provider_unknown",
-            Self::NotAllowed(_) => "endpoint_not_allowed",
+            Self::NotAllowed(_) | Self::NotAllowedOutsideProject(_) => "endpoint_not_allowed",
             Self::Unavailable { .. } => "provider_unavailable",
             Self::NoProvider => "no_provider",
+            Self::ProviderNotChosen { .. } => "provider_not_chosen",
             Self::EngineUnavailable { .. } => "engine_unavailable",
         }
     }
@@ -257,12 +293,20 @@ impl fmt::Display for ResolveError {
             Self::NotAllowed(id) => {
                 write!(f, "provider '{id}' is not allowed for this project")
             }
+            Self::NotAllowedOutsideProject(id) => {
+                write!(f, "provider '{id}' is not allowed outside a project")
+            }
             Self::Unavailable { provider_id, role } => write!(
                 f,
                 "provider '{provider_id}' is unavailable for role {}",
                 role.as_str()
             ),
             Self::NoProvider => f.write_str("no provider is configured"),
+            Self::ProviderNotChosen { candidates } => write!(
+                f,
+                "several providers are usable ({}) and none is chosen",
+                candidates.join(", ")
+            ),
             Self::EngineUnavailable { provider_id } => write!(
                 f,
                 "session of provider '{provider_id}' was opened on the agent engine, which is switched off"
@@ -392,7 +436,8 @@ pub fn resolve(
     // 3. Nothing configured (or every level skipped): built-in Claude Code.
     let claude_usable = catalog.exists(CLAUDE_CODE)
         && catalog.is_healthy(CLAUDE_CODE)
-        && catalog.is_allowed_for_project(CLAUDE_CODE);
+        && catalog.is_allowed_for_project(CLAUDE_CODE)
+        && catalog.claude_code_installed();
     if claude_usable {
         return Ok(ProviderChoice {
             provider_id: CLAUDE_CODE.to_string(),
@@ -409,10 +454,47 @@ pub fn resolve(
             decision_id: None,
         });
     }
-    match first_skip {
+    if let Some(error) = first_skip {
         // Fallback chain exhausted: fail with the reason of the first skipped level.
-        Some(error) => Err(error),
-        None => Err(ResolveError::NoProvider),
+        return Err(error);
+    }
+
+    // 4. Nothing configured and Claude Code not usable (B2): the only other instance that
+    //    is healthy and allowed here. Never a remote machine (that would run the work
+    //    somewhere nobody chose), never a pick among several.
+    let local: Vec<String> = catalog
+        .instance_ids()
+        .into_iter()
+        .filter(|id| id != CLAUDE_CODE && !is_remote_instance(id))
+        .collect();
+    let usable: Vec<String> = local
+        .iter()
+        .filter(|id| catalog.is_allowed_for_project(id) && catalog.is_healthy(id))
+        .cloned()
+        .collect();
+    match usable.as_slice() {
+        [only] => Ok(ProviderChoice {
+            provider_id: only.clone(),
+            model: None,
+            routed_by: RoutedBy::SoleInstance,
+            route_rule: None,
+            shadow: None,
+            fallback_reason: None,
+            reason: None,
+            decision_id: None,
+        }),
+        [] => match local
+            .iter()
+            .filter(|id| !catalog.is_allowed_for_project(id))
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            // One instance exists but is not allowed here: say which, so the person
+            // knows what to allow, rather than "nothing is configured".
+            [only] => Err(ResolveError::NotAllowed((*only).clone())),
+            _ => Err(ResolveError::NoProvider),
+        },
+        _ => Err(ResolveError::ProviderNotChosen { candidates: usable }),
     }
 }
 
@@ -961,6 +1043,7 @@ mod tests {
             RoutedBy::GlobalRule,
             RoutedBy::ConfiguredDefault,
             RoutedBy::BuiltinClaudeCode,
+            RoutedBy::SoleInstance,
             RoutedBy::Fallback,
             RoutedBy::Auto,
         ] {
@@ -985,5 +1068,117 @@ mod tests {
         let wire = serde_json::to_value(&with_reason).unwrap();
         assert_eq!(wire["routed_by"], "auto");
         assert_eq!(wire["reason"], "cheapest healthy arm of class simple");
+    }
+
+    /// [`FakeCatalog`] that also lists its instances (the stored ones a default may open).
+    struct ListedCatalog(FakeCatalog);
+
+    impl InstanceCatalog for ListedCatalog {
+        fn exists(&self, provider_id: &str) -> bool {
+            self.0.exists(provider_id)
+        }
+        fn is_healthy(&self, provider_id: &str) -> bool {
+            self.0.is_healthy(provider_id)
+        }
+        fn is_allowed_for_project(&self, provider_id: &str) -> bool {
+            self.0.is_allowed_for_project(provider_id)
+        }
+        fn instance_ids(&self) -> Vec<String> {
+            self.0
+                .rows
+                .iter()
+                .map(|row| row.0.to_string())
+                .filter(|id| id != CLAUDE_CODE)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        }
+    }
+
+    fn listed(rows: &[(&'static str, bool, bool)]) -> ListedCatalog {
+        ListedCatalog(FakeCatalog::new(rows))
+    }
+
+    #[test]
+    fn nothing_configured_and_claude_code_usable_still_opens_claude_code() {
+        let catalog = listed(&[(CLAUDE_CODE, true, true), ("local", true, true)]);
+        for role in [Role::Pilot, Role::Executor] {
+            let choice = resolve(&ResolveInput::empty(role), &catalog).unwrap();
+            assert_eq!(choice.provider_id, CLAUDE_CODE);
+            assert_eq!(choice.routed_by, RoutedBy::BuiltinClaudeCode);
+        }
+    }
+
+    #[test]
+    fn without_the_claude_cli_the_only_usable_instance_opens_never_a_missing_claude_code() {
+        // B2: the CLI is not on the server (claude-code unhealthy), no role, no request.
+        let catalog = listed(&[(CLAUDE_CODE, false, true), ("local", true, true)]);
+        for role in [Role::Pilot, Role::Executor] {
+            let choice = resolve(&ResolveInput::empty(role), &catalog).unwrap();
+            assert_eq!(
+                (choice.provider_id.as_str(), choice.routed_by),
+                ("local", RoutedBy::SoleInstance)
+            );
+            assert_eq!(
+                choice.model, None,
+                "the instance's own default model applies"
+            );
+        }
+        // An unhealthy or unallowed instance does not count; a remote machine never does.
+        let catalog = listed(&[
+            (CLAUDE_CODE, false, true),
+            ("local", true, true),
+            ("down", false, true),
+            ("other-project", true, false),
+            ("claude-code@box", true, true),
+        ]);
+        let choice = resolve(&ResolveInput::empty(Role::Pilot), &catalog).unwrap();
+        assert_eq!(choice.provider_id, "local");
+    }
+
+    #[test]
+    fn without_the_claude_cli_several_usable_instances_are_never_picked_at_random() {
+        let catalog = listed(&[
+            (CLAUDE_CODE, false, true),
+            ("b-local", true, true),
+            ("a-cloud", true, true),
+        ]);
+        let error = resolve(&ResolveInput::empty(Role::Pilot), &catalog).unwrap_err();
+        assert_eq!(error.code(), "provider_not_chosen");
+        assert_eq!(
+            error,
+            ResolveError::ProviderNotChosen {
+                candidates: vec!["a-cloud".into(), "b-local".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn without_the_claude_cli_an_instance_not_allowed_here_is_named_and_nothing_else_is() {
+        // One instance exists, not allowed here: the refusal names it (what to allow).
+        let catalog = listed(&[(CLAUDE_CODE, false, true), ("local", true, false)]);
+        assert_eq!(
+            resolve(&ResolveInput::empty(Role::Pilot), &catalog).unwrap_err(),
+            ResolveError::NotAllowed("local".into())
+        );
+        // Nothing registered at all: no_provider.
+        let catalog = listed(&[(CLAUDE_CODE, false, true)]);
+        assert_eq!(
+            resolve(&ResolveInput::empty(Role::Pilot), &catalog).unwrap_err(),
+            ResolveError::NoProvider
+        );
+        // An executor that skipped a configured level still reports that level, never a
+        // default it was not configured for.
+        let catalog = listed(&[
+            (CLAUDE_CODE, false, true),
+            ("local", true, true),
+            ("rule", false, true),
+        ]);
+        let mut input = ResolveInput::empty(Role::Executor);
+        input.project_rule = Some(Candidate::new("rule", None));
+        assert_eq!(
+            resolve(&input, &catalog).unwrap_err().code(),
+            "provider_unavailable"
+        );
     }
 }

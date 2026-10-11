@@ -333,6 +333,8 @@ const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     "/api/chat/config",
     "/api/chat/providers",
     "/api/chat/roles",
+    // Where the chats outside any project may send their content (B3).
+    "/api/chat/llm-consents",
     "/api/chat/model-policy",
     "/api/chat/model-aliases",
     "/api/chat/routing",
@@ -883,6 +885,10 @@ mod tests {
             .route("/api/chat/providers", get(ok_handler).post(ok_handler))
             .route("/api/chat/providers/{id}", put(ok_handler))
             .route("/api/projects/{slug}/llm-consent", put(ok_handler))
+            .route(
+                "/api/chat/llm-consents/{provider_id}",
+                put(ok_handler).delete(ok_handler),
+            )
             .route("/api/notes", post(ok_handler))
             .layer(from_fn_with_state(state.clone(), require_auth))
             .with_state(state);
@@ -903,6 +909,8 @@ mod tests {
             ("POST", "/api/chat/providers"),
             ("PUT", "/api/chat/providers/deepseek"),
             ("PUT", "/api/projects/demo/llm-consent"),
+            ("PUT", "/api/chat/llm-consents/deepseek"),
+            ("DELETE", "/api/chat/llm-consents/deepseek"),
         ] {
             assert_eq!(
                 status_of(app.clone(), method, uri, &agent).await,
