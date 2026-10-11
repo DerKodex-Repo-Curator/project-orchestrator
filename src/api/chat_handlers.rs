@@ -167,18 +167,8 @@ pub async fn create_session(
     // T4.3: Extract code entities from the first message and create DISCUSSED relations (non-blocking)
     super::ws_chat_handler::spawn_entity_extraction(&state, &response.session_id, &request.message);
 
-    // Emit CRUD event for live refresh
-    state.event_bus.emit(
-        CrudEvent::new(
-            EntityType::ChatSession,
-            CrudAction::Created,
-            &response.session_id,
-        )
-        .with_payload(serde_json::json!({
-            "project_slug": request.project_slug,
-        })),
-    );
-
+    // The session lists learn it from the `created` event `ChatManager` emits itself for
+    // every session it opens (with `spawned_by`): emitting one here sent it twice.
     Ok(Json(response))
 }
 
@@ -5561,16 +5551,7 @@ pub async fn switch_provider(
         .await
         .map_err(|e| switch_error(e, &session_id.to_string()))?;
 
-    state.event_bus.emit(
-        CrudEvent::new(
-            EntityType::ChatSession,
-            CrudAction::Created,
-            &response.session_id,
-        )
-        .with_payload(serde_json::json!({
-            "switched_from": response.previous_session_id,
-        })),
-    );
+    // The new session's `created` event (with `switched_from`) is emitted by `ChatManager`.
     Ok(Json(response))
 }
 

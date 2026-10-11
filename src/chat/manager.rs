@@ -1195,6 +1195,38 @@ fn is_conclusive_tool(tool_name: &str, input: &serde_json::Value) -> bool {
     false
 }
 
+/// The payload of the CRUD `created` event of a chat session (decision ed628dad): what a
+/// session list needs to show the new session at once. `spawned_by` is the session
+/// record's own (the same JSON the API's `ChatSession.spawned_by` answers): the client
+/// joins a sub-agent to its parent's `Agent` call by `spawned_by.tool_use_id`, live. It
+/// is absent for a session nothing spawned. `switched_from` names the session a provider
+/// switch or an automatic move left.
+fn session_created_payload(
+    request: &ChatRequest,
+    project_slug: Option<&str>,
+    model: &str,
+    relay: Option<&super::relay::RelayedFrom>,
+) -> serde_json::Value {
+    let neutral = super::neutral_place::is_neutral_path(&request.cwd);
+    let mut payload = serde_json::json!({
+        "project_slug": project_slug,
+        "execution_place": if neutral { "neutral" } else { "project" },
+        "cwd": if neutral { serde_json::Value::Null } else { serde_json::json!(request.cwd) },
+        "model": model,
+    });
+    if let Some(spawned_by) = request
+        .spawned_by
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    {
+        payload["spawned_by"] = spawned_by;
+    }
+    if let Some(relay) = relay {
+        payload["switched_from"] = serde_json::json!(relay.from_session_id);
+    }
+    payload
+}
+
 /// Parse a `spawned_by` JSON string and extract parent session info + protocol FSM context.
 ///
 /// Returns `None` if the JSON is invalid.
@@ -6266,6 +6298,28 @@ impl ChatManager {
     // Session lifecycle
     // ========================================================================
 
+    /// The ONE CRUD `created` event of a session this server just opened, whatever the
+    /// engine (legacy CLI or agent runtime) and whoever asked (HTTP, MCP, an `Agent` call,
+    /// a provider switch, the runner): the callers emit none of their own (lot review of
+    /// #721, finding 1).
+    fn emit_session_created(
+        &self,
+        session_id: Uuid,
+        request: &ChatRequest,
+        project_slug: Option<&str>,
+        model: &str,
+        relay: Option<&super::relay::RelayedFrom>,
+    ) {
+        if let Some(ref emitter) = self.event_emitter {
+            emitter.emit_created(
+                crate::events::EntityType::ChatSession,
+                &session_id.to_string(),
+                session_created_payload(request, project_slug, model, relay),
+                None,
+            );
+        }
+    }
+
     /// Create a new chat session: persist to Neo4j, spawn CLI subprocess, start streaming
     pub async fn create_session(&self, request: &ChatRequest) -> Result<CreateSessionResponse> {
         self.create_session_relayed(request, None).await
@@ -6680,7 +6734,7 @@ impl ChatManager {
         // (`engine_is_agent`). The agent engine ports hooks, queue, auto-continue,
         // retry, compaction and NATS: what a session lacks is in its `system_init`.
         if self.engine_is_agent(&provider_choice.provider_id) {
-            return self
+            let opened = self
                 .open_agent_session(AgentOpen {
                     request,
                     session_id,
@@ -6693,7 +6747,11 @@ impl ChatManager {
                     relay,
                     access,
                 })
-                .await;
+                .await?;
+            // The agent engine's session is open: the lists learn it now, a sub-agent
+            // opened by an `Agent` call included (it never goes through an HTTP handler).
+            self.emit_session_created(session_id, request, project_slug.as_deref(), &model, relay);
+            return Ok(opened);
         }
 
         // The Claude CLI always switches model live; the opening message was turn 0.
@@ -7081,19 +7139,7 @@ impl ChatManager {
         self.notify_attention(&session_id.to_string(), AttentionReason::UserMessage);
 
         // Emit CRUD event so other instances (via NATS) know a session was created
-        if let Some(ref emitter) = self.event_emitter {
-            emitter.emit_created(
-                crate::events::EntityType::ChatSession,
-                &session_id.to_string(),
-                serde_json::json!({
-                    "project_slug": request.project_slug,
-                    "execution_place": if super::neutral_place::is_neutral_path(&request.cwd) { "neutral" } else { "project" },
-                    "cwd": if super::neutral_place::is_neutral_path(&request.cwd) { serde_json::Value::Null } else { serde_json::json!(request.cwd) },
-                    "model": model,
-                }),
-                None,
-            );
-        }
+        self.emit_session_created(session_id, request, project_slug.as_deref(), &model, relay);
 
         // The title and preview were set on the node at creation (`session_record`).
 
@@ -20898,6 +20944,189 @@ mod tests {
             "start, then end"
         );
         manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The `created` events of chat sessions the bus holds right now.
+    fn chat_sessions_created(
+        crud: &mut tokio::sync::broadcast::Receiver<crate::events::CrudEvent>,
+    ) -> Vec<crate::events::CrudEvent> {
+        let mut created = Vec::new();
+        while let Ok(event) = crud.try_recv() {
+            if event.entity_type == crate::events::EntityType::ChatSession
+                && event.action == crate::events::CrudAction::Created
+            {
+                created.push(event);
+            }
+        }
+        created
+    }
+
+    /// Lot review of #721, finding 1 (decision ed628dad): the payload of a session's
+    /// `created` event carries the record's own `spawned_by` — the join of a sub-agent to
+    /// its parent's `Agent` call is `spawned_by.tool_use_id` — and none for a session
+    /// nothing spawned. The fields it carried before stay.
+    #[test]
+    fn the_created_payload_carries_spawned_by_only_for_a_spawned_session() {
+        let mut req = agent_request("hello");
+        req.cwd = "/work/proj".into();
+        let top = session_created_payload(&req, Some("proj"), "m-1", None);
+        assert_eq!(top["project_slug"], "proj");
+        assert_eq!(top["model"], "m-1");
+        assert_eq!(top["cwd"], "/work/proj");
+        assert_eq!(top["execution_place"], "project");
+        assert!(top.get("spawned_by").is_none(), "{top}");
+        assert!(top.get("switched_from").is_none(), "{top}");
+
+        let parent = Uuid::new_v4();
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: Some("toolu_7".into()),
+            }
+            .to_json_string(),
+        );
+        let child = session_created_payload(&req, Some("proj"), "m-1", None);
+        assert_eq!(child["spawned_by"]["type"], "conversation");
+        assert_eq!(child["spawned_by"]["parent_session_id"], parent.to_string());
+        assert_eq!(child["spawned_by"]["tool_use_id"], "toolu_7");
+        assert_eq!(child["project_slug"], "proj", "the other fields stay");
+    }
+
+    /// Lot review of #721, finding 1: a session of the agent engine opened by nobody
+    /// emits exactly one `created`, without `spawned_by`. Red before: none at all (only
+    /// the legacy engine and the HTTP handler emitted one).
+    #[tokio::test]
+    async fn an_agent_engine_session_emits_one_created_event_without_spawned_by() {
+        let (manager, _graph, _fake) = agent_manager();
+        let bus = Arc::new(crate::events::EventBus::new(64));
+        let mut crud = bus.subscribe();
+        let manager = manager.with_event_emitter(bus.clone());
+        let created = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        let events = chat_sessions_created(&mut crud);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].entity_id, created.session_id);
+        assert!(events[0].payload.get("spawned_by").is_none());
+        assert!(events[0].payload.get("model").is_some());
+        manager.close_session(&created.session_id).await.unwrap();
+        assert!(chat_sessions_created(&mut crud).is_empty());
+    }
+
+    /// Lot review of #721, nit (b) of the follow-up review of #724: a deny of a sub-agent's
+    /// request that its provider refuses still ends the request DECIDED on the child's
+    /// thread (it is closed right after: nothing runs the call), so it stays pending in
+    /// nobody's attention; a deny the provider takes is written once, by the normal path.
+    /// Red before: the refused one got no `permission_decision` at all.
+    #[tokio::test]
+    async fn a_deny_the_provider_refuses_is_still_written_on_the_thread() {
+        let (manager, graph, fake) = agent_manager();
+        let created = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        let sid = created.session_id.clone();
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        let ask = |id: &str| ChatEvent::PermissionRequest {
+            id: id.into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "rm -rf build" }),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: Some("Bash".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        handle.emit(ask("refused")).await;
+        handle.emit(ask("taken")).await;
+        // The provider already holds an answer to `refused`: it rejects a second one.
+        fake.state.permission_answers.lock().unwrap().push((
+            "refused".into(),
+            nexus_claude::agent::PermissionDecision::allow_once(),
+        ));
+        manager.deny_waiting_permissions(&sid).await;
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let decisions: Vec<(String, bool)> = events_of(&graph, uuid)
+            .await
+            .iter()
+            .filter_map(|e| match serde_json::from_str::<ChatEvent>(&e.data).ok()? {
+                ChatEvent::PermissionDecision { id, allow, .. } => Some((id, allow)),
+                _ => None,
+            })
+            .collect();
+        let mut decisions = decisions;
+        decisions.sort();
+        assert_eq!(
+            decisions,
+            vec![("refused".to_string(), false), ("taken".to_string(), false)]
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Lot review of #721, finding 4: the restart recovery closes a cut sub-agent of an
+    /// `Agent` call, and first refuses what its thread leaves undecided, through the same
+    /// helper as the live path — so the request is no orphan in its owner's attention. A
+    /// runner's child is closed as before (its requests are its run's business). Red
+    /// before: closed with the request still undecided.
+    #[tokio::test]
+    async fn a_cut_agent_child_refuses_its_undecided_requests_before_it_is_closed() {
+        let request = serde_json::to_string(&ChatEvent::PermissionRequest {
+            id: "p1".into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "make" }),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: Some("Bash".into()),
+            tool_use_id: None,
+            always: None,
+        })
+        .unwrap();
+        let tail = [
+            ("user_message", "{}"),
+            ("permission_request", request.as_str()),
+        ];
+        for (spawned_by, refused) in [
+            (
+                crate::chat::types::SpawnedBy::Conversation {
+                    parent_session_id: Uuid::new_v4(),
+                    tool_use_id: Some("toolu_1".into()),
+                },
+                true,
+            ),
+            (
+                crate::chat::types::SpawnedBy::Runner {
+                    run_id: Uuid::new_v4(),
+                    task_id: Uuid::new_v4(),
+                    parent_session_id: None,
+                },
+                false,
+            ),
+        ] {
+            let (manager, graph, fake, sid) = restarted_with_tail(&tail).await;
+            let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+            node.spawned_by = Some(spawned_by.to_json_string());
+            graph.create_chat_session(&node).await.unwrap();
+            let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+            assert_eq!((pending.len(), scan.closed), (0, 1));
+            assert!(fake.state.turns_started.lock().unwrap().is_empty());
+            let events = events_of(&graph, sid).await;
+            assert_closed_by_recovery(&events);
+            let decisions: Vec<&ChatEventRecord> = events
+                .iter()
+                .filter(|e| e.event_type == "permission_decision")
+                .collect();
+            if refused {
+                assert_eq!(decisions.len(), 1, "{events:?}");
+                let decision: ChatEvent = serde_json::from_str(&decisions[0].data).unwrap();
+                assert!(
+                    matches!(decision, ChatEvent::PermissionDecision { ref id, allow: false, .. } if id == "p1"),
+                    "{decision:?}"
+                );
+            } else {
+                assert!(decisions.is_empty(), "{events:?}");
+            }
+        }
     }
 
     /// Finding 8b of #697: a session reopened without its owner's identity, on a server

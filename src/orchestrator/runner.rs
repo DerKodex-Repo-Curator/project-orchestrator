@@ -7580,26 +7580,65 @@ mod tests {
         }
     }
 
+    /// Runs `git args` in `dir` with a fixed identity and no user/system config, so the
+    /// test does not depend on the machine's git setup.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Self-contained (lot review of #721): it used to read the last 3 commits of THIS
+    /// repository, and failed whenever they were merges (no numstat) — as on a promotion
+    /// branch, whose head is a merge. Now a repository of its own with known commits.
     #[test]
     fn test_git_log_touched_files_has_file_stats() {
-        // Parse 3 commits from the actual repo and check file stats
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let commits = Orchestrator::git_log_touched_files(&root, 3).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(root, &["add", "a.txt"]);
+        git_in(root, &["commit", "-q", "-m", "first"]);
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git_in(root, &["add", "-A"]);
+        git_in(root, &["commit", "-q", "-m", "second"]);
 
-        if !commits.is_empty() {
-            // At least one commit should have files
-            let has_files = commits.iter().any(|c| !c.files.is_empty());
-            assert!(has_files, "At least one commit should have touched files");
+        let commits = Orchestrator::git_log_touched_files(root, 3).unwrap();
+        assert_eq!(commits.len(), 2, "{commits:?}");
+        // Newest first.
+        assert_eq!(commits[0].message, "second");
+        assert_eq!(commits[0].author, "Test");
+        assert_eq!(commits[1].message, "first");
 
-            // Check that file paths are relative (no leading /)
-            for c in &commits {
-                for f in &c.files {
-                    assert!(
-                        !f.path.starts_with('/'),
-                        "git log should return relative paths, got: {}",
-                        f.path
-                    );
-                }
+        let second = &commits[0].files;
+        assert_eq!(second.len(), 2, "{second:?}");
+        let a = second.iter().find(|f| f.path == "a.txt").unwrap();
+        assert_eq!((a.additions, a.deletions), (Some(0), Some(1)));
+        let b = second.iter().find(|f| f.path == "src/b.rs").unwrap();
+        assert_eq!((b.additions, b.deletions), (Some(1), Some(0)));
+
+        let first = &commits[1].files;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].path, "a.txt");
+        assert_eq!((first[0].additions, first[0].deletions), (Some(2), Some(0)));
+        for c in &commits {
+            for f in &c.files {
+                assert!(!f.path.starts_with('/'), "relative path: {}", f.path);
             }
         }
     }

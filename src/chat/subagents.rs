@@ -497,8 +497,16 @@ impl ChatManager {
     /// answer (the call failed on it, fix B) is no orphan in the cockpit of the child's
     /// owner for 30 days once the child is closed (review of #724, point 1). The requests
     /// are the live session's, and those its stored thread shows undecided.
-    async fn deny_waiting_permissions(&self, sid: &str) {
-        let mut ids: Vec<String> = match self.agent_runtime.get(sid).await {
+    ///
+    /// Every request named ends DECIDED on the thread (lot review of #721): when the child
+    /// is not live on this server (the restart recovery closing it), or when its provider
+    /// refuses the deny (a request it no longer knows), the refusal is written on the
+    /// thread by this server, with a warning naming why — the child is closed right after,
+    /// so nothing of it can run the call any more. It used to write nothing then, and the
+    /// request stayed pending in the owner's attention.
+    pub(crate) async fn deny_waiting_permissions(&self, sid: &str) {
+        let live = self.agent_runtime.get(sid).await;
+        let mut ids: Vec<String> = match &live {
             Some(handle) => handle.waiting_permission_ids(),
             None => Vec::new(),
         };
@@ -516,19 +524,41 @@ impl ChatManager {
                 }
             }
         }
+        let routable = live.is_some() || self.is_session_active(sid).await;
         for id in ids {
-            if let Err(e) = self
-                .route_permission_response(
-                    sid,
-                    &id,
-                    false,
-                    super::types::PermissionAnswerScope::Once,
-                    false,
-                )
-                .await
-            {
-                tracing::debug!(child = %sid, request = %id, error = %e, "sub-agent permission deny");
+            if routable {
+                match self
+                    .route_permission_response(
+                        sid,
+                        &id,
+                        false,
+                        super::types::PermissionAnswerScope::Once,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(_) => continue,
+                    Err(e) => tracing::warn!(
+                        child = %sid, request = %id, error = %e,
+                        "the provider did not take the sub-agent's deny: the refusal is written on its thread, and it is closed"
+                    ),
+                }
+            } else {
+                tracing::info!(
+                    child = %sid, request = %id,
+                    "sub-agent not live here: its undecided permission request is refused on its thread"
+                );
             }
+            self.emit_on_session(
+                sid,
+                ChatEvent::PermissionDecision {
+                    id,
+                    allow: false,
+                    scope: None,
+                    rule: None,
+                },
+            )
+            .await;
         }
     }
 
@@ -538,10 +568,8 @@ impl ChatManager {
             .subscribe(sid)
             .await
             .map_err(|e| format!("the sub-agent cannot be followed: {e:#}"))?;
-        // Whether the backend answers a request of the child itself: decided by the child's
-        // session before the request is broadcast (`AgentSessionHandle::answers_itself`).
-        let handle = self.agent_runtime.get(sid).await;
-        let answers_itself = |id: &str| handle.as_ref().is_some_and(|h| h.answers_itself(id));
+        let initial = self.agent_runtime.get(sid).await;
+        let answers_itself = live_answers_itself(Arc::clone(&self.agent_runtime), sid, initial);
         self.answer_from(sid, rx, &answers_itself).await
     }
 
@@ -744,6 +772,30 @@ impl Watch {
              (nobody answers in its session): do that step yourself, or give it a task that \
              needs no permission"
         )))
+    }
+}
+
+/// Whether the backend answers a request of the child `sid` itself, read from the child's
+/// LIVE session each time it is asked (`AgentSessionHandle::answers_itself`, decided before
+/// the request is broadcast). The handle used to be captured once, when the wait began
+/// (lot review of #721, nit (a) of the follow-up review of #724): a child whose session was
+/// replaced in the runtime meanwhile (re-adopted under the same id: a resume) was judged
+/// on the OLD handle, whose sets never see the new session's requests — a covered request
+/// then failed the call, or one still waiting looked answered. The runtime is read without
+/// waiting; at the instant it is being written, the handle last seen answers.
+fn live_answers_itself(
+    runtime: Arc<super::agent_runtime::AgentRuntime>,
+    sid: &str,
+    initial: Option<Arc<super::agent_runtime::AgentSessionHandle>>,
+) -> impl Fn(&str) -> bool + Send + Sync {
+    let sid = sid.to_owned();
+    let last = std::sync::Mutex::new(initial);
+    move |id: &str| {
+        let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(now) = runtime.try_get(&sid) {
+            *last = now;
+        }
+        last.as_ref().is_some_and(|h| h.answers_itself(id))
     }
 }
 
@@ -987,6 +1039,65 @@ mod tests {
             .unwrap();
         assert!(out.is_err_and(|e| e.contains("Bash")));
         drop(tx);
+    }
+
+    /// Lot review of #721 (nit (a) of the follow-up review of #724): what the parent asks
+    /// about a child's request is read from the child's LIVE session, not from the handle
+    /// seen when the wait began. The child is re-adopted under the same id (a resume); its
+    /// new session holds a grant and answers a covered request itself: the parent must not
+    /// see it as unanswered. Red before: the handle captured at the start never saw the
+    /// request, so the call failed with "needed a permission".
+    #[tokio::test]
+    async fn whether_a_child_answers_itself_is_read_from_its_live_session() {
+        use super::super::agent_runtime::{fake::FakeProvider, AgentRuntime};
+        use super::super::types::PermissionAnswerScope;
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = Arc::new(AgentRuntime::new(graph));
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes = vec![
+            nexus_claude::agent::PermissionScope::Once,
+            nexus_claude::agent::PermissionScope::Session,
+        ];
+        let adopt = || {
+            runtime.adopt(
+                "child",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+        };
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        let first = adopt().await;
+        let answers_itself = live_answers_itself(Arc::clone(&runtime), "child", Some(first));
+        let second = adopt().await;
+        second.emit(write("w0")).await;
+        assert!(!answers_itself("w0"), "the live session waits on its user");
+        second
+            .answer_permission_scoped("w0", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        second.emit(write("w1")).await;
+        assert!(
+            answers_itself("w1"),
+            "the live session answered it itself (its grant covers it)"
+        );
+        second.emit(asked("bash-1")).await;
+        assert!(!answers_itself("bash-1"), "nothing covers it: it waits");
+        // The child is gone from the runtime: nothing answers for it.
+        let _ = runtime.close("child").await;
+        assert!(!answers_itself("w1"));
     }
 
     /// P18b round 2, fix 3: a guard still armed when it drops runs its backstop exactly

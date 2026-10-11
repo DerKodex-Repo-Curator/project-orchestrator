@@ -649,7 +649,15 @@ impl AgentSessionHandle {
         drop(answering);
         match answered {
             Ok(()) => {
+                // Answered: it waits no more, and the set of the requests the backend
+                // answers itself forgets it — it used to keep every one for the session's
+                // whole life (lot review of #721, finding 2c). `answers_itself` still says
+                // `true` for it: a request no longer waiting needs nobody.
                 self.asked_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&covered);
+                self.self_answered
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&covered);
@@ -1455,14 +1463,39 @@ impl AgentSessionHandle {
             .collect()
     }
 
-    /// Whether the backend answers the permission request `request_id` itself (a grant
-    /// or a lasting rule covers it): known as soon as the request is broadcast, before
-    /// its automatic answer went out. `false` once that answer failed.
+    /// Whether nobody needs to answer the permission request `request_id`: the backend
+    /// answers it itself (a grant or a lasting rule covers it — known as soon as the
+    /// request is broadcast, before its automatic answer went out), or this session does
+    /// not wait on it (already answered). `false` only for a request this session still
+    /// waits on and that no grant answers: one whose automatic answer failed included.
+    ///
+    /// The "not waiting" half is what lets a successful automatic answer drop its id from
+    /// `self_answered` (lot review of #721): a parent reading the request before the
+    /// decision that follows it still sees it answered, never asked.
     pub fn answers_itself(&self, request_id: &str) -> bool {
-        self.self_answered
+        if self
+            .self_answered
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(request_id)
+        {
+            return true;
+        }
+        !self
+            .asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(request_id)
+    }
+
+    /// How many requests this session holds as answered by itself: zero once their
+    /// automatic answers went through.
+    #[cfg(test)]
+    pub(crate) fn self_answered_len(&self) -> usize {
+        self.self_answered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// Answers a permission request for this call only.
@@ -1916,6 +1949,16 @@ impl AgentRuntime {
     /// The live session, if this runtime owns it.
     pub async fn get(&self, session_id: &str) -> Option<Arc<AgentSessionHandle>> {
         self.sessions.read().await.get(session_id).cloned()
+    }
+
+    /// [`Self::get`] without waiting, for a caller that cannot `await` (a synchronous
+    /// predicate): `None` while the map is being written at this very instant, else the
+    /// live session (or its absence).
+    pub fn try_get(&self, session_id: &str) -> Option<Option<Arc<AgentSessionHandle>>> {
+        self.sessions
+            .try_read()
+            .ok()
+            .map(|sessions| sessions.get(session_id).cloned())
     }
 
     /// Whether this runtime owns a live session of that id.
@@ -2995,6 +3038,71 @@ mod adopt_tests {
                 "write-2".into()
             ]
         );
+    }
+
+    /// Lot review of #721 (finding 2c): a request a session grant covers is answered by the
+    /// backend, and then forgotten — the set of the requests it answers itself used to keep
+    /// every one for the session's whole life. Each stays "needs nobody" for a parent that
+    /// reads it late; a request still waiting for the user does not. Red before: 20 covered
+    /// requests left 20 ids in the set.
+    #[tokio::test]
+    async fn a_request_answered_by_a_grant_does_not_stay_in_the_self_answered_set() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let native = runtime
+            .adopt(
+                "native-forgets",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        native.emit(write("write-0")).await;
+        assert!(!native.answers_itself("write-0"), "waits for the user");
+        native
+            .answer_permission_scoped("write-0", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        for i in 1..=20 {
+            native.emit(write(&format!("write-{i}"))).await;
+        }
+        assert_eq!(provider.state.permission_answers.lock().unwrap().len(), 21);
+        assert_eq!(native.self_answered_len(), 0, "answered, so forgotten");
+        assert!(native.waiting_permission_ids().is_empty());
+        assert!(
+            native.answers_itself("write-20"),
+            "answered: nobody needs to answer it"
+        );
+        // A call no grant covers still waits for the user: not answered by the backend.
+        native
+            .emit(ChatEvent::PermissionRequest {
+                id: "bash-1".into(),
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": "rm -rf build" }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: Some("Bash".into()),
+                tool_use_id: None,
+                always: None,
+            })
+            .await;
+        assert!(!native.answers_itself("bash-1"));
     }
 }
 
