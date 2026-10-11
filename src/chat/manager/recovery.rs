@@ -65,7 +65,11 @@ pub(crate) enum Verdict {
     Close(&'static str),
 }
 
-/// Events that say nothing about whether a turn ended (timing, hints, bookkeeping).
+/// Events that say nothing about whether a turn ended: timing, hints, bookkeeping, and
+/// everything that can be written on an IDLE session after its turn's `result` (review of
+/// #711, finding 1). When one of them does start a turn (a background output given to the
+/// model), the turn's own events follow it and decide; a cut right after it is judged on
+/// what came before, which errs on the safe side (left as it is rather than closed).
 fn is_bookkeeping(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -73,18 +77,38 @@ fn is_bookkeeping(event_type: &str) -> bool {
             | "system_hint"
             | "tool_use_input_resolved"
             | "permission_decision"
-            // Settings changed on an idle session, and the announce of a (re)opened one: a
-            // turn that ended stays ended after them.
+            // Settings changed on an idle session, and the announce of a (re)opened one.
             | "permission_mode_changed"
             | "model_changed"
             | "auto_continue_state_changed"
             | "system_init"
+            // Out of turn: the output of a background command or monitor (both engines
+            // store it after the turn ended: `oob_listener`, `pump_out_of_band`), the
+            // cancel of a background task, the state of the task list and the queue.
+            | "background_output"
+            | "tool_cancelled"
+            | "tools_cancelled"
+            | "active_tasks_update"
+            | "pending_queue"
+            | "secret_request_resolved"
+            | "conversation_relayed"
+            // Transient or announcing events (no turn content of their own).
+            | "stream_delta"
+            | "streaming_status"
+            | "retrying"
+            | "auto_continue"
+            | "compaction_started"
+            | "compaction_recovery"
+            | "compact_boundary"
+            | "refs_resolved"
     )
 }
 
 /// How many times this session has already been automatically resumed, counting only the
 /// resumes that belong to the CURRENT turn (after the last real user message). With TAIL=200
-/// earlier turns' resume markers would otherwise accumulate and trigger false closes.
+/// earlier turns' resume markers would otherwise accumulate and trigger false closes. A
+/// marker followed by a `session_closed` before the next marker is an attempt of the
+/// recovery that failed and was tried again (review of #711, finding 2), not a restart.
 fn count_resumes(tail: &[ChatEventRecord]) -> usize {
     // Find the start of the current turn: the last user_message that is NOT a resume marker.
     let turn_start = tail
@@ -92,10 +116,19 @@ fn count_resumes(tail: &[ChatEventRecord]) -> usize {
         .rposition(|e| e.event_type == "user_message" && !e.data.contains(RESUME_MARKER))
         .map(|i| i + 1)
         .unwrap_or(0);
-    tail[turn_start..]
-        .iter()
-        .filter(|e| e.event_type == "user_message" && e.data.contains(RESUME_MARKER))
-        .count()
+    let mut resumes = 0;
+    let mut open_marker = false;
+    for event in &tail[turn_start..] {
+        if event.event_type == "user_message" && event.data.contains(RESUME_MARKER) {
+            if open_marker {
+                resumes += 1;
+            }
+            open_marker = true;
+        } else if event.event_type == "session_closed" {
+            open_marker = false;
+        }
+    }
+    resumes + usize::from(open_marker)
 }
 
 /// Whether the `spawned_by` JSON string identifies a session managed by an orchestrator
@@ -335,6 +368,12 @@ const CLOSED_FAILED: &str = "The server restarted while this turn was running, a
 /// when its turn was cut (enough to find its last meaningful event).
 const SHORT_TAIL: i64 = 20;
 
+/// A session whose last activity is older than this is not touched at all, cut or not: the
+/// older a thread, the less its "streaming" look matters and the more a wrong judgement of
+/// its tail would cost (review of #711, finding 1: rather left streaming than falsely
+/// closed). It also bounds what one boot reads and writes.
+pub(crate) const CLOSE_HORIZON: chrono::Duration = chrono::Duration::days(7);
+
 /// What the scan found.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanReport {
@@ -393,6 +432,11 @@ impl ChatManager {
             if node.created_at >= started || self.is_session_active(&sid).await {
                 continue;
             }
+            // `updated_at` is set at least when a turn starts: older than the horizon, so is
+            // the turn.
+            if node.updated_at < started - CLOSE_HORIZON {
+                continue;
+            }
             // Not resumed here, closed when cut: a session without a capability snapshot
             // is a Claude Code CLI session; an orchestrator-managed one (runner, pipeline,
             // gate-retry, delegation) is relaunched by its orchestrator. Conversation
@@ -433,6 +477,9 @@ impl ChatManager {
                 }
             };
             let last_event_at = tail.last().map(|e| e.created_at).unwrap_or(node.updated_at);
+            if last_event_at < started - CLOSE_HORIZON {
+                continue;
+            }
             match judge(&tail) {
                 Verdict::Settled => {}
                 Verdict::Close(reason) => {
@@ -600,15 +647,25 @@ impl ChatManager {
         if self.agent_runtime.owns(&sid).await {
             let _ = self.close_session(&sid).await;
         }
-        if credentials_locked(&error) || transient(&error) {
+        // `credentials_locked` waits only while the vault IS locked. With the vault open it
+        // says the key could not be read for another reason (vault unavailable, throttled,
+        // storage error: `credentials.rs`): counted like any transient error, not retried
+        // every `poll` until the deadline (review of #711, finding 3).
+        let locked_out = credentials_locked(&error)
+            && self
+                .vault
+                .as_ref()
+                .is_some_and(|v| !v.is_unlocked(chrono::Utc::now()));
+        let retryable = transient(&error) || credentials_locked(&error);
+        if locked_out || retryable {
             if let Ok(seq) = self.graph.get_latest_chat_event_seq(item.node.id).await {
                 item.seen_seq = seq;
             }
         }
-        if credentials_locked(&error) {
+        if locked_out {
             return Attempt::Wait;
         }
-        if transient(&error) && item.failures < MAX_TRANSIENT_RETRIES {
+        if retryable && item.failures < MAX_TRANSIENT_RETRIES {
             item.failures += 1;
             warn!("recovery: session {sid} not resumed yet ({error}), trying again");
             return Attempt::Retry;
@@ -741,6 +798,66 @@ mod tests {
             ];
             assert_eq!(judge(&tail), Verdict::Settled, "{last}");
         }
+    }
+
+    #[test]
+    fn output_written_on_an_idle_session_does_not_reopen_its_turn() {
+        // Review of #711, finding 1: both engines store a background command's output
+        // AFTER the turn's result; so are the cancel of a background task and the like.
+        for after in [
+            "background_output",
+            "tool_cancelled",
+            "tools_cancelled",
+            "active_tasks_update",
+            "pending_queue",
+            "secret_request_resolved",
+            "conversation_relayed",
+            "retrying",
+            "compact_boundary",
+        ] {
+            let tail = [
+                ev(1, "user_message", "{}"),
+                ev(2, "result", "{}"),
+                ev(3, after, "{}"),
+            ];
+            assert_eq!(judge(&tail), Verdict::Settled, "{after}");
+        }
+        // A turn that a background output started is judged on its own events.
+        let started = [
+            ev(1, "result", "{}"),
+            ev(2, "background_output", "{}"),
+            ev(3, "assistant_text", "{}"),
+        ];
+        assert!(matches!(judge(&started), Verdict::Resume { .. }));
+    }
+
+    #[test]
+    fn a_failed_attempt_of_the_recovery_is_not_counted_as_a_restart() {
+        // Review of #711, finding 2: an attempt that adopted the session and failed left
+        // its marker, then `session_closed`; the attempt tried again is the one resume.
+        let resume = resume_message(None, "");
+        let marker = serde_json::json!({ "type": "user_message", "content": resume }).to_string();
+        let retried = [
+            ev(1, "user_message", r#"{"content":"go"}"#),
+            ev(2, "user_message", &marker),
+            ev(3, "session_closed", "{}"),
+            ev(4, "user_message", &marker),
+            ev(5, "assistant_text", "{}"),
+        ];
+        assert_eq!(count_resumes(&retried), 1);
+        assert!(matches!(judge(&retried), Verdict::Resume { .. }));
+        // Two real resumes still close.
+        let twice = [
+            ev(1, "user_message", r#"{"content":"go"}"#),
+            ev(2, "user_message", &marker),
+            ev(3, "session_closed", "{}"),
+            ev(4, "user_message", &marker),
+            ev(5, "assistant_text", "{}"),
+            ev(6, "user_message", &marker),
+            ev(7, "assistant_text", "{}"),
+        ];
+        assert_eq!(count_resumes(&twice), 2);
+        assert!(matches!(judge(&twice), Verdict::Close(_)));
     }
 
     #[test]

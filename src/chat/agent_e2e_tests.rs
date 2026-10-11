@@ -10263,3 +10263,212 @@ mod native_subagents {
         assert!(r.none_alive().await);
     }
 }
+
+/// What a session of the Claude CLI leaves on its thread, read back by the restart
+/// recovery of the next boot (review of #711, findings 1 and 4): a turn that ENDED must
+/// not look cut, or the recovery closes an idle session with a false "the server
+/// restarted".
+mod legacy_turn_end_at_boot {
+    use super::*;
+
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    fn text(t: &str, id: &str) -> Value {
+        emit(json!({"type": "assistant", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": "fake-claude", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": t}]}}))
+    }
+
+    fn result(subtype: &str, t: &str, is_error: bool) -> Value {
+        emit(json!({"type": "result", "subtype": subtype,
+            "duration_ms": 1, "duration_api_ms": 1, "is_error": is_error, "num_turns": 1,
+            "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": t}))
+    }
+
+    fn init() -> Value {
+        emit(json!({"type": "system", "subtype": "init",
+            "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+            "permissionMode": "default", "apiKeySource": "none"}))
+    }
+
+    struct Cli {
+        _dir: tempfile::TempDir,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+        sid: String,
+    }
+
+    /// A legacy session on the fake CLI playing `transcript`, opened with "FIRST-MESSAGE".
+    async fn open(transcript: Vec<Value>) -> Cli {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        let lines: String = transcript.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.path().join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.path().join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+        manager
+            .update_claude_cli_path(Some(wrapper.display().to_string()))
+            .await;
+        let mut req = request(None, None, "default");
+        req.message = "FIRST-MESSAGE".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        Cli {
+            _dir: dir,
+            graph,
+            manager,
+            sid,
+        }
+    }
+
+    impl Cli {
+        fn id(&self) -> Uuid {
+            Uuid::parse_str(&self.sid).unwrap()
+        }
+
+        async fn events(&self) -> Vec<crate::neo4j::models::ChatEventRecord> {
+            self.graph.get_chat_events(self.id(), 0, 500).await.unwrap()
+        }
+
+        /// Waits until a stored event satisfies `pred` (at most 15 s).
+        async fn stored(
+            &self,
+            pred: impl Fn(&crate::neo4j::models::ChatEventRecord) -> bool,
+        ) -> bool {
+            for _ in 0..600 {
+                if self.events().await.iter().any(&pred) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        }
+
+        async fn idle(&self) {
+            for _ in 0..600 {
+                if !self.manager.is_session_streaming(&self.sid).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the turn never ended");
+        }
+
+        /// The boot after a restart, over the same graph: what its scan closes.
+        async fn closed_at_next_boot(&self) -> usize {
+            let dyn_graph: Arc<dyn GraphStore> = self.graph.clone();
+            let next = ChatManager::new_without_memory(
+                dyn_graph,
+                mock_app_state().meili,
+                Default::default(),
+            );
+            next.scan_interrupted_turns().await.unwrap().1.closed
+        }
+    }
+
+    /// Finding 1: a background command that prints after the turn's `result` stores a
+    /// `background_output` on the idle session; the turn stays ended for the next boot.
+    #[tokio::test]
+    async fn output_of_a_background_command_after_the_turn_closes_nothing_at_boot() {
+        let cli = open(vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            init(),
+            text("started it in the background", "msg_1"),
+            result("success", "started it in the background", false),
+            json!({"op": "sleep", "ms": 600}),
+            text("BACKGROUND-LINE", "msg_bg"),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ])
+        .await;
+        assert!(
+            cli.stored(
+                |e| e.event_type == "background_output" && e.data.contains("BACKGROUND-LINE")
+            )
+            .await,
+            "the output after the turn is stored: {:?}",
+            cli.events().await
+        );
+        assert_eq!(cli.closed_at_next_boot().await, 0);
+        assert!(!cli.events().await.iter().any(|e| e.event_type == "error"));
+        cli.manager.close_session(&cli.sid).await.unwrap();
+    }
+
+    /// Finding 4: a turn stopped by a person ends on the thread with a `result`
+    /// (`stop_reason: interrupted`), whether the CLI answers the interrupt or not.
+    async fn a_stopped_turn_is_stored_with_its_end(cli_answers: bool) {
+        let mut transcript = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            init(),
+            text("working on it", "msg_1"),
+            json!({"op": "await_stdin", "contains": "\"interrupt\"", "timeout_ms": 15000, "optional": true}),
+        ];
+        if cli_answers {
+            transcript.push(result("error_during_execution", "", true));
+        }
+        transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+        let cli = open(transcript).await;
+        for _ in 0..400 {
+            if cli.manager.is_session_streaming(&cli.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cli.manager.interrupt(&cli.sid).await.unwrap();
+        cli.idle().await;
+        assert!(
+            cli.stored(|e| e.event_type == "result" && e.data.contains("\"interrupted\""))
+                .await,
+            "the stopped turn ends on the thread: {:?}",
+            cli.events()
+                .await
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cli.closed_at_next_boot().await, 0);
+        cli.manager.close_session(&cli.sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_the_cli_answers_is_stored_with_its_end() {
+        a_stopped_turn_is_stored_with_its_end(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_the_cli_never_answers_is_stored_with_its_end() {
+        a_stopped_turn_is_stored_with_its_end(false).await;
+    }
+}

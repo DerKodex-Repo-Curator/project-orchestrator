@@ -2461,6 +2461,60 @@ pub(crate) fn po_server_unauthorised(
         )
 }
 
+/// The `result` that ends a turn of the Claude CLI stopped by a person: the CLI's own
+/// `result` of that turn when it was read in time, else one made here; either way with
+/// `stop_reason: interrupted`, the neutral reason the agent engine gives.
+pub(crate) fn interrupted_turn_end(read: Option<Message>) -> ChatEvent {
+    let from_cli = read
+        .as_ref()
+        .map(ChatManager::message_to_events)
+        .and_then(|events| {
+            events
+                .into_iter()
+                .find(|e| matches!(e, ChatEvent::Result { .. }))
+        });
+    match from_cli {
+        Some(ChatEvent::Result {
+            session_id,
+            duration_ms,
+            cost_usd,
+            subtype,
+            is_error,
+            num_turns,
+            result_text,
+            cost,
+            usage,
+            model,
+            ..
+        }) => ChatEvent::Result {
+            session_id,
+            duration_ms,
+            cost_usd,
+            subtype,
+            is_error,
+            num_turns,
+            result_text,
+            cost,
+            usage,
+            model,
+            stop_reason: Some("interrupted".to_string()),
+        },
+        _ => ChatEvent::Result {
+            session_id: String::new(),
+            duration_ms: 0,
+            cost_usd: None,
+            subtype: "interrupted".to_string(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: Some("interrupted".to_string()),
+        },
+    }
+}
+
 /// Opens (or resumes) a session with `spec` through `open`. A provider that learned,
 /// between the reading of its capabilities and this opening, that it takes no MCP
 /// server per session (two first sessions opened at once on an ACP agent that refuses
@@ -8152,22 +8206,41 @@ impl ChatManager {
                         let drained = tokio::time::timeout(INTERRUPTED_TURN_RESULT_GRACE, async {
                             while let Some(item) = stream.next().await {
                                 match item {
-                                    Ok(Message::Result { .. }) => {
+                                    Ok(msg @ Message::Result { .. }) => {
                                         result_cursor.turn_read_result();
-                                        return true;
+                                        return Some(msg);
                                     }
                                     Ok(_) => continue,
-                                    Err(_) => return false,
+                                    Err(_) => return None,
                                 }
                             }
-                            false
+                            None
                         })
-                        .await;
+                        .await
+                        .ok()
+                        .flatten();
                         debug!(
                             session_id = %session_id,
-                            result_read = matches!(drained, Ok(true)),
+                            result_read = drained.is_some(),
                             "interrupted turn: waited for the CLI's result"
                         );
+                        // The stopped turn ends on the thread: stored without an end, it
+                        // would look cut by a restart at the next boot, and the restart
+                        // recovery would close it with a false "the server restarted"
+                        // (review of #711, finding 4). Stored only (the agent engine ends an
+                        // interrupted turn with such a `result` too); the live clients
+                        // already see the turn stop (`streaming_status`).
+                        if let Some(uuid) = session_uuid {
+                            let ended = interrupted_turn_end(drained);
+                            events_to_persist.push(ChatEventRecord {
+                                id: Uuid::new_v4(),
+                                session_id: uuid,
+                                seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                                event_type: ended.event_type().to_string(),
+                                data: serde_json::to_string(&ended).unwrap_or_default(),
+                                created_at: chrono::Utc::now(),
+                            });
+                        }
                     }
                 } // end if let Some(s) = stream_ok
             } // client lock released here
@@ -19274,6 +19347,108 @@ mod tests {
         assert_eq!((pending.len(), scan.closed), (0, 1));
         assert!(fake.state.turns_started.lock().unwrap().is_empty());
         assert_closed_by_recovery(&events_of(&graph, sid).await);
+    }
+
+    /// Review of #711, finding 1: a CLI session whose background command printed after
+    /// the turn's `result` is idle, not cut: nothing is closed at boot.
+    #[tokio::test]
+    async fn a_cli_session_with_output_after_its_turn_is_not_closed_at_boot() {
+        let (manager, graph, _fake, sid) = restarted_with_tail(&[
+            ("user_message", "{}"),
+            ("assistant_text", "{}"),
+            ("result", "{}"),
+            (
+                "background_output",
+                r#"{"source":"assistant","content":"line"}"#,
+            ),
+        ])
+        .await;
+        let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        node.capabilities = None;
+        graph.create_chat_session(&node).await.unwrap();
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 0));
+        assert!(!events_of(&graph, sid)
+            .await
+            .iter()
+            .any(|e| e.event_type == "error"));
+    }
+
+    /// Review of #711, finding 1 (age): a cut turn older than the horizon is left as it
+    /// is, never closed (rather left "streaming" than falsely closed).
+    #[tokio::test]
+    async fn a_cut_turn_older_than_the_horizon_is_left_as_it_is() {
+        let (manager, graph, _fake, sid) = restarted_with(
+            &[("user_message", "{}"), ("tool_use", "{}")],
+            recovery::CLOSE_HORIZON + chrono::Duration::days(1),
+            |_| {},
+        )
+        .await;
+        let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        node.capabilities = None;
+        graph.create_chat_session(&node).await.unwrap();
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 0));
+    }
+
+    /// Review of #711, finding 2: an attempt that failed AFTER it adopted the session (its
+    /// marker stored) and was tried again does not count as a restart: the next boot
+    /// still resumes the session once more instead of closing it as "restarted again".
+    #[tokio::test]
+    async fn a_retry_after_adoption_does_not_count_as_a_restart() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        *fake.state.fail_next_turn.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::Overloaded);
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!((report.resumed, report.retried), (1, 1));
+        let events = events_of(&graph, sid).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.data.contains(recovery::RESUME_MARKER))
+                .count(),
+            2,
+            "the failed attempt left its marker: {events:?}"
+        );
+        // The server restarts again while the resumed turn runs.
+        assert!(
+            matches!(recovery::judge(&events), recovery::Verdict::Resume { .. }),
+            "{:?}",
+            recovery::judge(&events)
+        );
+        manager.close_session(&sid.to_string()).await.unwrap();
+    }
+
+    /// Review of #711, finding 3: `credentials_locked` while the vault is OPEN (a vault
+    /// error that is not a lock) is counted like a transient error and closes the turn,
+    /// instead of reopening the session every `poll` until the deadline.
+    #[tokio::test]
+    async fn credentials_locked_with_the_vault_open_is_counted_then_closed() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let vault = crate::vault::VaultService::ephemeral();
+        vault
+            .init("a long passphrase".into(), chrono::Duration::seconds(600))
+            .await
+            .unwrap();
+        let manager = manager.with_vault(vault);
+        *fake.fail_every_open.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::CredentialsLocked);
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            (report.failed, report.retried, report.abandoned),
+            (1, recovery::MAX_TRANSIENT_RETRIES as usize, 0)
+        );
+        let events = events_of(&graph, sid).await;
+        assert_eq!(events.iter().filter(|e| e.event_type == "error").count(), 1);
+        assert_closed_by_recovery(&events);
     }
 
     /// A session live on this server (a run relaunched while the boot scans) is not a turn

@@ -2175,6 +2175,8 @@ pub(crate) mod fake {
     pub struct FakeProvider {
         pub state: Arc<FakeState>,
         pub fail_open: Arc<StdMutex<Option<ProviderError>>>,
+        /// Every `open` fails with this error, as long as it is set (`fail_open` fails one).
+        pub fail_every_open: Arc<StdMutex<Option<ProviderError>>>,
         /// Capabilities the sessions of this provider declare.
         pub caps: Arc<StdMutex<Capabilities>>,
         /// The kind it says it is (Claude Code unless a test plays another).
@@ -2191,6 +2193,7 @@ pub(crate) mod fake {
             Self {
                 state: Arc::new(FakeState::default()),
                 fail_open: Arc::new(StdMutex::new(None)),
+                fail_every_open: Arc::new(StdMutex::new(None)),
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
                 kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
                 health: Arc::new(StdMutex::new(None)),
@@ -2237,6 +2240,9 @@ pub(crate) mod fake {
             let delay = *self.open_delay.lock().unwrap();
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
+            }
+            if let Some(e) = self.fail_every_open.lock().unwrap().clone() {
+                return Err(e);
             }
             if let Some(e) = self.fail_open.lock().unwrap().take() {
                 return Err(e);
