@@ -8297,6 +8297,20 @@ impl ChatManager {
                         session_id = %session_id,
                         "Retry cancelled by interrupt during backoff"
                     );
+                    // The stopped turn ends on the thread, as a Stop during the stream
+                    // (`interrupted_turn_end`): ended by `retrying` alone, it would look cut
+                    // at the next boot (follow-up review of #711, finding 3).
+                    if let Some(uuid) = session_uuid {
+                        let ended = interrupted_turn_end(None);
+                        events_to_persist.push(ChatEventRecord {
+                            id: Uuid::new_v4(),
+                            session_id: uuid,
+                            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                            event_type: ended.event_type().to_string(),
+                            data: serde_json::to_string(&ended).unwrap_or_default(),
+                            created_at: chrono::Utc::now(),
+                        });
+                    }
                     break 'retry_loop;
                 }
 

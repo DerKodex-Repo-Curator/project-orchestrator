@@ -10303,6 +10303,14 @@ mod legacy_turn_end_at_boot {
 
     /// A legacy session on the fake CLI playing `transcript`, opened with "FIRST-MESSAGE".
     async fn open(transcript: Vec<Value>) -> Cli {
+        open_with(transcript, |_| {}).await
+    }
+
+    /// [`open`], the chat configured by `tweak`.
+    async fn open_with(
+        transcript: Vec<Value>,
+        tweak: impl FnOnce(&mut super::super::config::ChatConfig),
+    ) -> Cli {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("transcript.jsonl");
@@ -10323,7 +10331,7 @@ mod legacy_turn_end_at_boot {
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let dyn_graph: Arc<dyn GraphStore> = graph.clone();
-        let config = super::super::config::ChatConfig {
+        let mut config = super::super::config::ChatConfig {
             provider_path: ProviderPath::Legacy,
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: None,
@@ -10332,6 +10340,7 @@ mod legacy_turn_end_at_boot {
             max_sessions: 10,
             ..Default::default()
         };
+        tweak(&mut config);
         let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
         manager
             .update_claude_cli_path(Some(wrapper.display().to_string()))
@@ -10470,5 +10479,45 @@ mod legacy_turn_end_at_boot {
     #[tokio::test]
     async fn a_stopped_turn_the_cli_never_answers_is_stored_with_its_end() {
         a_stopped_turn_is_stored_with_its_end(false).await;
+    }
+
+    /// Follow-up review of #711, finding 3: a turn stopped during the pause before a retry
+    /// (a retryable API error, no output yet) ends on the thread too: it used to end with
+    /// `retrying` alone, a cut turn for the next boot.
+    #[tokio::test]
+    async fn a_turn_stopped_during_the_pause_before_a_retry_is_stored_with_its_end() {
+        let cli = open_with(
+            vec![
+                json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+                init(),
+                result(
+                    "error_during_execution",
+                    r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                    true,
+                ),
+                json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+            ],
+            |config| config.retry.initial_delay_ms = 30_000,
+        )
+        .await;
+        assert!(
+            cli.stored(|e| e.event_type == "retrying").await,
+            "the turn waits to retry: {:?}",
+            cli.events().await
+        );
+        cli.manager.interrupt(&cli.sid).await.unwrap();
+        cli.idle().await;
+        assert!(
+            cli.stored(|e| e.event_type == "result" && e.data.contains("\"interrupted\""))
+                .await,
+            "the stopped turn ends on the thread: {:?}",
+            cli.events()
+                .await
+                .iter()
+                .map(|e| e.event_type.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cli.closed_at_next_boot().await, 0);
+        cli.manager.close_session(&cli.sid).await.unwrap();
     }
 }
