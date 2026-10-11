@@ -41,6 +41,9 @@ use uuid::Uuid;
 
 use crate::expand_tilde;
 
+mod recovery;
+pub use recovery::{RecoveryReport, ScanReport};
+
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
 
@@ -1249,6 +1252,9 @@ pub(crate) struct ManagerTurnServices {
     step_budget: Duration,
     /// A step made to never answer (tests only, `None` in production).
     stall_step: Option<&'static str>,
+    /// Where routing decisions are stored (`CognitiveRouting::store`): a change of model a
+    /// turn could not make is written back on its decision. `None`: nowhere.
+    routing_store: Option<Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
 }
 
 /// What a session of the agent engine keeps for the end of its turns: the fields of
@@ -1642,6 +1648,23 @@ impl HeldContext {
 /// Largest share of the model's window the held context may take.
 pub(crate) const HELD_CONTEXT_WINDOW_SHARE: f64 = 0.05;
 
+/// The decision of a model change that could not be made says so: not applied, and why
+/// (`not_changed: <code>`). Nothing to write without a store.
+async fn record_not_changed(
+    store: Option<&Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
+    mut decision: super::provider::cognitive::decision::CognitiveDecision,
+    code: &str,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    decision.applied = false;
+    decision.reason = format!("{}; not_changed: {code}", decision.reason);
+    if let Err(error) = store.put_decision(&decision).await {
+        warn!(decision_id = %decision.id, %error, "the refused change was not recorded on its decision");
+    }
+}
+
 impl ManagerTurnServices {
     /// One end-of-turn step under its own budget ([`run_step`]); `stall_step` makes
     /// the named one never answer (tests only: proves the budgets are per step).
@@ -1753,9 +1776,25 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // instance), right before it is sent — what the user typed, not the
         // `<po-refs>`/`<po-attachments>` blocks around it.
         if let Some(router) = self.turn_routing.get(session_id) {
-            router.set_last_message(&crate::refs::turn::visible_text(shown));
+            router.set_turn_input(shown);
         }
         prepared
+    }
+
+    async fn model_for_images(&self, session_id: &str) -> Option<String> {
+        let router = self.turn_routing.get(session_id)?;
+        super::agent_hooks::model_for_images(&router).await
+    }
+
+    async fn image_model_not_applied(&self, session_id: &str, _model: &str) {
+        let Some(router) = self.turn_routing.get(session_id) else {
+            return;
+        };
+        // The decision said the image model was applied; it was not (as the legacy
+        // `set_model` that fails, `apply_turn_directive`).
+        if let Some(decision) = router.forget_image_change() {
+            record_not_changed(self.routing_store.as_ref(), decision, "set_model_failed").await;
+        }
     }
 
     async fn continuation(&self, session_id: &str) -> String {
@@ -2887,6 +2926,12 @@ impl ChatManager {
                 provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
+                // Auto, or two models ticked or more: the user's choice for THIS
+                // conversation, decided at the `auto` stage (decision R-S1).
+                conversation_routes: super::provider::cognitive::conversation_routes(
+                    turn.routing_mode,
+                    turn.routing_pool.as_ref().map_or(0, Vec::len),
+                ),
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
                 moved_in: turn.moved_in,
@@ -2903,10 +2948,11 @@ impl ChatManager {
         let Some(router) = self.turn_routing.get(session_id) else {
             return;
         };
-        // The routing reads what the user typed, not the blocks around it.
+        // The routing reads what the user typed, not the blocks around it, and whether an
+        // image goes with it.
+        router.set_turn_input(message);
         let typed = crate::refs::turn::visible_text(message);
         let message = typed.as_str();
-        router.set_last_message(message);
         let ctx = router.next_turn_context(message.chars().count());
         let before = ctx.current_model.clone();
         let directive = super::agent_hooks::directive_for_turn(&router, &ctx).await;
@@ -2917,8 +2963,32 @@ impl ChatManager {
             {
                 warn!(session_id, error = %error, "turn routing could not change the model");
                 router.forget_change(&before);
+                // The stored decision says the change did not go out (as a refused move).
+                if let Some(decision) = router.decision_of_turn(ctx.turn_index) {
+                    self.record_refused_change(decision, "set_model_failed")
+                        .await;
+                }
             }
         }
+    }
+
+    /// What the conversation can really do for its next turn, given its routing (F-R4,
+    /// decision 11cefdb2): `snapshot_images` is what the capabilities snapshot of its
+    /// opening model says (`None`: no snapshot stored). The live router answers
+    /// (`agent_hooks::effective_images`); without one (the session is not open here, or no
+    /// cognitive router is configured) the snapshot stands, said so (`no_router`). `None`:
+    /// nothing to say (no snapshot, no router).
+    pub(crate) async fn effective_capabilities(
+        &self,
+        session_id: &str,
+        snapshot_images: Option<bool>,
+    ) -> Option<super::types::EffectiveCapabilities> {
+        use super::types::{EffectiveCapabilities, EffectiveCapability, EffectiveCause};
+        let images = match self.turn_routing.get(session_id) {
+            Some(router) => super::agent_hooks::effective_images(&router, snapshot_images).await?,
+            None => EffectiveCapability::snapshot(snapshot_images?, EffectiveCause::NoRouter),
+        };
+        Some(EffectiveCapabilities { images })
     }
 
     /// Mode `full`, before a turn starts, on both engines: when the router's decision names
@@ -2943,8 +3013,9 @@ impl ChatManager {
         if streaming {
             return false;
         }
-        // The routing reads what the user typed, not the blocks around it.
-        router.set_last_message(&crate::refs::turn::visible_text(message));
+        // The routing reads what the user typed, not the blocks around it, and whether an
+        // image goes with it.
+        router.set_turn_input(message);
         let super::agent_hooks::ProviderPlan::Move { pick, decision } =
             super::agent_hooks::plan_provider_move(&router).await
         else {
@@ -3013,6 +3084,19 @@ impl ChatManager {
         if let Err(error) = store.put_decision(&decision).await {
             warn!(decision_id = %decision.id, %error, "the refused move was not recorded on its decision");
         }
+    }
+
+    /// The decision of a model change that could not be sent says so: not applied, and why.
+    async fn record_refused_change(
+        &self,
+        decision: super::provider::cognitive::decision::CognitiveDecision,
+        code: &str,
+    ) {
+        let store = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.store.clone());
+        record_not_changed(store.as_ref(), decision, code).await;
     }
 
     /// Emit the light `attention_changed` signal for a session (no-op without
@@ -4532,13 +4616,17 @@ impl ChatManager {
                 }
             }
         }
-        // The agent engine's sessions are live too (their permissions and background
-        // tasks are not tracked here: P11 / P4).
+        // The agent engine's sessions are live too, with the background tasks their
+        // provider reports running (P4); their permissions are not tracked here (P11).
         for handle in self.agent_runtime.handles().await {
             if let Ok(id) = handle.session_id.parse::<Uuid>() {
                 snap.live.insert(id);
                 if handle.is_streaming.load(Ordering::SeqCst) {
                     snap.streaming.insert(id);
+                }
+                let counts = count_background_tasks(&handle.active_background_tasks().await);
+                if counts != (0, 0) {
+                    snap.background_tasks.insert(id, counts);
                 }
             }
         }
@@ -5314,6 +5402,20 @@ impl ChatManager {
         // The menu's ticks, read once: one model ticked is strict, an empty pool is none.
         let settled = request.settled_routing();
         let request = settled.as_ref().unwrap_or(request);
+        // A delegation (an agent caller, a spawned session) follows the settings' stage: it
+        // cannot hand its own routing to PO (decision R-S1). Its Auto or pool is dropped, not
+        // refused: the delegation still opens, routed as a session that asked nothing.
+        let delegated = (request.spawned_by.is_some()
+            && (request.routing_mode.is_some() || request.routing_pool.is_some()))
+        .then(|| {
+            warn!("a delegated session cannot choose its routing: routing_mode and routing_pool dropped");
+            ChatRequest {
+                routing_mode: None,
+                routing_pool: None,
+                ..request.clone()
+            }
+        });
+        let request = delegated.as_ref().unwrap_or(request);
         let session_id = Uuid::new_v4();
         if !request.cwd.trim().is_empty() {
             return self
@@ -12404,6 +12506,15 @@ impl ChatManager {
             || request.run_provider.is_some();
         // The conversation's own mode replaces the settings' (the chat menu: Auto = full).
         let mut settings = settings;
+        // Auto, or two models ticked or more: the user's choice for THIS conversation is
+        // decided at the `auto` stage, whatever the settings' stage (decision R-S1).
+        settings.stage = super::provider::cognitive::conversation_stage(
+            settings.stage,
+            super::provider::cognitive::conversation_routes(
+                request.routing_mode,
+                Self::routing_pool_of(request).map_or(0, <[_]>::len),
+            ),
+        );
         if let Some(mode) = request.routing_mode {
             settings.mode = mode;
         }
@@ -13100,6 +13211,10 @@ impl ChatManager {
             context_injector: self.context_injector.clone(),
             step_budget: super::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: self
+                .cognitive_routing
+                .as_ref()
+                .and_then(|routing| routing.store.clone()),
         })
     }
 
@@ -13817,24 +13932,7 @@ impl ChatManager {
                         );
                     }
                 }
-                // The agent engine's sessions, by the same rule: a running turn or a
-                // background task its provider still reports running (P4) keeps it.
-                for handle in manager.agent_runtime.handles().await {
-                    let idle = handle.idle_for();
-                    let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
-                    let background_tasks = handle.active_background_tasks().await.len();
-                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
-                        expired.push(handle.session_id.clone());
-                    } else if idle > timeout {
-                        debug!(
-                            session_id = %handle.session_id,
-                            idle_secs = idle.as_secs(),
-                            is_streaming,
-                            background_tasks,
-                            "Idle agent session kept alive: work still in progress"
-                        );
-                    }
-                }
+                expired.extend(manager.expired_agent_sessions(timeout).await);
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -13844,6 +13942,30 @@ impl ChatManager {
                 }
             }
         });
+    }
+
+    /// The agent engine's sessions the idle cleanup closes, by the rule of the
+    /// Claude Code engine ([`session_is_expired`]): a running turn or a background
+    /// task its provider still reports running (P4) keeps an idle session.
+    async fn expired_agent_sessions(&self, timeout: Duration) -> Vec<String> {
+        let mut expired = Vec::new();
+        for handle in self.agent_runtime.handles().await {
+            let idle = handle.idle_for();
+            let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
+            let background_tasks = handle.active_background_tasks().await.len();
+            if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+                expired.push(handle.session_id.clone());
+            } else if idle > timeout {
+                debug!(
+                    session_id = %handle.session_id,
+                    idle_secs = idle.as_secs(),
+                    is_streaming,
+                    background_tasks,
+                    "Idle agent session kept alive: work still in progress"
+                );
+            }
+        }
+        expired
     }
 
     /// Get the number of currently active sessions, on both engines.
@@ -17902,6 +18024,175 @@ mod tests {
         manager.close_session(&ok).await.unwrap();
     }
 
+    /// A session of the agent engine opened by a first manager, whose last events are `tail`
+    /// (type, data), and a SECOND manager over the same graph: the server after a restart.
+    async fn restarted_with_tail(
+        tail: &[(&str, &str)],
+    ) -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+        Uuid,
+    ) {
+        let (before, graph, _fake) = agent_manager();
+        let created = before
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        let sid = Uuid::parse_str(&created.session_id).unwrap();
+        before.close_session(&created.session_id).await.unwrap();
+        graph.delete_chat_events(sid).await.unwrap();
+        for (i, (event_type, data)) in tail.iter().enumerate() {
+            graph
+                .store_chat_events(
+                    sid,
+                    vec![ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: sid,
+                        seq: i as i64 + 1,
+                        event_type: event_type.to_string(),
+                        data: data.to_string(),
+                        created_at: chrono::Utc::now(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let after = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        (after, graph, fake, sid)
+    }
+
+    #[tokio::test]
+    async fn a_turn_cut_by_a_restart_is_resumed_and_the_model_is_told() {
+        let (manager, _graph, fake, _sid) = restarted_with_tail(&[
+            ("user_message", r#"{"type":"user_message","content":"go"}"#),
+            (
+                "assistant_text",
+                r#"{"type":"assistant_text","content":"I start"}"#,
+            ),
+        ])
+        .await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.scanned, scan.closed, pending.len()), (1, 0, 1));
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!(report.resumed, 1);
+        let turns = fake.state.turns_started.lock().unwrap().clone();
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].starts_with(recovery::RESUME_MARKER),
+            "{}",
+            turns[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_is_not_resumed_at_boot() {
+        let (manager, _graph, fake, _sid) = restarted_with_tail(&[
+            ("user_message", "{}"),
+            ("assistant_text", "{}"),
+            ("result", "{}"),
+        ])
+        .await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.scanned, scan.closed, pending.len()), (1, 0, 0));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_waiting_for_an_answer_is_closed_once_and_not_judged_again() {
+        let (manager, graph, _fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("permission_request", "{}")]).await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.closed, pending.len()), (1, 0));
+        let events = graph.get_chat_events(sid, 0, 50).await.unwrap();
+        assert_eq!(events.last().unwrap().event_type, "error");
+        // The next boot finds it settled.
+        let (_, again) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(again.closed, 0, "closed once");
+    }
+
+    #[tokio::test]
+    async fn a_session_the_user_wrote_to_meanwhile_is_not_resumed_twice() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        graph
+            .store_chat_events(
+                sid,
+                vec![ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: sid,
+                    seq: 3,
+                    event_type: "user_message".into(),
+                    data: "{}".into(),
+                    created_at: chrono::Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(1))
+            .await;
+        assert_eq!((report.resumed, report.skipped), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_recovery_waits_while_the_vault_is_locked_then_resumes() {
+        let (manager, _graph, fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let vault = crate::vault::VaultService::ephemeral();
+        let manager = manager.with_vault(vault.clone());
+        assert!(
+            !vault.is_unlocked(chrono::Utc::now()),
+            "a fresh vault is locked"
+        );
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let manager = Arc::new(manager);
+        let driving = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .drive_recovery(pending, Duration::from_millis(20), Duration::from_secs(10))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            fake.state.turns_started.lock().unwrap().is_empty(),
+            "nothing resumes while the vault is locked"
+        );
+        vault
+            .init("a long passphrase".into(), chrono::Duration::seconds(600))
+            .await
+            .unwrap();
+        let report = driving.await.unwrap();
+        assert_eq!(report.resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_that_waits_for_ever_gives_up_and_says_so() {
+        let (manager, _graph, _fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let manager = manager.with_vault(crate::vault::VaultService::ephemeral());
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(
+                pending,
+                Duration::from_millis(10),
+                Duration::from_millis(60),
+            )
+            .await;
+        assert_eq!((report.resumed, report.abandoned), (0, 1));
+    }
+
     /// A third-party instance (`acp`) a project consented to, played by the fake.
     async fn consented_acp_instance(
         graph: &crate::neo4j::mock::MockGraphStore,
@@ -21178,6 +21469,112 @@ mod tests {
         let untouched = graph.get_chat_session(live.id).await.unwrap().unwrap();
         assert_eq!(untouched.message_count, 1, "a live session is its handle's");
         assert_eq!(untouched.total_cost_usd, None);
+    }
+
+    fn native_bg_task(
+        id: &str,
+        kind: nexus_claude::agent::BackgroundTaskKind,
+        status: nexus_claude::agent::BackgroundTaskStatus,
+    ) -> nexus_claude::agent::BackgroundTask {
+        nexus_claude::agent::BackgroundTask {
+            id: id.into(),
+            kind,
+            description: "cargo build".into(),
+            status,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: Some(format!("tool-{id}")),
+            parent: None,
+            pid: None,
+        }
+    }
+
+    /// Adopts a native agent session on a fake provider, idle for `idle`.
+    async fn idle_agent_session(
+        manager: &ChatManager,
+        idle: Duration,
+    ) -> Arc<crate::chat::agent_runtime::AgentSessionHandle> {
+        let provider = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let handle = manager
+            .agent_runtime
+            .adopt(
+                &Uuid::new_v4().to_string(),
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        handle.backdate_activity(idle);
+        handle
+    }
+
+    /// The idle cleanup keeps an agent session whose provider still reports a
+    /// background task running (P4), as it keeps a Claude Code session with one;
+    /// the same idle session with no task left (or only ended ones) is closed,
+    /// and past the hard cap even a busy one is.
+    #[tokio::test]
+    async fn the_idle_cleanup_keeps_an_agent_session_with_a_background_task_running() {
+        use nexus_claude::agent::{BackgroundTaskKind as Kind, BackgroundTaskStatus as Status};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let timeout = Duration::from_secs(60);
+
+        let busy = idle_agent_session(&manager, timeout * 2).await;
+        busy.set_background_tasks(vec![native_bg_task("nt-1", Kind::Shell, Status::Running)])
+            .await;
+        let done = idle_agent_session(&manager, timeout * 2).await;
+        done.set_background_tasks(vec![native_bg_task("nt-2", Kind::Shell, Status::Killed)])
+            .await;
+        let quiet = idle_agent_session(&manager, timeout * 2).await;
+        let fresh = idle_agent_session(&manager, Duration::ZERO).await;
+
+        let mut expired = manager.expired_agent_sessions(timeout).await;
+        expired.sort();
+        let mut want = vec![done.session_id.clone(), quiet.session_id.clone()];
+        want.sort();
+        assert_eq!(expired, want, "busy and fresh sessions are kept");
+        assert!(!expired.contains(&fresh.session_id));
+
+        busy.backdate_activity(timeout * (IDLE_HARD_CAP_FACTOR + 1));
+        assert!(
+            manager
+                .expired_agent_sessions(timeout)
+                .await
+                .contains(&busy.session_id),
+            "past the hard cap, a background task no longer keeps the session"
+        );
+    }
+
+    /// The cockpit's snapshot counts the background tasks an agent session's
+    /// provider reports running, by kind, as it does for a Claude Code session.
+    #[tokio::test]
+    async fn the_live_snapshot_lists_the_background_tasks_of_an_agent_session() {
+        use nexus_claude::agent::{BackgroundTaskKind as Kind, BackgroundTaskStatus as Status};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let busy = idle_agent_session(&manager, Duration::ZERO).await;
+        busy.set_background_tasks(vec![
+            native_bg_task("nt-1", Kind::Shell, Status::Running),
+            native_bg_task("nt-2", Kind::Monitor, Status::Running),
+            native_bg_task("nt-3", Kind::Shell, Status::Running),
+            native_bg_task("nt-4", Kind::Shell, Status::Killed),
+        ])
+        .await;
+        let quiet = idle_agent_session(&manager, Duration::ZERO).await;
+
+        let snap = manager.live_session_snapshot().await;
+        let busy_id: Uuid = busy.session_id.parse().unwrap();
+        let quiet_id: Uuid = quiet.session_id.parse().unwrap();
+        assert!(snap.live.contains(&busy_id) && snap.live.contains(&quiet_id));
+        assert_eq!(
+            snap.background_tasks.get(&busy_id),
+            Some(&(1, 2)),
+            "one monitor, two running commands; the killed one is not counted"
+        );
+        assert_eq!(snap.background_tasks.get(&quiet_id), None);
     }
 
     // ====================================================================
@@ -26217,6 +26614,7 @@ mod refs_turn_services_tests {
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: None,
         };
 
         let note = Uuid::new_v4();
@@ -26308,6 +26706,7 @@ mod held_context_tests {
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: None,
         }
     }
 
@@ -26743,5 +27142,167 @@ mod held_context_tests {
             "the objective step still ran after the stuck one"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+/// F-R4: the host's own order — `prepare` hands the router the turn's input (its images
+/// included), so `model_for_images`, asked right after, routes an image turn to a model that
+/// reads it. Played with the REAL services and the real decision.
+#[cfg(test)]
+mod image_turn_services_tests {
+    use super::*;
+    use crate::chat::agent_hooks::{PoolSource, TurnRouter, TurnRouterSpec, TurnRouting};
+    use crate::chat::agent_runtime::TurnServices;
+    use crate::chat::message_attachments::{self, MessageAttachment};
+    use crate::chat::provider::cognitive::candidates::ModelFacts;
+    use crate::chat::provider::cognitive::decider::decide_with;
+    use crate::chat::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider};
+    use crate::chat::provider::cognitive::scorer::PriorHints;
+    use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+
+    struct Real;
+
+    #[async_trait::async_trait]
+    impl Decider for Real {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            Ok(decide_with(
+                Uuid::new_v4(),
+                chrono::Utc::now(),
+                request,
+                &[],
+                &PriorHints::new(),
+            ))
+        }
+    }
+
+    struct Pool;
+
+    #[async_trait::async_trait]
+    impl PoolSource for Pool {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            self.project_pool(None)
+                .await
+                .into_iter()
+                .filter(|f| f.provider_id == provider_id)
+                .collect()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            ["flash", "vision"]
+                .into_iter()
+                .map(|model| ModelFacts {
+                    provider_id: "deepseek".into(),
+                    model: model.into(),
+                    supports_tools: true,
+                    supports_images: model == "vision",
+                    context_window: Some(1_000_000),
+                    window_unknown: None,
+                    price: None,
+                    cost_basis: nexus_claude::agent::CostBasis::Unknown,
+                    healthy: Some(true),
+                    allowed_for_project: true,
+                    sandboxed: false,
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_hands_the_router_the_images_so_the_turn_is_routed_before_it_is_sent() {
+        use crate::chat::provider::cognitive::store::{
+            DecisionFilter, InMemoryRoutingStore, RoutingArmStore,
+        };
+        let store = Arc::new(InMemoryRoutingStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            ChatConfig {
+                max_sessions: 10,
+                ..Default::default()
+            },
+        );
+        let session = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id.to_string();
+        let router = Arc::new(TurnRouter::new(TurnRouterSpec {
+            decider: Arc::new(Real),
+            pool: Arc::new(Pool),
+            routing: RoutingSettings {
+                mode: ProviderRoutingMode::Full,
+                stage: LearningStage::Auto,
+                exploration_epsilon: 0.0,
+                ..RoutingSettings::default()
+            },
+            provider_id: "deepseek".into(),
+            session_id: Some(session.id),
+            project_slug: None,
+            trust: false,
+            explicit_model: false,
+            provider_imposed: false,
+            allowed_models: None,
+            routing_pool: None,
+            conversation_routes: false,
+            current_model: "flash".into(),
+            next_turn: 0,
+            moved_in: false,
+        }));
+        router.set_model_live(true);
+        let routing = Arc::new(TurnRouting::default());
+        routing.insert(&sid, Arc::clone(&router));
+        let services = ManagerTurnServices {
+            graph: graph.clone(),
+            enrichment_pipeline: manager.enrichment_pipeline.clone(),
+            turn_routing: routing,
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
+            nats: None,
+            anchor: Default::default(),
+            session: AgentTurnState::default(),
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
+            routing_store: Some(store.clone()),
+        };
+        // Before any turn input, nothing says an image comes.
+        assert_eq!(services.model_for_images(&sid).await, None);
+        let stored = message_attachments::encode(
+            "what is on this screenshot?",
+            &[MessageAttachment {
+                id: Uuid::new_v4(),
+                filename: "shot.png".into(),
+                mime_type: "image/png".into(),
+                size_bytes: 4,
+            }],
+        );
+        let turn = crate::refs::turn::expand_user_turn_if(&graph, &stored, false).await;
+        services.prepare(&sid, &stored, &stored, &turn).await;
+        assert_eq!(
+            services.model_for_images(&sid).await.as_deref(),
+            Some("vision")
+        );
+        // The host could not apply it: the router is put back as it was.
+        services.image_model_not_applied(&sid, "vision").await;
+        assert_eq!(router.next_turn_context(0).current_model, "flash");
+        // ...and the decision, which said `applied: true`, is stored as what happened: not
+        // applied, and why (as a legacy `set_model` that fails, or a refused move).
+        let stored = store.decisions(&DecisionFilter::default()).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the image decision is written back: {stored:#?}"
+        );
+        assert!(!stored[0].applied, "{:#?}", stored[0]);
+        assert_eq!(
+            stored[0].chosen.as_ref().map(|p| p.model.as_str()),
+            Some("vision")
+        );
+        assert!(
+            stored[0]
+                .reason
+                .ends_with("; not_changed: set_model_failed"),
+            "{}",
+            stored[0].reason
+        );
     }
 }
