@@ -750,6 +750,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
             ChatEvent::Result {
                 session_id: "sess-1".into(),

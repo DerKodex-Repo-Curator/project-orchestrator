@@ -8042,7 +8042,8 @@ mod legacy_oob_lag {
 /// P11a: an approval lasts `once` or for the `session`, on both engines, and the backend
 /// decides what a session grant covers (`chat::session_grants`): the identical call (any
 /// call of a read-only tool), answered by the backend in THIS session only, never handed
-/// to the provider as a rule. `always` is refused, typed, on every engine (P11b).
+/// to the provider as a rule. `always` (P11b): kept by the backend for a person and a project,
+/// never by the provider; refused, typed, elsewhere.
 mod permission_scopes {
     use super::*;
     use crate::chat::manager::PermissionDeliveryError;
@@ -8342,6 +8343,190 @@ mod permission_scopes {
         manager.close_session(&sid).await.unwrap();
     }
 
+    /// One turn, three `can_use_tool` the CLI waits on in turn: `cat README.md` twice (the
+    /// CLI suggesting, as it does, rules that would set a mode, add a directory and allow
+    /// a whole program), then `cat README.md >> ~/.zshrc`.
+    fn legacy_lasting_transcript() -> Vec<Value> {
+        let suggestions = json!([
+            {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+            {"type": "addDirectories", "directories": ["/"], "destination": "session"},
+            {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "cat:*"}],
+             "behavior": "allow", "destination": "session"}
+        ]);
+        let ask = |id: &str, command: &str| {
+            vec![
+                emit(
+                    json!({"type": "control_request", "request_id": id, "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash",
+                    "input": {"command": command}, "tool_use_id": id,
+                    "permission_suggestions": suggestions}}),
+                ),
+                json!({"op": "await_stdin", "contains": id, "timeout_ms": 15000}),
+            ]
+        };
+        let mut t = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+        ];
+        t.extend(ask("req-a1", "cat README.md"));
+        t.extend(ask("req-a2", "cat README.md"));
+        t.extend(ask("req-a3", "cat README.md >> ~/.zshrc"));
+        t.extend(vec![
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "lasting done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "lasting done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]);
+        t
+    }
+
+    /// The review of P11a, blocker 3, on the legacy engine: `always` hands NOTHING to the
+    /// CLI — no `updatedPermissions`, none of its suggestions (`setMode`, `addDirectories`,
+    /// a whole-program rule) to `localSettings` or anywhere, no `.claude/settings.local.json`
+    /// written in the project. The backend keeps the identical call and answers it.
+    #[tokio::test]
+    async fn legacy_always_hands_nothing_to_the_cli_and_covers_the_identical_call_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        let lines: String = legacy_lasting_transcript()
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&script, lines).unwrap();
+        let cli = {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    script.display(),
+                    dir.path().join("stdin.jsonl").display(),
+                    fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wrapper.display().to_string()
+        };
+        let rules = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        project_at(&graph, dir.path()).await;
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                lasting_rules_dir: Some(rules.path().join("rules")),
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, Some("proj"), "default");
+        req.message = "run the lasting tools".into();
+        req.cwd = dir.path().display().to_string();
+        req.user_claims = Some(person("alice"));
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+
+        waits(&manager, &sid, "req-a1").await;
+        manager
+            .route_permission_response(&sid, "req-a1", true, PermissionAnswerScope::Always, true)
+            .await
+            .unwrap();
+        let answer = answer_read(dir.path(), "req-a1").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert_eq!(
+            answer["updatedInput"],
+            json!({"command": "cat README.md"}),
+            "{answer}"
+        );
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+
+        // The identical call: answered by the backend, `always`.
+        let answer = answer_read(dir.path(), "req-a2").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+
+        // The redirection waits for the user, and cannot be approved for good.
+        waits(&manager, &sid, "req-a3").await;
+        let refused = manager
+            .route_permission_response(&sid, "req-a3", true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, "req-a3", false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+
+        let mut seen: Vec<String> = decisions(&graph, &sid, 3)
+            .await
+            .iter()
+            .map(|(scope, rule)| format!("{scope} {rule}"))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "\"always\" \"Bash: cat README.md\"",
+                "\"always\" \"Bash: cat README.md\"",
+                "null null",
+            ]
+        );
+        // Nothing of the CLI's suggestions went anywhere.
+        let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
+        for word in [
+            "updatedPermissions",
+            "setMode",
+            "addDirectories",
+            "localSettings",
+            "addRules",
+        ] {
+            assert!(!stdin.contains(word), "{word} reached the CLI: {stdin}");
+        }
+        assert!(
+            !dir.path().join(".claude").exists(),
+            "no settings written in the project"
+        );
+        // `system_init` offered `always` on this session.
+        let id = Uuid::parse_str(&sid).unwrap();
+        let init = graph
+            .get_chat_events(id, 0, 500)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "system_init")
+            .map(|e| e.data)
+            .unwrap_or_default();
+        assert!(init.contains("\"always\""), "{init}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
     // ---------------------------------------------------------------- native
 
     fn calls(key: &str, id: &str, tool: &str, arguments: Value) -> Value {
@@ -8504,7 +8689,7 @@ mod permission_scopes {
         let manager = native_manager(graph.clone()).await;
         let sid = open(&manager, cwd.path(), None).await;
 
-        // No engine offers `always` in this lot.
+        // A session without an owner keeps no lasting rule: `always` is not offered.
         let handle = manager.agent_runtime.get(&sid).await.unwrap();
         let scopes = handle.offered_capabilities().permission_scopes;
         assert!(
@@ -8579,6 +8764,295 @@ mod permission_scopes {
             .await
             .unwrap();
         manager.close_session(&sid2).await.unwrap();
+    }
+
+    // ------------------------------------------------------------ lasting (P11b)
+
+    /// A person signed in with their own session token.
+    pub(super) fn person(sub: &str) -> crate::auth::jwt::Claims {
+        crate::auth::jwt::Claims {
+            sub: sub.to_string(),
+            email: format!("{sub}@ffs.holdings"),
+            name: sub.to_string(),
+            iat: 0,
+            exp: i64::MAX / 2,
+            token_type: None,
+            scope: None,
+            jti: None,
+        }
+    }
+
+    /// The later turns first: a turn's body holds the earlier turns' text.
+    fn lasting_script() -> Value {
+        let bash = |key: &str, id: &str, command: &str| {
+            calls(key, id, "mcp__nexus__Bash", json!({ "command": command }))
+        };
+        let mut routes = vec![
+            bash("ALWAYS-ELSEWHERE", "a6", "cat README.md"),
+            says("ALWAYS-ELSEWHERE", "done elsewhere"),
+            bash("ALWAYS-BOB", "a5", "cat README.md"),
+            says("ALWAYS-BOB", "done bob"),
+            bash("ALWAYS-REVOKED", "a4", "cat README.md"),
+            says("ALWAYS-REVOKED", "done revoked"),
+            bash("ALWAYS-REDIRECT", "a3", "cat README.md >> zshrc"),
+            says("ALWAYS-REDIRECT", "done redirect"),
+            bash("ALWAYS-TWO", "a2", "cat README.md"),
+            says("ALWAYS-TWO", "done two"),
+            bash("ALWAYS-ONE", "a1", "cat README.md"),
+            says("ALWAYS-ONE", "done one"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    /// The project `proj`, rooted at `root`: lasting rules are bound to that root.
+    pub(super) async fn project_at(graph: &MockGraphStore, root: &std::path::Path) {
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "proj".into();
+        project.root_path = root.display().to_string();
+        graph.create_project(&project).await.unwrap();
+    }
+
+    /// A native session of `sub` on project `proj`, its lasting rules kept in `rules`.
+    async fn open_as(manager: &ChatManager, cwd: &std::path::Path, sub: &str) -> String {
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.cwd = cwd.display().to_string();
+        req.user_claims = Some(person(sub));
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        sid
+    }
+
+    /// The review of P11a, blocker 1, end to end on the native engine (real nexus-tools,
+    /// its policy deciding each call through `policy_args::decide_call`): an `always`
+    /// approval of `cat README.md` is NEVER put in the session's `allow` list — nexus still
+    /// ASKS the identical call in the next session, and the backend answers it (decision
+    /// `always`); `cat README.md >> zshrc` is asked of the user and never runs; another
+    /// person's session, or the same person after a revocation, is asked again.
+    #[tokio::test]
+    async fn native_always_rule_is_kept_by_the_backend_never_by_nexus() {
+        let fake = FakeOpenAi::start(lasting_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("README.md"), "readme").unwrap();
+        project_at(&graph, cwd.path()).await;
+        let rules = tempfile::tempdir().unwrap();
+        let manager = {
+            let mut m = native_manager(graph.clone()).await;
+            m.config.lasting_rules_dir = Some(rules.path().join("rules"));
+            m
+        };
+        let sid = open_as(&manager, cwd.path(), "alice").await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(
+            handle
+                .offered_capabilities()
+                .permission_scopes
+                .contains(&nexus_claude::agent::PermissionScope::Always),
+            "a session of a person on a project offers always"
+        );
+        manager.send_message(&sid, "ALWAYS-ONE").await.unwrap();
+        let id = asked(&graph, &sid, "cat README.md", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the command");
+        manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Always, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "ALWAYS-ONE").await, "the tool ran");
+        let first = decisions(&graph, &sid, 1).await;
+        assert_eq!(
+            first[0],
+            (json!("always"), json!("mcp__nexus__Bash: cat README.md"))
+        );
+        manager.close_session(&sid).await.unwrap();
+
+        // The next session of the same person on the same project: nexus ASKS again (no
+        // rule was handed to it), the backend answers.
+        let sid2 = open_as(&manager, cwd.path(), "alice").await;
+        manager.send_message(&sid2, "ALWAYS-TWO").await.unwrap();
+        assert!(ran(&fake, "ALWAYS-TWO").await, "answered without the user");
+        assert_eq!(
+            asked_ids(&graph, &sid2, "cat README.md").await.len(),
+            1,
+            "nexus asked: its allow list holds no lasting rule"
+        );
+        let seen = decisions(&graph, &sid2, 1).await;
+        assert_eq!(
+            seen,
+            vec![(json!("always"), json!("mcp__nexus__Bash: cat README.md"))]
+        );
+
+        // The same program with a redirection: asked of the user, never covered.
+        manager
+            .send_message(&sid2, "ALWAYS-REDIRECT")
+            .await
+            .unwrap();
+        let redirect = asked(&graph, &sid2, ">> zshrc", Duration::from_secs(10))
+            .await
+            .expect("a redirection is asked");
+        assert_eq!(decisions(&graph, &sid2, 2).await.len(), 1, "not answered");
+        // ...and it cannot be approved for good either.
+        let refused = manager
+            .route_permission_response(&sid2, &redirect, true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid2, &redirect, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "ALWAYS-REDIRECT").await);
+        assert!(
+            !cwd.path().join("zshrc").exists(),
+            "the redirection never ran"
+        );
+
+        // Revoked: asked again at once, in this very session.
+        let store = manager.lasting_rule_store().unwrap();
+        let rule = store.rules("alice").remove(0);
+        assert!(store.revoke("alice", rule.id).unwrap());
+        manager.send_message(&sid2, "ALWAYS-REVOKED").await.unwrap();
+        let again = asked_ids_after(&graph, &sid2, "cat README.md\"", 1).await;
+        manager
+            .route_permission_response(&sid2, &again, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        manager.close_session(&sid2).await.unwrap();
+
+        // Another person on the same project: asked.
+        let sid3 = open_as(&manager, cwd.path(), "bob").await;
+        manager.send_message(&sid3, "ALWAYS-BOB").await.unwrap();
+        let bob = asked(&graph, &sid3, "cat README.md", Duration::from_secs(10)).await;
+        assert!(bob.is_some(), "another person's rule never holds");
+        manager
+            .route_permission_response(
+                &sid3,
+                &bob.unwrap(),
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+        manager.close_session(&sid3).await.unwrap();
+
+        // Review of #714, S2: the same person and slug, another directory (a rule kept
+        // again first, so one exists): `always` is not offered there and the identical
+        // call is asked.
+        let place = manager
+            .lasting_scope(
+                Some("alice"),
+                Some("proj"),
+                &cwd.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input: json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        place.keep(&call, &grant, "seed").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("README.md"), "secret").unwrap();
+        let sid4 = open_as(&manager, elsewhere.path(), "alice").await;
+        let handle = manager.agent_runtime.get(&sid4).await.unwrap();
+        assert!(
+            !handle
+                .offered_capabilities()
+                .permission_scopes
+                .contains(&nexus_claude::agent::PermissionScope::Always),
+            "not offered outside the project's root"
+        );
+        manager
+            .send_message(&sid4, "ALWAYS-ELSEWHERE")
+            .await
+            .unwrap();
+        let asked_there = asked(&graph, &sid4, "cat README.md", Duration::from_secs(10)).await;
+        assert!(asked_there.is_some(), "asked outside the project's root");
+        assert!(
+            decisions(&graph, &sid4, 1).await.is_empty(),
+            "never answered by a rule"
+        );
+        manager
+            .route_permission_response(
+                &sid4,
+                &asked_there.unwrap(),
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+        manager.close_session(&sid4).await.unwrap();
+    }
+
+    /// The id of the request holding `needle` asked after the first `skip` ones.
+    async fn asked_ids_after(
+        graph: &MockGraphStore,
+        sid: &str,
+        needle: &str,
+        skip: usize,
+    ) -> String {
+        for _ in 0..400 {
+            if let Some(id) = asked_ids(graph, sid, needle).await.into_iter().nth(skip) {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{needle} was not asked again");
+    }
+
+    /// No owner (the server's own run, the anonymous user) or no project: `always` is not
+    /// offered and is refused, typed, even with a store configured.
+    #[tokio::test]
+    async fn a_session_without_a_person_keeps_no_lasting_rule() {
+        let fake = FakeOpenAi::start(native_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let rules = tempfile::tempdir().unwrap();
+        let manager = {
+            let mut m = native_manager(graph.clone()).await;
+            m.config.lasting_rules_dir = Some(rules.path().join("rules"));
+            m
+        };
+        let sid = open(&manager, cwd.path(), None).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(!handle
+            .offered_capabilities()
+            .permission_scopes
+            .contains(&nexus_claude::agent::PermissionScope::Always));
+        manager.send_message(&sid, "ECHO-ONE").await.unwrap();
+        let id = asked(&graph, &sid, "first-echo", Duration::from_secs(10))
+            .await
+            .unwrap();
+        let refused = manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(refused, Err(PermissionDeliveryError::ScopeUnsupported(_))),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, &id, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        manager.close_session(&sid).await.unwrap();
+        assert!(!rules.path().join("rules").exists(), "nothing written");
     }
 
     #[tokio::test]

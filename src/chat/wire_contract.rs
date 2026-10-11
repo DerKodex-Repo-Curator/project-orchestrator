@@ -339,6 +339,7 @@ fn server_examples() -> Vec<ServerExample> {
                 category: Some(s("read")),
                 canonical: Some(s("read_file")),
                 tool_use_id: Some(s(TOOL_USE_ID)),
+                always: None,
             },
             ChatEvent::PermissionRequest {
                 id: s("perm_0001"),
@@ -348,6 +349,7 @@ fn server_examples() -> Vec<ServerExample> {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
         ),
         ServerExample::new(

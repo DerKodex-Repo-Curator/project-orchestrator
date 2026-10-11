@@ -338,6 +338,9 @@ const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     "/api/chat/routing",
     // Search engines are tool providers: declaring one decides where a session's queries go (P6).
     "/api/chat/search-engines",
+    // The lasting approvals of a person (P11b): an agent that could revoke or touch them
+    // would act on its person's decisions (the handlers also refuse an agent's GET).
+    "/api/chat/permission-rules",
 ];
 
 /// Per-project settings that decide where a project's content may go
@@ -1265,6 +1268,10 @@ mod tests {
         assert!(
             is_human_only_mutation(&Method::POST, "/api/chat/sessions/abc/permissions/req-1"),
             "an agent must not answer permission prompts"
+        );
+        assert!(
+            is_human_only_mutation(&Method::DELETE, "/api/chat/permission-rules/r1"),
+            "an agent must not revoke its person's lasting approvals"
         );
         assert!(
             is_human_only_mutation(&Method::PUT, "/api/chat/sessions/abc/routing"),

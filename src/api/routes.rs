@@ -1884,6 +1884,15 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/permissions/{request_id}",
             post(chat_handlers::respond_permission),
         )
+        // The caller's lasting approvals (`always`, P11b): list and revoke, human only.
+        .route(
+            "/api/chat/permission-rules",
+            get(chat_handlers::list_permission_rules),
+        )
+        .route(
+            "/api/chat/permission-rules/{id}",
+            delete(chat_handlers::revoke_permission_rule),
+        )
         .route(
             "/api/chat/sessions/{id}/children",
             get(chat_handlers::get_session_children),

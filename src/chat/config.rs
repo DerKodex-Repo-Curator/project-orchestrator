@@ -222,6 +222,12 @@ pub struct ChatConfig {
     /// server configured outside the backend, the very ones a declaration is for
     /// (`docs/guides/chat-websocket.md`).
     pub read_only_mcp_tools: Vec<String>,
+    /// Where the lasting approvals (`always`, `chat::lasting_rules`) are kept: one file per
+    /// person, in a `0700` directory. `None`: no session keeps a lasting approval (`always`
+    /// is not offered). From `CHAT_PERMISSION_RULES_DIR`, else the application directory
+    /// (`lasting_rules::default_root`) on a unix host; never in the unit tests of the crate
+    /// (they would write in the developer's home), which set it explicitly.
+    pub lasting_rules_dir: Option<std::path::PathBuf>,
 }
 
 /// Environment variable selecting the [`ProviderPath`].
@@ -233,6 +239,10 @@ pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
 /// Variable listing the third-party MCP tools declared read-only
 /// ([`ChatConfig::read_only_mcp_tools`]).
 pub const READ_ONLY_MCP_TOOLS_VAR: &str = "CHAT_READ_ONLY_MCP_TOOLS";
+
+/// Variable naming the directory of the lasting approvals
+/// ([`ChatConfig::lasting_rules_dir`]).
+pub const PERMISSION_RULES_DIR_VAR: &str = "CHAT_PERMISSION_RULES_DIR";
 
 /// Engine that drives Claude Code sessions (decision A18 / task B38).
 ///
@@ -355,7 +365,22 @@ impl ChatConfig {
             read_only_mcp_tools: Self::parse_read_only_mcp_tools(
                 std::env::var(READ_ONLY_MCP_TOOLS_VAR).ok().as_deref(),
             ),
+            lasting_rules_dir: Self::lasting_rules_dir_from_env(),
         }
+    }
+
+    /// [`ChatConfig::lasting_rules_dir`] from the environment.
+    fn lasting_rules_dir_from_env() -> Option<std::path::PathBuf> {
+        if cfg!(test) {
+            return None;
+        }
+        if let Some(dir) = std::env::var_os(PERMISSION_RULES_DIR_VAR).filter(|d| !d.is_empty()) {
+            return Some(std::path::PathBuf::from(dir));
+        }
+        if !cfg!(unix) {
+            return None;
+        }
+        Some(super::lasting_rules::default_root())
     }
 
     /// The declared read-only MCP tools of [`READ_ONLY_MCP_TOOLS_VAR`]: comma separated,
@@ -493,6 +518,7 @@ mod tests {
             server_port: 8080,
             session_token_expiry_secs: 86400,
             read_only_mcp_tools: Vec::new(),
+            lasting_rules_dir: None,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");

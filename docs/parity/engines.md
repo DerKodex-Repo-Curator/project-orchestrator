@@ -27,7 +27,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `cancel_tools` | cancel_tools arrête l'outil en cours, le tour continue | ok | ok |
 | `permissions.once` | une permission accordée une fois débloque l'outil | ok | ok |
 | `permissions.session` | une permission accordée pour la session n'est pas redemandée | ok | ok |
-| `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | gap (harnais, P11b) | gap (harnais, P11b) |
+| `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | ok | ok |
 | `tool_timing` | un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin | ok | ok |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok |
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | ok |
@@ -42,14 +42,12 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 27/29, natif 28/29.
+`ok` : Claude Code 28/29, natif 29/29.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
-| Claude Code | `permissions.always` | harnais | P11b | volontaire (sécurité) : aucune approbation durable tant que les règles ne sont pas tenues par un comparateur strict du backend (revue P11 : une suggestion du CLI réécrite vers localSettings pouvait y porter setMode / addDirectories) ; always est refusé, typé |
-| natif | `permissions.always` | harnais | P11b | volontaire (sécurité) : aucune règle durable tant qu'elle n'est pas tenue par un comparateur strict du backend (revue P11 : un préfixe Bash(cat *) dans la liste allow de nexus autorisait cat x >> ~/.zshrc) ; always est refusé, typé |
 
 ## Non mesuré
 
