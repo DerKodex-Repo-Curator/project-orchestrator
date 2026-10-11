@@ -379,8 +379,8 @@ fn executor() -> ChatRequest {
     r
 }
 
-/// The pool probes only an instance's DEFAULT model: `wb` is a candidate that can call
-/// tools once a session has run on it (the session's opening probes it).
+/// Opens a session on `wb`, which probes it. Under `primary` + `shadow` the pool probes
+/// nothing (task 58fa9980): this is how those tests make `wb` a candidate with tools.
 async fn probe_wb(w: &World) {
     let mut on_wb = pilot();
     on_wb.provider = Some("worker".into());

@@ -12610,10 +12610,41 @@ impl ChatManager {
     }
 
     /// The pool for a project (`None` = none): the routing pool built from what is
-    /// stored. Empty when the cognitive router is not wired.
+    /// stored. Empty when the cognitive router is not wired. The native models whose
+    /// tools are unknown are probed (bounded) unless the settings say `primary` +
+    /// `shadow`, where routing spends no request.
     pub(crate) async fn routing_pool_for(
         &self,
         project_slug: Option<&str>,
+    ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
+        use super::provider::cognitive::decider::ProbeScope;
+        if self.cognitive_routing.is_none() {
+            return Vec::new();
+        }
+        let scope =
+            match super::provider::cognitive::load_routing(self.graph.as_ref(), project_slug).await
+            {
+                Ok((settings, _)) => ProbeScope::for_settings(settings.mode, settings.stage),
+                Err(_) => ProbeScope::None,
+            };
+        self.routing_pool_scoped(project_slug, &scope).await
+    }
+
+    /// [`Self::routing_pool_for`] without any probe: what is already known (a report
+    /// must not spend requests).
+    pub(crate) async fn routing_pool_known(
+        &self,
+        project_slug: Option<&str>,
+    ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
+        use super::provider::cognitive::decider::ProbeScope;
+        self.routing_pool_scoped(project_slug, &ProbeScope::None)
+            .await
+    }
+
+    async fn routing_pool_scoped(
+        &self,
+        project_slug: Option<&str>,
+        scope: &super::provider::cognitive::decider::ProbeScope,
     ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
         use super::provider::{catalog, store};
         let Some(routing) = self.cognitive_routing.as_ref() else {
@@ -12630,7 +12661,8 @@ impl ChatManager {
         };
         let store_catalog =
             catalog::StoreCatalog::new(instances.clone(), &consents, project_slug.is_some());
-        self.routing_pool(routing, &instances, &store_catalog).await
+        self.routing_pool(routing, &instances, &store_catalog, scope)
+            .await
     }
 
     /// Links the cognitive decision taken for a session to that session, then keeps
@@ -12797,18 +12829,131 @@ impl ChatManager {
         }
     }
 
+    /// Starts, each in its own task, the probes of `reserved` on `native`. Each task
+    /// records its own outcome: a caller that stops waiting (a turn's timeout, the pool's
+    /// short wait) loses neither a request already sent nor the model's mark.
+    fn spawn_probes(
+        routing: &super::provider::cognitive::decider::CognitiveRouting,
+        native: &Arc<nexus_claude::providers::native::NativeProvider>,
+        instance: &str,
+        reserved: Vec<super::provider::cognitive::decider::Reservation>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        use super::provider::cognitive::decider::{record_probe, ProbeOutcome};
+        let policy = routing.probe_policy;
+        reserved
+            .into_iter()
+            .map(|reservation| {
+                let (native, log, instance) = (
+                    Arc::clone(native),
+                    Arc::clone(&routing.probed),
+                    instance.to_owned(),
+                );
+                tokio::spawn(async move {
+                    let model = reservation.model;
+                    let outcome = match tokio::time::timeout(
+                        policy.timeout,
+                        native.refresh_capabilities(&model),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => ProbeOutcome::Concluded,
+                        Ok(Err(error)) => ProbeOutcome::of_error(&error),
+                        Err(_) => ProbeOutcome::Failed,
+                    };
+                    if outcome != ProbeOutcome::Concluded {
+                        debug!(%instance, %model, ?outcome, "routing capability probe did not conclude");
+                    }
+                    record_probe(
+                        &mut log.lock().unwrap_or_else(|e| e.into_inner()),
+                        &instance,
+                        &model,
+                        reservation.ticket,
+                        outcome,
+                        std::time::Instant::now(),
+                    );
+                })
+            })
+            .collect()
+    }
+
+    /// Probes in the background, without anyone waiting, every model of `instance` in
+    /// `models` whose tools are unknown, within the instance's budget: as seats free up,
+    /// the next models are reserved, until none is left to probe now. Used when a
+    /// conversation that routes (Auto, ticked models) opens: its per-turn pools read the
+    /// stored settings, which may forbid probing (review of #709, C4a).
+    async fn probe_rest_in_background(&self, instance: &str, models: Vec<String>) {
+        use super::provider::cognitive::decider::{probing, reserve_probes};
+        let Some(routing) = self.cognitive_routing.clone() else {
+            return;
+        };
+        let Some(native) = self.native_probers.read().await.get(instance).cloned() else {
+            return;
+        };
+        let instance = instance.to_owned();
+        tokio::spawn(async move {
+            use nexus_claude::agent::AgentProvider;
+            // Bounded: each round either starts a probe or waits for one to end.
+            for _ in 0..(models.len() * 4 + 8) {
+                let now = std::time::Instant::now();
+                let wanted: Vec<String> = models
+                    .iter()
+                    .filter(|m| !native.capabilities(Some(m)).tools)
+                    .cloned()
+                    .collect();
+                let reserved = reserve_probes(
+                    &mut routing.probed.lock().unwrap_or_else(|e| e.into_inner()),
+                    &instance,
+                    wanted,
+                    now,
+                    &routing.probe_policy,
+                );
+                if reserved.is_empty() {
+                    let busy = probing(
+                        &routing.probed.lock().unwrap_or_else(|e| e.into_inner()),
+                        &instance,
+                        now,
+                        &routing.probe_policy,
+                    );
+                    if !busy {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                futures::future::join_all(Self::spawn_probes(
+                    &routing, &native, &instance, reserved,
+                ))
+                .await;
+            }
+        });
+    }
+
     /// The pool the cognitive router chooses from: every model of every
     /// reachable instance, with the capabilities and the price nexus reports,
     /// the health (one probe per instance per window) and the project's consent.
+    /// The native models `scope` covers whose tools are not known yet are probed,
+    /// within `routing.probe_policy`: every instance's probes start before any is
+    /// waited for, and the build waits `wait` at most for all of them together; what
+    /// ends later serves the next builds.
     async fn routing_pool(
         &self,
         routing: &super::provider::cognitive::decider::CognitiveRouting,
         instances: &[super::provider::settings::InstanceRecord],
         store_catalog: &super::provider::catalog::StoreCatalog,
+        scope: &super::provider::cognitive::decider::ProbeScope,
     ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
         use super::provider::cognitive::candidates::ModelFacts;
+        use super::provider::cognitive::decider::reserve_probes;
         use super::provider::resolver::{self, InstanceCatalog};
         use std::time::{Duration, Instant};
+
+        struct Gathered {
+            id: String,
+            provider: Arc<dyn nexus_claude::agent::AgentProvider>,
+            healthy: bool,
+            allowed: bool,
+            entries: Vec<(String, Option<nexus_claude::agent::ModelPrice>)>,
+        }
 
         let mut ids = vec![resolver::CLAUDE_CODE.to_string()];
         ids.extend(
@@ -12817,7 +12962,8 @@ impl ChatManager {
                 .filter(|i| !resolver::is_remote_instance(&i.id))
                 .map(|i| i.id.clone()),
         );
-        let mut pool = Vec::new();
+        let mut gathered = Vec::new();
+        let mut probes = Vec::new();
         for id in ids {
             // The legacy engine can only drive Claude Code.
             if !self.engine_is_agent(&id) && id != resolver::CLAUDE_CODE {
@@ -12850,53 +12996,80 @@ impl ChatManager {
                 Vec::new()
             };
             let allowed = store_catalog.is_allowed_for_project(&id);
-            let mut seen = std::collections::HashSet::new();
+            // A model the catalogue itself lists without tools is not worth a probe.
+            let no_tools_listed: std::collections::HashSet<String> = models
+                .iter()
+                .filter(|m| m.supports_tools == Some(false))
+                .map(|m| m.id.clone())
+                .collect();
+            // Answered by the catalogue: no path (this pool, a routed conversation's
+            // background probes) may reserve them (review of #709, N2).
+            if id != resolver::CLAUDE_CODE && !no_tools_listed.is_empty() {
+                super::provider::cognitive::decider::mark_listed_without_tools(
+                    &mut routing.probed.lock().unwrap_or_else(|e| e.into_inner()),
+                    &id,
+                    &no_tools_listed,
+                );
+            }
             let mut entries: Vec<(String, Option<nexus_claude::agent::ModelPrice>)> =
                 models.into_iter().map(|m| (m.id, m.pricing)).collect();
-            if let Some(model) = default_model {
-                if !entries.iter().any(|(m, _)| *m == model) {
-                    entries.push((model, None));
+            if let Some(model) = &default_model {
+                if !entries.iter().any(|(m, _)| m == model) {
+                    entries.push((model.clone(), None));
                 }
             }
-            // A native model nobody probed reports no tools and no window, so the
-            // hard constraints would drop it for good. Probe the instance's default
-            // model once (bounded; a failure is remembered for ten minutes).
+            // A native model nobody probed reports no tools and no window, so the hard
+            // constraints would drop it for good: probe the instance's models the scope
+            // covers, the default first, then the catalogue's order. Bounded: a model
+            // the catalogue says has no tools is never probed, an answer (tools,
+            // `ModelNoTools`, a refusal of the model) is never sent again, a failure
+            // backs off, and an instance never has more than `per_instance` running.
             if id != resolver::CLAUDE_CODE && healthy {
-                if let Some(model) = instances
+                let wanted: Vec<String> = default_model
                     .iter()
-                    .find(|i| i.id == id)
-                    .and_then(|i| i.default_model.clone())
-                {
-                    let unknown = {
-                        let caps = provider.capabilities(Some(&model));
-                        // `tools` stays false until a probe has run; a window can be
-                        // known from the preset without one.
-                        !caps.tools
-                    };
-                    let key = (id.clone(), model.clone());
-                    let recent = routing
-                        .probed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&key)
-                        .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(600));
-                    let concrete = self.native_probers.read().await.get(&id).cloned();
-                    if let (true, false, Some(native)) = (unknown, recent, concrete) {
-                        let outcome = tokio::time::timeout(
-                            Duration::from_secs(10),
-                            native.refresh_capabilities(&model),
-                        )
-                        .await;
-                        if !matches!(outcome, Ok(Ok(ref caps)) if caps.tools) {
-                            routing
-                                .probed
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(key, now);
-                        }
-                    }
+                    .chain(entries.iter().map(|(m, _)| m))
+                    .filter(|model| scope.covers(&id, model))
+                    .filter(|model| !no_tools_listed.contains(*model))
+                    .filter(|model| !provider.capabilities(Some(model)).tools)
+                    .cloned()
+                    .collect();
+                let concrete = self.native_probers.read().await.get(&id).cloned();
+                if let (false, Some(native)) = (wanted.is_empty(), concrete) {
+                    let reserved = reserve_probes(
+                        &mut routing.probed.lock().unwrap_or_else(|e| e.into_inner()),
+                        &id,
+                        wanted,
+                        now,
+                        &routing.probe_policy,
+                    );
+                    probes.extend(Self::spawn_probes(routing, &native, &id, reserved));
                 }
             }
+            gathered.push(Gathered {
+                id,
+                provider,
+                healthy,
+                allowed,
+                entries,
+            });
+        }
+        // Every instance's probes are running: wait a little for all of them together,
+        // never for the slowest instance after another (review of #709, C1).
+        if !probes.is_empty() {
+            let _ =
+                tokio::time::timeout(routing.probe_policy.wait, futures::future::join_all(probes))
+                    .await;
+        }
+        let mut pool = Vec::new();
+        for Gathered {
+            id,
+            provider,
+            healthy,
+            allowed,
+            entries,
+        } in gathered
+        {
+            let mut seen = std::collections::HashSet::new();
             // Claude Code declares no catalog and no window of its own: its candidates
             // are the live Anthropic catalog's models, each with the window the Models
             // API reports. Offline, they stay in the pool with the reason they cannot
@@ -12952,6 +13125,7 @@ impl ChatManager {
     ) -> Result<Option<super::provider::cognitive::decision::CognitiveDecision>> {
         use super::provider::cognitive::{
             candidates::Slot,
+            decider::ProbeScope,
             decision::DecideRequest,
             scorer::PriorHints,
             signature::{ContextHints, TaskSignature},
@@ -12974,7 +13148,6 @@ impl ChatManager {
             ),
         };
         routing.set_hints(PriorHints::from_aliases(aliases));
-        let mut pool = self.routing_pool(routing, instances, store_catalog).await;
         // A provider, model, alias or run the caller named is never substituted.
         let named = request.provider.is_some()
             || request.model.as_deref().is_some_and(|m| !m.is_empty())
@@ -12995,15 +13168,35 @@ impl ChatManager {
         if let Some(mode) = request.routing_mode {
             settings.mode = mode;
         }
-        // The models ticked in the menu are the only candidates, and are routed like `full`
-        // inside them, whatever the settings' mode.
-        if let Some(ticked) = Self::routing_pool_of(request) {
+        let ticked = Self::routing_pool_of(request);
+        // The models ticked in the menu are routed like `full` inside them, whatever the
+        // settings' mode.
+        if ticked.is_some() {
+            settings.mode = super::provider::cognitive::ProviderRoutingMode::Full;
+        }
+        // What the probes may cost: nothing for a named choice (the session opening
+        // probes its own model) or in `primary` + `shadow`; only the ticked models when
+        // there are some; every model otherwise.
+        let scope = match ticked {
+            _ if named => ProbeScope::None,
+            Some(ticked) => ProbeScope::Only(
+                ticked
+                    .iter()
+                    .map(|e| (e.provider.clone(), e.model.clone()))
+                    .collect(),
+            ),
+            None => ProbeScope::for_settings(settings.mode, settings.stage),
+        };
+        let mut pool = self
+            .routing_pool(routing, instances, store_catalog, &scope)
+            .await;
+        // The models ticked in the menu are the only candidates.
+        if let Some(ticked) = ticked {
             pool.retain(|facts| {
                 ticked
                     .iter()
                     .any(|e| e.provider == facts.provider_id && e.model == facts.model)
             });
-            settings.mode = super::provider::cognitive::ProviderRoutingMode::Full;
         }
         let mut decide = DecideRequest::new(signature, settings, pool);
         decide.slot = if named {
@@ -13013,7 +13206,36 @@ impl ChatManager {
         };
         decide.trust = request.permission_mode.as_deref() == Some("bypassPermissions");
         decide.session_id = session_id;
-        Ok(Some(routing.decider.decide(&decide).await?))
+        let routes = !named
+            && super::provider::cognitive::conversation_routes(
+                request.routing_mode,
+                ticked.map_or(0, <[_]>::len),
+            );
+        let unknown: Vec<(String, String)> = decide
+            .pool
+            .iter()
+            .filter(|facts| !facts.supports_tools)
+            .map(|facts| (facts.provider_id.clone(), facts.model.clone()))
+            .collect();
+        let decision = routing.decider.decide(&decide).await?;
+        // A conversation that routes (Auto, models ticked) is decided turn by turn from
+        // pools that follow the stored settings, which may forbid probing: the candidates
+        // of its provider not known yet are probed now, in the background, within the
+        // instance's budget (review of #709, C4a).
+        if routes {
+            if let Some(chosen) = decision.chosen.as_ref() {
+                let rest: Vec<String> = unknown
+                    .into_iter()
+                    .filter(|(provider, _)| *provider == chosen.provider_id)
+                    .map(|(_, model)| model)
+                    .collect();
+                if !rest.is_empty() {
+                    self.probe_rest_in_background(&chosen.provider_id, rest)
+                        .await;
+                }
+            }
+        }
+        Ok(Some(decision))
     }
 
     /// The provider instance, built-in or stored. A stored instance becomes a
@@ -13055,6 +13277,13 @@ impl ChatManager {
                 Some(native) => probers.insert(provider_id.to_string(), native),
                 None => probers.remove(provider_id),
             };
+        }
+        // A rebuilt provider knows no probe: neither does the router.
+        if let Some(routing) = &self.cognitive_routing {
+            super::provider::cognitive::decider::forget_instance(
+                &mut routing.probed.lock().unwrap_or_else(|e| e.into_inner()),
+                provider_id,
+            );
         }
         self.native_cache
             .write()

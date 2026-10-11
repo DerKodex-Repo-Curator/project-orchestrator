@@ -310,8 +310,284 @@ impl Decider for CognitiveDecider {
     }
 }
 
-/// Capability probes attempted: (instance, model) to the time of the attempt.
-pub type ProbeLog = std::collections::HashMap<(String, String), std::time::Instant>;
+/// What the router knows of one model's capability probe (a tool call sent to the
+/// endpoint: a real, possibly paid, request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMark {
+    /// A probe is running: no other pool build sends a second one, and it counts against
+    /// its instance's budget. `ticket` identifies the reservation (only its own probe
+    /// records over it); `attempts` are the failed tries before it. Older than
+    /// [`ProbePolicy::in_flight_stale`] (its task died), it no longer blocks.
+    InFlight {
+        since: std::time::Instant,
+        ticket: u64,
+        attempts: u32,
+    },
+    /// The probe concluded, tools or not (`ModelNoTools` is a conclusion, recorded by the
+    /// provider): never sent again while the instance's provider is the same.
+    Concluded,
+    /// The endpoint refused the model itself (a 4xx other than 408/429: an embeddings,
+    /// speech or image model behind `/chat/completions`): a final answer, never sent
+    /// again while the provider is the same. The model stays without tools.
+    Unusable,
+    /// The probe failed without an answer about the model (network, 401, 408, 429, 5xx,
+    /// timeout): retried after a backoff that doubles with each attempt.
+    Failed {
+        at: std::time::Instant,
+        attempts: u32,
+    },
+}
+
+/// How a probe ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// Capabilities came back (tools or `ModelNoTools`).
+    Concluded,
+    /// The model was refused for good (see [`ProbeMark::Unusable`]).
+    Unusable,
+    /// No answer about the model.
+    Failed,
+}
+
+impl ProbeOutcome {
+    /// The outcome of a probe that returned `error`. Only a refusal about the MODEL is
+    /// final: 400, 404, 422 (nexus spells them `HTTP <status>: …` in `InvalidRequest`).
+    /// Every other status nexus also files under `InvalidRequest` (402 out of credit, 408,
+    /// 409, 410, …) says nothing final about the model and is retried with backoff, like
+    /// 401, 429, 5xx and network errors (review of #709, N1).
+    pub fn of_error(error: &nexus_claude::agent::ProviderError) -> Self {
+        use nexus_claude::agent::ProviderError;
+        const FINAL: [&str; 3] = ["HTTP 400", "HTTP 404", "HTTP 422"];
+        match error {
+            ProviderError::InvalidRequest { detail }
+                if FINAL.iter().any(|status| detail.starts_with(status)) =>
+            {
+                Self::Unusable
+            }
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// Capability probes of the routing: (instance, model) to what is known.
+pub type ProbeLog = std::collections::HashMap<(String, String), ProbeMark>;
+
+/// The bounds of the routing's capability probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbePolicy {
+    /// Probes that may run at once on one instance, whatever the number of pool builds.
+    pub per_instance: usize,
+    /// How long one probe may take.
+    pub timeout: std::time::Duration,
+    /// How long a pool build waits for the probes it started, all instances together;
+    /// what is still running then is used by the next builds.
+    pub wait: std::time::Duration,
+    /// Delay before the first retry of a failed probe; doubled at each further failure.
+    pub retry_after: std::time::Duration,
+    /// The longest delay between two retries.
+    pub max_backoff: std::time::Duration,
+    /// After how long a probe still marked running is considered abandoned.
+    pub in_flight_stale: std::time::Duration,
+}
+
+impl ProbePolicy {
+    /// The production bounds: three probes at once per instance, ten seconds each, a
+    /// build waiting 1.5 s at most, a failure retried after 10 min, 20, 40… up to a day.
+    pub const fn standard() -> Self {
+        Self {
+            per_instance: 3,
+            timeout: std::time::Duration::from_secs(10),
+            wait: std::time::Duration::from_millis(1_500),
+            retry_after: std::time::Duration::from_secs(600),
+            max_backoff: std::time::Duration::from_secs(86_400),
+            in_flight_stale: std::time::Duration::from_secs(60),
+        }
+    }
+
+    /// The delay before retrying a probe that failed `attempts` times (≥ 1).
+    pub fn backoff(&self, attempts: u32) -> std::time::Duration {
+        let factor = 1u32 << attempts.saturating_sub(1).min(16);
+        self.retry_after
+            .checked_mul(factor)
+            .map_or(self.max_backoff, |d| d.min(self.max_backoff))
+    }
+}
+
+impl Default for ProbePolicy {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+/// Which models a pool build may probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeScope {
+    /// None: the pool reports what is already known (primary + shadow, a report).
+    None,
+    /// Every model of every native instance, within the policy's bounds.
+    All,
+    /// Only these (instance, model) pairs: the models ticked for the conversation.
+    Only(Vec<(String, String)>),
+}
+
+impl ProbeScope {
+    /// Whether `(instance, model)` may be probed.
+    pub fn covers(&self, instance: &str, model: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Only(pairs) => pairs.iter().any(|(i, m)| i == instance && m == model),
+        }
+    }
+
+    /// The scope the routing settings allow: nothing in `primary` + `shadow` (routing off,
+    /// nothing learnt or applied: no request is spent on it), every model otherwise.
+    pub fn for_settings(mode: ProviderRoutingMode, stage: LearningStage) -> Self {
+        if mode == ProviderRoutingMode::Primary && stage == LearningStage::Shadow {
+            Self::None
+        } else {
+            Self::All
+        }
+    }
+}
+
+/// A model reserved for a probe, and the ticket its outcome is recorded with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    /// The model to probe.
+    pub model: String,
+    /// The reservation's identity (see [`record_probe`]).
+    pub ticket: u64,
+}
+
+static NEXT_TICKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn running(mark: &ProbeMark, now: std::time::Instant, policy: &ProbePolicy) -> bool {
+    matches!(mark, ProbeMark::InFlight { since, .. } if now.duration_since(*since) < policy.in_flight_stale)
+}
+
+/// Reserves, in `candidates` order, the models of `instance` to probe now: as many as
+/// the instance has room for (`policy.per_instance` minus the probes already running on
+/// it, from any build), skipping a model whose probe concluded, was refused for good, is
+/// running, or failed less than its backoff ago. The reserved ones are marked running.
+pub fn reserve_probes(
+    log: &mut ProbeLog,
+    instance: &str,
+    candidates: impl IntoIterator<Item = String>,
+    now: std::time::Instant,
+    policy: &ProbePolicy,
+) -> Vec<Reservation> {
+    let in_flight = log
+        .iter()
+        .filter(|((id, _), mark)| id == instance && running(mark, now, policy))
+        .count();
+    let room = policy.per_instance.saturating_sub(in_flight);
+    let mut reserved: Vec<Reservation> = Vec::new();
+    for model in candidates {
+        if reserved.len() >= room {
+            break;
+        }
+        let key = (instance.to_owned(), model);
+        let attempts = match log.get(&key) {
+            None => Some(0),
+            Some(ProbeMark::Concluded | ProbeMark::Unusable) => None,
+            Some(mark @ ProbeMark::InFlight { attempts, .. }) => {
+                (!running(mark, now, policy)).then_some(*attempts)
+            }
+            Some(ProbeMark::Failed { at, attempts }) => {
+                (now.duration_since(*at) >= policy.backoff(*attempts)).then_some(*attempts)
+            }
+        };
+        let Some(attempts) = attempts else { continue };
+        if reserved.iter().any(|r| r.model == key.1) {
+            continue;
+        }
+        let ticket = NEXT_TICKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log.insert(
+            key.clone(),
+            ProbeMark::InFlight {
+                since: now,
+                ticket,
+                attempts,
+            },
+        );
+        reserved.push(Reservation {
+            model: key.1,
+            ticket,
+        });
+    }
+    reserved
+}
+
+/// Records how the probe reserved with `ticket` ended. Only that reservation's entry is
+/// written: a probe whose instance was forgotten meanwhile (its provider rebuilt, the
+/// model maybe reserved again since) taught the new provider nothing.
+pub fn record_probe(
+    log: &mut ProbeLog,
+    instance: &str,
+    model: &str,
+    ticket: u64,
+    outcome: ProbeOutcome,
+    now: std::time::Instant,
+) {
+    let Some(entry) = log.get_mut(&(instance.to_owned(), model.to_owned())) else {
+        return;
+    };
+    let ProbeMark::InFlight {
+        ticket: mine,
+        attempts,
+        ..
+    } = *entry
+    else {
+        return;
+    };
+    if mine != ticket {
+        return;
+    }
+    *entry = match outcome {
+        ProbeOutcome::Concluded => ProbeMark::Concluded,
+        ProbeOutcome::Unusable => ProbeMark::Unusable,
+        ProbeOutcome::Failed => ProbeMark::Failed {
+            at: now,
+            attempts: attempts + 1,
+        },
+    };
+}
+
+/// Whether a probe of `instance` is running (from any build).
+pub fn probing(
+    log: &ProbeLog,
+    instance: &str,
+    now: std::time::Instant,
+    policy: &ProbePolicy,
+) -> bool {
+    log.iter()
+        .any(|((id, _), mark)| id == instance && running(mark, now, policy))
+}
+
+/// Records the models of `instance` the catalogue itself lists without tools as answered
+/// (`Concluded`), so that no path reserves them (the pool's and the background probes of
+/// a routed conversation alike; review of #709, N2). A running probe is left alone.
+pub fn mark_listed_without_tools<'a>(
+    log: &mut ProbeLog,
+    instance: &str,
+    models: impl IntoIterator<Item = &'a String>,
+) {
+    for model in models {
+        let entry = log
+            .entry((instance.to_owned(), model.clone()))
+            .or_insert(ProbeMark::Concluded);
+        if !matches!(entry, ProbeMark::InFlight { .. }) {
+            *entry = ProbeMark::Concluded;
+        }
+    }
+}
+
+/// Forgets every probe of `instance`: its provider was rebuilt (the stored record
+/// changed), so what the old one learnt is gone with it.
+pub fn forget_instance(log: &mut ProbeLog, instance: &str) {
+    log.retain(|(id, _), _| id != instance);
+}
 
 /// The routing pieces a chat manager owns: the decider, the handle through
 /// which the alias hints are refreshed, and the short-lived health memory.
@@ -323,9 +599,11 @@ pub struct CognitiveRouting {
     pub hints: Arc<RwLock<PriorHints>>,
     /// One health probe per instance per window.
     pub health: Arc<candidates::HealthCache>,
-    /// Models whose capability probe was attempted, and when: a probe that fails
-    /// is not replayed on every decision.
+    /// What is known of each native model's capability probe: a probe is sent once
+    /// per model (a failure is retried later, a conclusion never), never twice at once.
     pub probed: Arc<std::sync::Mutex<ProbeLog>>,
+    /// The bounds of those probes.
+    pub probe_policy: ProbePolicy,
     /// Where decisions and arms live, when the standard wiring built this; it is
     /// how a session's decision is linked and closed. `None` for a test decider.
     pub store: Option<Arc<dyn RoutingArmStore>>,
@@ -347,6 +625,7 @@ impl CognitiveRouting {
             hints,
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
+            probe_policy: ProbePolicy::standard(),
             store: Some(store),
             claude_code_catalog: None,
         }
@@ -359,6 +638,7 @@ impl CognitiveRouting {
             hints: Arc::new(RwLock::new(PriorHints::new())),
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
+            probe_policy: ProbePolicy::standard(),
             store: None,
             claude_code_catalog: None,
         }
@@ -827,5 +1107,256 @@ mod tests {
             })
             .count();
         assert_eq!(changes, 0);
+    }
+
+    fn models(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    fn names(reserved: &[Reservation]) -> Vec<String> {
+        reserved.iter().map(|r| r.model.clone()).collect()
+    }
+
+    fn end(log: &mut ProbeLog, r: &Reservation, outcome: ProbeOutcome, at: std::time::Instant) {
+        record_probe(log, "i", &r.model, r.ticket, outcome, at);
+    }
+
+    /// Review of #709 (C2): the budget is the probes RUNNING on the instance, whatever
+    /// the number of builds asking.
+    #[test]
+    fn an_instance_never_has_more_probes_running_than_its_budget() {
+        let policy = ProbePolicy::standard();
+        let mut log = ProbeLog::new();
+        let t0 = std::time::Instant::now();
+        let all = models(&["d", "a", "b", "c", "e"]);
+        let first = reserve_probes(&mut log, "i", all.clone(), t0, &policy);
+        assert_eq!(
+            names(&first),
+            ["d", "a", "b"],
+            "the default first, then in order"
+        );
+        // While they run, another build reserves nothing: the instance is full.
+        assert!(reserve_probes(&mut log, "i", all.clone(), t0, &policy).is_empty());
+        // Another instance has its own budget.
+        assert_eq!(
+            reserve_probes(&mut log, "j", all.clone(), t0, &policy).len(),
+            3
+        );
+        // One ends: one seat frees up.
+        end(&mut log, &first[0], ProbeOutcome::Concluded, t0);
+        assert_eq!(
+            names(&reserve_probes(&mut log, "i", all, t0, &policy)),
+            ["c"]
+        );
+        assert!(probing(&log, "i", t0, &policy));
+    }
+
+    #[test]
+    fn a_conclusion_or_a_refusal_is_never_probed_again_and_a_failure_waits_its_retry() {
+        let policy = ProbePolicy::standard();
+        let mut log = ProbeLog::new();
+        let t0 = std::time::Instant::now();
+        let three = models(&["no-tools", "embedding", "flaky"]);
+        let r = reserve_probes(&mut log, "i", three.clone(), t0, &policy);
+        assert_eq!(names(&r), three);
+        end(&mut log, &r[0], ProbeOutcome::Concluded, t0);
+        end(&mut log, &r[1], ProbeOutcome::Unusable, t0);
+        end(&mut log, &r[2], ProbeOutcome::Failed, t0);
+        let soon = t0 + std::time::Duration::from_secs(60);
+        assert!(reserve_probes(&mut log, "i", three.clone(), soon, &policy).is_empty());
+        let later = t0 + policy.retry_after;
+        assert_eq!(
+            names(&reserve_probes(
+                &mut log,
+                "i",
+                three.clone(),
+                later,
+                &policy
+            )),
+            ["flaky"],
+            "ModelNoTools and a refused model are answers: only the failure is retried"
+        );
+        // A rebuilt instance starts over.
+        forget_instance(&mut log, "i");
+        assert_eq!(
+            reserve_probes(&mut log, "i", three, later, &policy).len(),
+            3
+        );
+    }
+
+    /// Review of #709 (C3): each failure doubles the delay, up to the cap.
+    #[test]
+    fn each_failure_doubles_the_delay_before_the_next_try() {
+        let policy = ProbePolicy::standard();
+        assert_eq!(policy.backoff(1), policy.retry_after);
+        assert_eq!(policy.backoff(2), policy.retry_after * 2);
+        assert_eq!(policy.backoff(3), policy.retry_after * 4);
+        assert_eq!(policy.backoff(40), policy.max_backoff);
+        let mut log = ProbeLog::new();
+        let t0 = std::time::Instant::now();
+        let r = reserve_probes(&mut log, "i", models(&["m"]), t0, &policy);
+        end(&mut log, &r[0], ProbeOutcome::Failed, t0);
+        let t1 = t0 + policy.retry_after;
+        let r = reserve_probes(&mut log, "i", models(&["m"]), t1, &policy);
+        assert_eq!(r.len(), 1, "first retry after retry_after");
+        end(&mut log, &r[0], ProbeOutcome::Failed, t1);
+        assert!(
+            reserve_probes(
+                &mut log,
+                "i",
+                models(&["m"]),
+                t1 + policy.retry_after,
+                &policy
+            )
+            .is_empty(),
+            "the second failure waits twice as long"
+        );
+        assert_eq!(
+            reserve_probes(
+                &mut log,
+                "i",
+                models(&["m"]),
+                t1 + policy.retry_after * 2,
+                &policy
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// Review of #709 (C3): a 4xx about the model is final; 408, 429, 5xx, network are not.
+    #[test]
+    fn a_refusal_of_the_model_is_final_and_a_transient_error_is_not() {
+        use nexus_claude::agent::ProviderError;
+        let refused = |detail: &str| ProviderError::InvalidRequest {
+            detail: detail.into(),
+        };
+        assert_eq!(
+            ProbeOutcome::of_error(&refused("HTTP 404: model or endpoint not found (x)")),
+            ProbeOutcome::Unusable
+        );
+        assert_eq!(
+            ProbeOutcome::of_error(&refused("HTTP 400: not a chat model")),
+            ProbeOutcome::Unusable
+        );
+        assert_eq!(
+            ProbeOutcome::of_error(&refused("HTTP 408: request timeout")),
+            ProbeOutcome::Failed
+        );
+        // N1: an account out of credit is not a verdict on the model.
+        for status in [
+            "HTTP 402: insufficient credits",
+            "HTTP 409: conflict",
+            "HTTP 410: gone",
+        ] {
+            assert_eq!(
+                ProbeOutcome::of_error(&refused(status)),
+                ProbeOutcome::Failed,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            ProbeOutcome::of_error(&refused("HTTP 422: unprocessable model")),
+            ProbeOutcome::Unusable
+        );
+        for transient in [
+            ProviderError::RateLimited {
+                retry_after_ms: None,
+            },
+            ProviderError::Overloaded,
+            ProviderError::Unauthorized,
+            ProviderError::unreachable("connection refused"),
+        ] {
+            assert_eq!(ProbeOutcome::of_error(&transient), ProbeOutcome::Failed);
+        }
+    }
+
+    /// Review of #709 (N2): a model the catalogue lists without tools is never reserved,
+    /// by any path.
+    #[test]
+    fn a_model_the_catalogue_lists_without_tools_is_never_reserved() {
+        let policy = ProbePolicy::standard();
+        let mut log = ProbeLog::new();
+        let t0 = std::time::Instant::now();
+        let listed = models(&["plain"]);
+        mark_listed_without_tools(&mut log, "i", &listed);
+        assert_eq!(
+            names(&reserve_probes(
+                &mut log,
+                "i",
+                models(&["plain", "m"]),
+                t0,
+                &policy
+            )),
+            ["m"]
+        );
+        // Even after a failure would have been retried.
+        let later = t0 + policy.max_backoff;
+        assert!(reserve_probes(&mut log, "i", listed.clone(), later, &policy).is_empty());
+        // A probe already running keeps its reservation (its own outcome records).
+        let mut running = ProbeLog::new();
+        let r = reserve_probes(&mut running, "i", listed.clone(), t0, &policy);
+        mark_listed_without_tools(&mut running, "i", &listed);
+        assert!(matches!(
+            running[&("i".to_owned(), "plain".to_owned())],
+            ProbeMark::InFlight { ticket, .. } if ticket == r[0].ticket
+        ));
+    }
+
+    #[test]
+    fn an_abandoned_probe_stops_blocking_after_its_staleness() {
+        let policy = ProbePolicy::standard();
+        let mut log = ProbeLog::new();
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            reserve_probes(&mut log, "i", models(&["m"]), t0, &policy).len(),
+            1
+        );
+        let stale = t0 + policy.in_flight_stale;
+        assert!(!probing(&log, "i", stale, &policy));
+        assert_eq!(
+            reserve_probes(&mut log, "i", models(&["m"]), stale, &policy).len(),
+            1
+        );
+    }
+
+    /// Review of #709 (C5): the old provider's probe ends after a rebuild and a new
+    /// reservation of the same model: it does not write over the new one.
+    #[test]
+    fn a_probe_of_a_forgotten_generation_never_records_over_the_new_one() {
+        let policy = ProbePolicy::standard();
+        let mut log = ProbeLog::new();
+        let t0 = std::time::Instant::now();
+        let old = reserve_probes(&mut log, "i", models(&["m"]), t0, &policy).remove(0);
+        forget_instance(&mut log, "i");
+        record_probe(&mut log, "i", "m", old.ticket, ProbeOutcome::Concluded, t0);
+        assert!(log.is_empty(), "nothing recorded for a forgotten instance");
+        let t1 = t0 + std::time::Duration::from_millis(1);
+        let new = reserve_probes(&mut log, "i", models(&["m"]), t1, &policy).remove(0);
+        record_probe(&mut log, "i", "m", old.ticket, ProbeOutcome::Concluded, t1);
+        assert!(
+            matches!(log[&("i".to_owned(), "m".to_owned())], ProbeMark::InFlight { ticket, .. } if ticket == new.ticket),
+            "{log:?}"
+        );
+        // Its own probe records it.
+        end(&mut log, &new, ProbeOutcome::Failed, t1);
+        assert!(matches!(
+            log[&("i".to_owned(), "m".to_owned())],
+            ProbeMark::Failed { attempts: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn primary_and_shadow_probe_nothing_and_a_tick_list_only_itself() {
+        use LearningStage::*;
+        use ProviderRoutingMode::*;
+        assert_eq!(ProbeScope::for_settings(Primary, Shadow), ProbeScope::None);
+        for (mode, stage) in [(Primary, Auto), (Mixed, Shadow), (Full, Advisory)] {
+            assert_eq!(ProbeScope::for_settings(mode, stage), ProbeScope::All);
+        }
+        let only = ProbeScope::Only(vec![("i".into(), "a".into())]);
+        assert!(only.covers("i", "a"));
+        assert!(!only.covers("i", "b") && !only.covers("j", "a"));
+        assert!(!ProbeScope::None.covers("i", "a"));
     }
 }
