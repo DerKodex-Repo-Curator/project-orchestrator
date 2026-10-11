@@ -9349,6 +9349,7 @@ mod permission_scopes {
             routing_mode: None,
             routing_pool: None,
             capabilities: None,
+            engine: None,
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),

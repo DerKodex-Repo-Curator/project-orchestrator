@@ -66,6 +66,7 @@ fn node(id: Uuid) -> ChatSessionNode {
         provider_id: Some("local".into()),
         routed_by: Some("request".into()),
         capabilities: None,
+        engine: None,
         resume_token: None,
         execution_place: Default::default(),
         access: Default::default(),

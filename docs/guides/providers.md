@@ -33,6 +33,12 @@ The engine is frozen when a conversation opens, like its provider: a conversatio
 the engine it was opened on, whatever `CHAT_PROVIDER_PATH` says now. A conversation opened
 on the historical engine before the switch keeps it, and moving back to `legacy` breaks no
 conversation opened on the agent engine.
+A Claude Code turn cut by a server restart is closed, not resumed at boot: nobody would be
+there to watch the tools it runs. Send the message again.
+
+**Rollback.** `CHAT_PROVIDER_PATH=legacy` applies to new conversations only: the ones already
+opened on the agent engine stay there. Downgrading the server to v0.0.17 needs
+`CHAT_PROVIDER_PATH=agent` for them, or they answer `409 engine_unavailable`.
 
 ## Before the first connection
 
@@ -223,7 +229,7 @@ Two counters: *marginal* (reported or priced: real spend, the only one that can 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHAT_PROVIDER_PATH` | `agent` | `legacy` keeps Claude Code on the historical engine (new conversations only; an unknown value is the default) |
+| `CHAT_PROVIDER_PATH` | `agent` | `legacy` keeps Claude Code on the historical engine (new conversations only; an unknown non-empty value is `legacy`, with a warning) |
 | `CHAT_PROVIDER_ENV_CREDENTIALS` | empty | server variables an instance may name as `env:<VAR>` |
 | `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch: `name: [argv]` or `name: {"argv": [...], "per_session_mcp": false}` |
 | `CHAT_CHILD_ENV_INHERIT` | empty | extra variables handed to agent processes (never the server's own secrets) |

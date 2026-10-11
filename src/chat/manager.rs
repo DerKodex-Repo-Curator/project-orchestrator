@@ -852,6 +852,11 @@ pub struct ChatManager {
     /// The CLI path the built-in Claude Code of the agent engine opens with: the one
     /// `update_claude_cli_path` sets, as the historical engine reads it (M2).
     builtin_cli_path: super::agent_runtime::ClaudeCliPath,
+    /// Whether the restart recovery resumes a cut Claude Code turn of the agent engine.
+    /// `false` on every server (M2, review of #726): unattended, the CLI could run tools
+    /// in `acceptEdits` or `bypassPermissions`, so the turn is closed, as the historical
+    /// engine's always were. Only the recovery tests set it, their fake being `claude-code`.
+    recovery_resumes_claude_code: bool,
     /// The cognitive router (R2), when wired. `None` keeps the declarative
     /// resolution exactly as it was.
     pub(crate) cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
@@ -3128,6 +3133,7 @@ impl ChatManager {
             agent_runtime,
             provider_source,
             builtin_cli_path,
+            recovery_resumes_claude_code: false,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
@@ -3222,6 +3228,7 @@ impl ChatManager {
             agent_runtime,
             provider_source,
             builtin_cli_path,
+            recovery_resumes_claude_code: false,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
@@ -3941,6 +3948,14 @@ impl ChatManager {
     #[cfg(test)]
     pub(crate) fn with_claude_cli_present(mut self, present: bool) -> Self {
         self.claude_cli = super::cli_version::ClaudeCliProbe::Fixed(present);
+        self
+    }
+
+    /// The recovery resumes cut Claude Code turns too: for the recovery tests, whose fake
+    /// provider answers as `claude-code` (the field `recovery_resumes_claude_code`).
+    #[cfg(test)]
+    pub(crate) fn resuming_claude_code_at_boot(mut self) -> Self {
+        self.recovery_resumes_claude_code = true;
         self
     }
 
@@ -6480,6 +6495,16 @@ impl ChatManager {
                 .as_ref()
                 .and_then(|pool| serde_json::to_string(pool).ok()),
             capabilities: None,
+            // Written BEFORE the provider opens (M2): a resume routes on it, whether or not
+            // the capability snapshot (written after the open, non-fatal) reaches the graph.
+            engine: Some(
+                if self.engine_is_agent(&provider_choice.provider_id) {
+                    ChatSessionNode::ENGINE_AGENT
+                } else {
+                    ChatSessionNode::ENGINE_LEGACY
+                }
+                .to_string(),
+            ),
             resume_token: None,
             execution_place: if super::neutral_place::is_neutral_path(&request.cwd) {
                 super::neutral_place::ExecutionPlace::Neutral
@@ -10893,9 +10918,9 @@ impl ChatManager {
         );
         self.ready_for_resume(&mut session_node).await?;
 
-        // A session opened by the agent engine carries its capability snapshot:
-        // it resumes on that engine (`ready_for_resume` checked it is switched on).
-        if session_node.capabilities.is_some() {
+        // The engine is frozen at opening (M2): a session written as opened on the agent
+        // engine resumes there, whether or not its capability snapshot was stored.
+        if session_node.opened_on_agent() {
             return self
                 .resume_agent_session(&session_node, message, user_claims, seen)
                 .await;
@@ -11408,9 +11433,7 @@ impl ChatManager {
             &super::provider::resolver::BuiltinCatalog,
         )
         .map_err(anyhow::Error::new)?;
-        if node.capabilities.is_none()
-            && frozen.provider_id != super::provider::resolver::CLAUDE_CODE
-        {
+        if !node.opened_on_agent() && frozen.provider_id != super::provider::resolver::CLAUDE_CODE {
             return Err(anyhow::Error::new(
                 super::provider::resolver::ResolveError::Unavailable {
                     provider_id: frozen.provider_id,
@@ -11418,7 +11441,7 @@ impl ChatManager {
                 },
             ));
         }
-        // A session of the agent engine (its capability snapshot) resumes there whatever
+        // A session of the agent engine (`ChatSessionNode::opened_on_agent`) resumes there whatever
         // `CHAT_PROVIDER_PATH` says now: the engine is frozen at opening, like the provider.
         Ok(())
     }
@@ -11640,16 +11663,13 @@ impl ChatManager {
                 .context("Failed to list sessions")?;
             let fetched = page.len();
             offset += fetched;
-            // The sessions the agent engine served: it alone stores their provider
-            // snapshot (`finish_agent_open`), Claude Code forced onto it included;
-            // and any other provider than Claude Code (only the agent engine serves
-            // one), in case that snapshot write failed.
-            sessions.extend(page.into_iter().filter(|s| {
-                s.capabilities.is_some()
-                    || s.provider_id
-                        .as_deref()
-                        .is_some_and(|p| p != super::provider::resolver::CLAUDE_CODE)
-            }));
+            // The sessions the agent engine served (`opened_on_agent`: the engine written at
+            // creation, else the snapshot), and any provider other than Claude Code (only the
+            // agent engine serves one), in case neither was written.
+            sessions.extend(
+                page.into_iter()
+                    .filter(|s| s.opened_on_agent() || !s.served_by_claude_code()),
+            );
             if fetched < PAGE {
                 break;
             }
@@ -17509,8 +17529,11 @@ mod tests {
     }
 
     /// M2: the built-in Claude Code of the agent engine opens with the CLI path set NOW
-    /// (`update_claude_cli_path`: the CLI installed or moved at runtime), as the historical
-    /// engine reads it at every opening — not the path the server started with.
+    /// (the cell `update_claude_cli_path` writes: the CLI installed or moved at runtime), as
+    /// the historical engine reads it at every opening — not the path the server started
+    /// with. Only the manager's own cell is written here: no process-global state (that
+    /// `update_claude_cli_path` writes it is asserted in
+    /// `test_runtime_env_config_update_methods`).
     #[tokio::test]
     async fn the_builtin_claude_code_follows_the_cli_path_changed_at_runtime() {
         let state = mock_app_state();
@@ -17522,16 +17545,9 @@ mod tests {
             Arc::ptr_eq(&first, &same),
             "unchanged path: the same provider"
         );
-        manager
-            .update_claude_cli_path(Some("/opt/claude/bin/claude".into()))
-            .await;
-        assert_eq!(
-            manager.builtin_cli_path.read().unwrap().as_deref(),
-            Some("/opt/claude/bin/claude")
-        );
+        *manager.builtin_cli_path.write().unwrap() = Some("/opt/claude/bin/claude".into());
         let moved = manager.provider_source.get(cc).expect("built in");
         assert!(!Arc::ptr_eq(&first, &moved), "rebuilt on the new path");
-        crate::chat::cli_version::set_configured_cli_path(None);
     }
 
     #[tokio::test]
@@ -20462,8 +20478,11 @@ mod tests {
         config.provider_path = crate::chat::config::ProviderPath::Agent;
         tweak(&mut config);
         let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        // The fake answers as `claude-code`, whose cut turns no server resumes by itself
+        // (M2): these tests exercise the resume, so this server does.
         let after = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
-            .with_provider_source(Arc::new(fake.clone()));
+            .with_provider_source(Arc::new(fake.clone()))
+            .resuming_claude_code_at_boot();
         (after, graph, fake, sid)
     }
 
@@ -20622,6 +20641,99 @@ mod tests {
         assert_eq!(fake.state.turns_started.lock().unwrap().len(), 1);
     }
 
+    /// Review of #726, point 3: a cut turn of a Claude Code session of the agent engine is
+    /// CLOSED at boot, as the historical engine's always were — not resumed with nobody
+    /// there (its CLI could run tools in `acceptEdits` or `bypassPermissions`).
+    #[tokio::test]
+    async fn a_cut_claude_code_turn_of_the_agent_engine_is_closed_at_boot_not_resumed() {
+        let (resuming, graph, _fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        // The same server as every other: it does not resume Claude Code at boot.
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        drop(resuming);
+        let node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        assert!(node.opened_on_agent() && node.served_by_claude_code());
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+        let events = events_of(&graph, sid).await;
+        assert_closed_by_recovery(&events);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.data.contains("not resumed without you")),
+            "the reason says why"
+        );
+    }
+
+    /// Review of #726, point 2: the engine is written on the node BEFORE the open. A
+    /// session whose capability snapshot never reached the graph (that write is non-fatal)
+    /// still resumes on the agent engine — it used to fall to legacy with no CLI session,
+    /// and the model lost the conversation.
+    #[tokio::test]
+    async fn a_session_whose_snapshot_write_failed_still_resumes_on_the_agent_engine() {
+        let (manager, graph, fake) = agent_manager();
+        graph
+            .fail_harness_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let sid = manager
+            .create_session(&agent_request("one"))
+            .await
+            .unwrap()
+            .session_id;
+        manager.agent_runtime.close(&sid).await.unwrap();
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(node.capabilities.is_none(), "the snapshot write failed");
+        assert_eq!(node.engine.as_deref(), Some(ChatSessionNode::ENGINE_AGENT));
+        graph
+            .fail_harness_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // A restart, even onto `legacy`.
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let after =
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, test_config())
+                .with_provider_source(Arc::new(fake.clone()));
+        after
+            .resume_session(&sid, "two", None)
+            .await
+            .expect("resumed on the engine it was opened on");
+        assert!(after.agent_runtime.owns(&sid).await, "the agent engine");
+    }
+
+    /// The engine read back: written ones decide; a node from before the field keeps the
+    /// inference of its time (snapshot, or a provider other than Claude Code).
+    #[test]
+    fn the_engine_of_a_session_is_the_one_written_else_legacy_without_a_snapshot() {
+        let mut node = test_chat_session(None);
+        node.engine = Some(ChatSessionNode::ENGINE_AGENT.into());
+        assert!(node.opened_on_agent());
+        node.engine = Some(ChatSessionNode::ENGINE_LEGACY.into());
+        node.capabilities = Some("{}".into());
+        assert!(!node.opened_on_agent(), "the written engine wins");
+        node.engine = None;
+        assert!(node.opened_on_agent(), "pre-M2: a snapshot means agent");
+        node.capabilities = None;
+        node.provider_id = Some("claude-code".into());
+        assert!(
+            !node.opened_on_agent(),
+            "pre-M2: Claude Code without one is legacy"
+        );
+        node.provider_id = Some("local".into());
+        assert!(
+            !node.opened_on_agent(),
+            "pre-M2, no snapshot: legacy (a resume refuses it, provider_unavailable)"
+        );
+    }
+
     /// Finding 9 of #697, M2: the recovery checks what a person's resume checks, and the
     /// engine is frozen at opening. A Claude Code session of the agent engine, after a
     /// restart with `CHAT_PROVIDER_PATH=legacy` (a rollback of the default), is resumed on
@@ -20714,6 +20826,7 @@ mod tests {
             restarted_with_tail(&[("user_message", "{}"), ("tool_use", "{}")]).await;
         let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
         node.capabilities = None;
+        node.engine = Some(ChatSessionNode::ENGINE_LEGACY.to_string());
         graph.create_chat_session(&node).await.unwrap();
         let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
         assert_eq!((pending.len(), scan.closed), (0, 1));
@@ -20737,6 +20850,7 @@ mod tests {
         .await;
         let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
         node.capabilities = None;
+        node.engine = Some(ChatSessionNode::ENGINE_LEGACY.to_string());
         graph.create_chat_session(&node).await.unwrap();
         let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
         assert_eq!((pending.len(), scan.closed), (0, 0));
@@ -20758,6 +20872,7 @@ mod tests {
         .await;
         let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
         node.capabilities = None;
+        node.engine = Some(ChatSessionNode::ENGINE_LEGACY.to_string());
         graph.create_chat_session(&node).await.unwrap();
         let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
         assert_eq!((pending.len(), scan.closed), (0, 0));
@@ -22980,6 +23095,7 @@ mod tests {
             provider_id: None,
             routed_by: None,
             capabilities: None,
+            engine: None,
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -23350,6 +23466,7 @@ mod tests {
             provider_id: None,
             routed_by: None,
             capabilities: None,
+            engine: None,
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -23390,6 +23507,7 @@ mod tests {
             provider_id: None,
             routed_by: None,
             capabilities: None,
+            engine: None,
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -26564,6 +26682,11 @@ mod tests {
             .await;
         let env = manager.get_env_config().await;
         assert_eq!(env.claude_cli_path.as_deref(), Some("/opt/claude"));
+        // ... and the built-in Claude Code of the agent engine opens with it (M2).
+        assert_eq!(
+            manager.builtin_cli_path.read().unwrap().as_deref(),
+            Some("/opt/claude")
+        );
 
         // Update auto_update_cli
         manager.update_auto_update_cli(true).await;

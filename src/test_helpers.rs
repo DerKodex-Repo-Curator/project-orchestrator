@@ -546,6 +546,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         provider_id: None,
         routed_by: None,
         capabilities: None,
+        engine: None,
         resume_token: None,
         execution_place: Default::default(),
         access: Default::default(),

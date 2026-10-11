@@ -1106,6 +1106,15 @@ pub fn setup_claude_code(server_url: Option<String>, port: Option<u16>) -> Claud
                 file_path: None,
                 allowed_tools_configured,
             },
+            // Only the boot variant skips (M1, #722); kept total for the type.
+            SetupResult::SkippedCliAbsent => ClaudeSetupResult {
+                success: false,
+                method: "skipped".into(),
+                message: "Claude Code is not installed on this machine: nothing was configured"
+                    .into(),
+                file_path: None,
+                allowed_tools_configured: false,
+            },
         },
         Err(e) => ClaudeSetupResult {
             success: false,

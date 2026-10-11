@@ -266,19 +266,22 @@ pub enum ProviderPath {
 }
 
 impl ProviderPath {
-    /// `legacy` or `agent` (case-insensitive). Nothing, or anything else, is the
-    /// default (`agent`): a typo never switches the engine away from the default.
+    /// `legacy` or `agent` (case-insensitive). Nothing (or blank) is the default (`agent`).
+    /// Anything else is `legacy`, with a warning: a value was set, so the operator meant to
+    /// choose, and a typo in the opt-out (`legasy`) must not land on the newer engine
+    /// (review of #726, point 4).
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             Some("agent") => Self::Agent,
             Some("legacy") => Self::Legacy,
-            None => Self::default(),
+            None | Some("") => Self::default(),
             Some(other) => {
                 tracing::warn!(
                     value = other,
-                    "unknown CHAT_PROVIDER_PATH (agent or legacy), using the default: agent"
+                    "unknown CHAT_PROVIDER_PATH (agent or legacy): Claude Code stays on the \
+                     historical engine (legacy)"
                 );
-                Self::default()
+                Self::Legacy
             }
         }
     }
@@ -478,13 +481,16 @@ impl Default for ChatConfig {
 mod tests {
     use super::*;
 
-    /// M2: the agent engine is the default; legacy stays selectable; a typo is the default.
+    /// M2: the agent engine is the default; legacy stays selectable; a value set but not
+    /// understood (a typo in the opt-out) is legacy (review of #726, point 4).
     #[test]
-    fn provider_path_defaults_to_agent_legacy_stays_selectable_and_a_typo_never_switches() {
+    fn provider_path_defaults_to_agent_and_an_unknown_value_is_legacy() {
         assert_eq!(ProviderPath::parse(None), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some("  ")), ProviderPath::Agent);
         assert_eq!(ProviderPath::parse(Some(" LEGACY ")), ProviderPath::Legacy);
         assert_eq!(ProviderPath::parse(Some("agent")), ProviderPath::Agent);
-        assert_eq!(ProviderPath::parse(Some("legasy")), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some("legasy")), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::parse(Some("agnet")), ProviderPath::Legacy);
         assert_eq!(ProviderPath::default().as_str(), "agent");
         assert_eq!(ChatConfig::default().provider_path, ProviderPath::Agent);
     }

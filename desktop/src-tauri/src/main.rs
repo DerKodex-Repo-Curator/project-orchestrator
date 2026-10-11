@@ -408,8 +408,11 @@ fn main() {
                 let server_started = Arc::new(AtomicBool::new(false));
                 let server_started_clone = server_started.clone();
 
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new()
+                // The server's own runtime and stack (`runtime::RUNTIME_STACK_BYTES`): a bare
+                // `Runtime::new()` gives 2 MiB workers, and `block_on` polls the server on
+                // this thread, which needs the same stack (a chat turn overflowed 2 MiB).
+                project_orchestrator::runtime::spawn_with_runtime_stack("po-server", move || {
+                    let rt = project_orchestrator::runtime::build_runtime()
                         .expect("Failed to create tokio runtime");
                     rt.block_on(async {
                         // Signal that the runtime is up and server is about to start
@@ -418,7 +421,8 @@ fn main() {
                             tracing::error!("Server error: {}", e);
                         }
                     });
-                });
+                })
+                .expect("Failed to start the server thread");
 
                 // Wait for the tokio runtime to start
                 while !server_started.load(Ordering::SeqCst) {

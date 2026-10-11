@@ -2111,8 +2111,8 @@ fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let (cc, na) = Box::pin(the_scenario(ProviderPath::Legacy)).await;
-                    let (cca, _) = Box::pin(the_scenario(ProviderPath::Agent)).await;
+                    let (cc, na) = run_naming_the_column(ProviderPath::Legacy).await;
+                    let (cca, _) = run_naming_the_column(ProviderPath::Agent).await;
                     gate(&[
                         (Engine::ClaudeCode, &cc),
                         (Engine::ClaudeCodeAgent, &cca),
@@ -2123,6 +2123,30 @@ fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         .unwrap()
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+/// One run of the scenario; a run that panics says WHICH run (the Claude Code column it
+/// measures), so a failure on CI names its engine (review of #726).
+async fn run_naming_the_column(path: ProviderPath) -> (Measures, Measures) {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(Box::pin(the_scenario(path)))
+        .catch_unwind()
+        .await
+    {
+        Ok(measures) => measures,
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let column = match path {
+                ProviderPath::Legacy => Engine::ClaudeCode.label(),
+                ProviderPath::Agent => Engine::ClaudeCodeAgent.label(),
+            };
+            panic!("parity run with Claude Code as « {column} » ({path:?}) failed: {why}");
+        }
+    }
 }
 
 /// The body of [`the_same_scenario_on_both_engines_gives_the_parity_matrix`], with Claude

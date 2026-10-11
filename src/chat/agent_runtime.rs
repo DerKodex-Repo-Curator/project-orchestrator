@@ -1563,8 +1563,34 @@ impl AgentSessionHandle {
         let mark = self
             .tool_clock
             .decided(request_id, allow, chrono::Utc::now());
+        // The grant covers, from now on, the requests that arrive while the provider takes
+        // the answer: a CLI asks the identical call again as soon as it has it, before
+        // `answer_permission` returns here (measured on CI, review of #726). Kept for good
+        // once delivered, dropped if the provider refuses the answer.
+        if let Some(grant) = &grant {
+            let mut grants = self
+                .session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if scope == PermissionAnswerScope::Always && for_good {
+                grants.begin_lasting(grant.clone());
+            } else {
+                grants.begin_pending(grant.clone());
+            }
+        }
         if let Err(e) = self.session.answer_permission(request_id, decision).await {
             self.tool_clock.undecided(request_id, mark);
+            if let Some(grant) = &grant {
+                let mut grants = self
+                    .session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if scope == PermissionAnswerScope::Always && for_good {
+                    grants.abort_lasting(grant);
+                } else {
+                    grants.end_pending(grant, false);
+                }
+            }
             return Err(PermissionDeliveryError::Failed(anyhow::Error::new(e)));
         }
         drop(answering);
@@ -1573,11 +1599,10 @@ impl AgentSessionHandle {
         match (&grant, &asked, scope) {
             (Some(grant), Some(call), PermissionAnswerScope::Always) if for_good => {
                 let place = {
-                    let mut grants = self
+                    let grants = self
                         .session_grants
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    grants.begin_lasting(grant.clone());
                     // The shell may have moved since: then nothing is written.
                     (!grants.cwd_bound(call))
                         .then(|| grants.lasting_scope())
@@ -1600,7 +1625,7 @@ impl AgentSessionHandle {
                 self.session_grants
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .add(grant.clone())
+                    .end_pending(grant, true)
             }
             (None, _, _) => {}
         }
@@ -2879,6 +2904,89 @@ mod adopt_tests {
             1,
             "listed once, whatever the caller passes"
         );
+    }
+
+    /// Review of #726 (CI): a CLI asks the identical call again as soon as it has the first
+    /// answer, BEFORE `answer_permission` returns to the engine. A `session` grant must
+    /// already cover it then — it was kept only once the answer returned, so the second
+    /// request waited for a person who had already answered (the CLI then hung).
+    #[tokio::test]
+    async fn the_identical_call_asked_while_the_session_answer_is_delivered_is_covered() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let handle = runtime
+            .adopt(
+                "native-race",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let mut rx = handle.events_tx.subscribe();
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        handle.emit(write("write-1")).await;
+        // The provider takes the answer, and does not return yet.
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_answers.lock().unwrap() = Some(Arc::clone(&hold));
+        let answering = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                handle
+                    .answer_permission_scoped("write-1", true, PermissionAnswerScope::Session)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Meanwhile the CLI asks the identical call.
+        let second = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.emit(write("write-2")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        *provider.state.hold_answers.lock().unwrap() = None;
+        hold.notify_waiters();
+        answering
+            .await
+            .unwrap()
+            .expect("the first answer is delivered");
+        second.await.unwrap();
+        let answered: Vec<String> = provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert!(
+            answered.contains(&"write-2".to_string()),
+            "the backend answered the identical call: {answered:?}"
+        );
+        let mut decided_by_backend = false;
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::PermissionDecision {
+                id, rule: Some(_), ..
+            } = &event
+            {
+                decided_by_backend |= id == "write-2";
+            }
+        }
+        assert!(decided_by_backend, "permission_decision with its rule");
     }
 
     /// The review of #681 (finding 1): Codex asks a patch with `{reason}` only (nexus
