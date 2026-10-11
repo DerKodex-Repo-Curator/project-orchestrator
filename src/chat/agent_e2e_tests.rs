@@ -11948,16 +11948,28 @@ mod native_subagents {
 
     /// A native parent session opened in `mode`; every child plays `child_turn`.
     async fn rig(child_turn: Vec<Step>, mode: &str) -> Rig {
-        rig_with(child_turn, mode, 0, 0).await
+        rig_with(child_turn, mode, 0, 0, None).await
     }
 
     async fn rig_slow(child_turn: Vec<Step>, mode: &str, open_ms: u64) -> Rig {
-        rig_with(child_turn, mode, open_ms, 0).await
+        rig_with(child_turn, mode, open_ms, 0, None).await
+    }
+
+    /// [`rig`], the parent opened inside the workspace `ws` (its only project is the
+    /// parent's own, so its resolved `add_dirs` starts out empty — P18b, fix 1).
+    async fn rig_in_workspace(child_turn: Vec<Step>, mode: &str, ws: &str) -> Rig {
+        rig_with(child_turn, mode, 0, 0, Some(ws)).await
     }
 
     /// [`rig`], the provider taking `open_ms` to open a session and `turn_ms` to accept its
-    /// first turn.
-    async fn rig_with(child_turn: Vec<Step>, mode: &str, open_ms: u64, turn_ms: u64) -> Rig {
+    /// first turn, and the parent opened inside `workspace` when given.
+    async fn rig_with(
+        child_turn: Vec<Step>,
+        mode: &str,
+        open_ms: u64,
+        turn_ms: u64,
+        workspace: Option<&str>,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let mut project = crate::test_helpers::test_project();
@@ -11966,6 +11978,15 @@ mod native_subagents {
         crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
             &project,
         ));
+        if let Some(ws_slug) = workspace {
+            let mut ws = crate::test_helpers::test_workspace();
+            ws.slug = ws_slug.to_string();
+            graph.create_workspace(&ws).await.unwrap();
+            graph
+                .add_project_to_workspace(ws.id, project.id)
+                .await
+                .unwrap();
+        }
         let state = mock_app_state();
         let dyn_graph: Arc<dyn GraphStore> = graph.clone();
         let config = super::super::config::ChatConfig {
@@ -11998,6 +12019,7 @@ mod native_subagents {
         let mut req = request(None, Some(&project.slug), mode);
         req.message = String::new();
         req.cwd = project.root_path.clone();
+        req.workspace_slug = workspace.map(str::to_string);
         let parent = manager.create_session(&req).await.unwrap().session_id;
         Rig {
             manager,
@@ -12195,7 +12217,7 @@ mod native_subagents {
     /// child ran on for ever.
     #[tokio::test]
     async fn a_call_cancelled_while_the_child_opens_still_closes_it() {
-        let r = Arc::new(rig_with(vec![Step::AwaitInterrupt], "default", 0, 2_000).await);
+        let r = Arc::new(rig_with(vec![Step::AwaitInterrupt], "default", 0, 2_000, None).await);
         let call = {
             let r = r.clone();
             tokio::spawn(async move { r.run("c0").await })
@@ -12240,6 +12262,74 @@ mod native_subagents {
             .unwrap()
             .get(&r.parent)
             .is_none());
+    }
+
+    /// P18b round 2, fix 2: the slot must stay taken for as long as the child the spawned
+    /// `open_wait_close` task is still opening — not just for as long as `run_subagent`'s
+    /// own future, which the caller can abort well before the provider's `open` even
+    /// returns. `open_ms` (not `turn_ms`) delays specifically that path: the child's session
+    /// node is persisted but the provider has not even been asked to open it yet when the
+    /// call is aborted.
+    ///
+    /// Red before the fix: `_slot` lived in `run_subagent`'s own frame, so aborting it freed
+    /// the slot immediately, while the spawned task was still stuck inside `create_session`
+    /// with the child nowhere near closed — a concurrent call could then take a slot that,
+    /// for a little longer, was still really in use.
+    #[tokio::test]
+    async fn the_slot_stays_taken_until_the_cancelled_childs_task_actually_closes_it() {
+        let r = Arc::new(rig_slow(vec![Step::AwaitInterrupt], "default", 2_000).await);
+        let call = {
+            let r = r.clone();
+            tokio::spawn(async move { r.run("c0").await })
+        };
+        // The child's session node is persisted (`create_session_in_place`) well before the
+        // provider's `open` returns: catch the call here, node up but not yet live.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r.children().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child's node never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_id = r.children().await[0].id.to_string();
+        assert!(
+            !r.manager.agent_runtime.owns(&child_id).await,
+            "the child must not be live yet: this is the window the slot now spans"
+        );
+        call.abort();
+        // Right after the abort: `run_subagent`'s own frame is gone, but the spawned task
+        // is still stuck inside `create_session`'s multi-second provider `open`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            r.manager
+                .subagent_slots
+                .lock()
+                .unwrap()
+                .get(&r.parent)
+                .copied(),
+            Some(1),
+            "the slot must still be taken: the child this task owns is not yet even live"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_some()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot was never freed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !r.manager.agent_runtime.owns(&child_id).await,
+            "the slot frees only once the child this task owns is actually closed"
+        );
     }
 
     /// P18b, fix 3: after a restart, the child of an `Agent` call is NOT resumed. Its
@@ -12358,6 +12448,63 @@ mod native_subagents {
             .expect("the parent must not wait for its turn timeout")
             .unwrap();
         assert_eq!(out, Ok("LATE-ANSWER".to_string()));
+    }
+
+    /// P18b round 2, fix 1: the parent opens inside a workspace whose only project is its
+    /// own (so its resolved `add_dirs` is empty — nothing to freeze yet); project B then
+    /// joins the workspace. A sub-agent spawned afterwards does not get B's root, although
+    /// the envelope's `add_dirs` check alone would pass (the child's raw `add_dirs` is
+    /// still `None`, same as the parent's). The same clamp guards a `chat(send_message)`
+    /// child, not just the `Agent` tool. Red before the fix: `resolve_add_dirs` re-read the
+    /// workspace's CURRENT membership at child-creation time, which by then included B.
+    #[tokio::test]
+    async fn a_project_added_to_the_workspace_after_the_parent_opened_does_not_widen_its_child() {
+        let r = rig_in_workspace(answer("CHILD-ANSWER"), "default", "ws-widen").await;
+
+        // Project B joins the workspace only after the parent is already open.
+        let mut b = crate::test_helpers::test_project_named("project-b");
+        b.root_path = "/tmp/project-b-root".into();
+        r.graph.create_project(&b).await.unwrap();
+        let ws = r
+            .graph
+            .get_workspace_by_slug("ws-widen")
+            .await
+            .unwrap()
+            .unwrap();
+        r.graph.add_project_to_workspace(ws.id, b.id).await.unwrap();
+
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        let agent_child_dirs = children[0].add_dirs.clone().unwrap_or_default();
+        assert!(
+            !agent_child_dirs.iter().any(|d| d.contains("project-b")),
+            "an Agent-tool child must not see project B, added after the parent opened: {agent_child_dirs:?}"
+        );
+
+        // The same clamp protects a `chat(send_message)` child: both paths end in
+        // `create_session_in_place`.
+        let parent = r.parent_node().await;
+        let mut req = request(None, parent.project_slug.as_deref(), "default");
+        req.message = "also widened?".into();
+        req.cwd = parent.cwd.clone();
+        req.workspace_slug = parent.workspace_slug.clone();
+        req.spawned_by = Some(crate::chat::envelope::conversation_spawned_by(
+            r.parent_uuid(),
+        ));
+        let plain_child = r.manager.create_session(&req).await.unwrap().session_id;
+        let plain_node = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&plain_child).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let plain_dirs = plain_node.add_dirs.clone().unwrap_or_default();
+        assert!(
+            !plain_dirs.iter().any(|d| d.contains("project-b")),
+            "a chat(send_message) child must not see project B either: {plain_dirs:?}"
+        );
+        let _ = r.manager.close_session(&plain_child).await;
     }
 }
 
