@@ -165,6 +165,9 @@ impl ToolClock {
     pub(crate) async fn answering(&self, request_id: &str) -> Answering<'_> {
         let lock = {
             let mut answers = self.answers.lock().unwrap_or_else(|e| e.into_inner());
+            // An entry only the map holds is held and awaited by no one: left by an
+            // answer dropped while it waited (a client that went away), it goes here.
+            answers.retain(|_, lock| Arc::strong_count(lock) > 1);
             Arc::clone(answers.entry(request_id.to_string()).or_default())
         };
         Answering {
@@ -586,6 +589,26 @@ mod tests {
             .await
             .expect("the second answer goes once the first is handed over")
             .unwrap();
+        assert!(clock.answers.lock().unwrap().is_empty(), "no entry left");
+    }
+
+    /// An answer dropped while it waited (its client went away) leaves no entry behind
+    /// once another answer comes.
+    #[tokio::test]
+    async fn an_answer_dropped_while_it_waits_leaves_no_entry() {
+        let clock = Arc::new(ToolClock::default());
+        let first = clock.answering("r").await;
+        let waiting = {
+            let clock = Arc::clone(&clock);
+            tokio::spawn(async move {
+                let _second = clock.answering("r").await;
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(first);
+        waiting.abort();
+        let _ = waiting.await;
+        drop(clock.answering("x").await);
         assert!(clock.answers.lock().unwrap().is_empty(), "no entry left");
     }
 

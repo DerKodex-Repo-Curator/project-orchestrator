@@ -28378,4 +28378,69 @@ mod granted_answer_clock_tests {
         let t = timing(&clock);
         assert_eq!(t["permission_outcome"], "denied", "{t}");
     }
+
+    /// The CLI is slow to take a first answer (its stdin is full): a second strict
+    /// answer to the same request waits for it instead of being told `NotPending`, and
+    /// claims the request given back when the first write fails.
+    #[tokio::test]
+    async fn a_second_answer_waits_for_the_first_write_and_claims_a_failed_one() {
+        let state = crate::test_helpers::mock_app_state();
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            test_support::chat_config(),
+        ));
+        let sid = uuid::Uuid::new_v4().to_string();
+        let client = nexus_claude::InteractiveClient::new(nexus_claude::ClaudeCodeOptions {
+            model: Some("test".into()),
+            cli_path: Some("/nonexistent/claude".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (stdin_rx, _queue) =
+            test_support::insert_session_with_client(&manager, &sid, client, false, &["req-1"])
+                .await
+                .unwrap();
+        let stdin_tx = manager.active_sessions.read().await[&sid]
+            .stdin_tx
+            .clone()
+            .unwrap();
+        while stdin_tx.try_send("filler".into()).is_ok() {}
+        let answer = |allow: bool| {
+            let manager = Arc::clone(&manager);
+            let sid = sid.clone();
+            tokio::spawn(async move {
+                manager
+                    .send_permission_response_inner(
+                        &sid,
+                        "req-1",
+                        allow,
+                        crate::chat::types::PermissionAnswerScope::Once,
+                        true,
+                    )
+                    .await
+            })
+        };
+        let first = answer(true);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = answer(false);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!first.is_finished(), "the first write is blocked");
+        assert!(
+            !second.is_finished(),
+            "the second answer waits for the first write, not NotPending"
+        );
+        // The CLI is gone: the first write fails and gives the request back.
+        drop(stdin_rx);
+        let first = first.await.unwrap();
+        assert!(
+            matches!(first, Err(PermissionDeliveryError::Failed(_))),
+            "{first:?}"
+        );
+        let second = second.await.unwrap();
+        assert!(
+            matches!(second, Err(PermissionDeliveryError::Failed(_))),
+            "the second claimed the request given back (its write fails too): {second:?}"
+        );
+    }
 }

@@ -243,6 +243,9 @@ pub(crate) fn spawn_oob_listener(
                                 tokio::time::sleep(lag).await;
                             }
                             let message = ChatManager::mask_cli_message(message);
+                            // When the message arrived: the end of a call it ends, before its
+                            // output is persisted and published (`clock_oob_message`).
+                            let arrived_at = Utc::now();
                             // A message before a `result` that a turn already read belongs
                             // to a finished turn, whatever `is_streaming` says now
                             // (`ResultCursor`): never background output.
@@ -301,7 +304,7 @@ pub(crate) fn spawn_oob_listener(
                             .await;
                             // A call of a background sub-agent that ends between two
                             // turns: no turn times it, this listener does (`tool_clock`).
-                            for timing in clock_oob_message(&tool_clock, &message) {
+                            for timing in clock_oob_message(&tool_clock, &message, arrived_at) {
                                 emit_oob_timing(
                                     &session_id,
                                     session_uuid,
@@ -342,9 +345,13 @@ pub(crate) fn spawn_oob_listener(
 /// `tool_result` blocks are observed (a sub-agent's call announced or ended between
 /// turns), and the timings of the calls they end are returned. A result whose call
 /// the clock no longer holds (a background Bash or Monitor of an ended turn) gives
-/// none.
-fn clock_oob_message(clock: &super::tool_clock::ToolClock, message: &Message) -> Vec<ChatEvent> {
-    let at = Utc::now();
+/// none. `at`: when the message arrived, the end of the calls it ends (taken before
+/// its output is persisted and published).
+fn clock_oob_message(
+    clock: &super::tool_clock::ToolClock,
+    message: &Message,
+    at: chrono::DateTime<Utc>,
+) -> Vec<ChatEvent> {
     ChatManager::message_to_events(message)
         .iter()
         .filter(|event| {
@@ -1422,11 +1429,13 @@ mod tests {
 
     /// A background sub-agent's call, announced during the turn that launched it,
     /// ends between two turns: the listener times it (persisted and broadcast after
-    /// its background output).
+    /// its background output), its end taken when the result arrived, not after a
+    /// slow persistence of its output.
     #[tokio::test]
     async fn a_sub_agent_call_that_ends_between_turns_is_timed() {
         let (mut events_rx, graph, handle, cancel, sid) =
             spawn_listener_with_mock_transport().await;
+        graph.stall_chat_events("background_output");
         let clock = crate::chat::tool_clock::ToolClock::for_session(&sid.to_string());
         let started = Utc::now();
         clock.observe(
@@ -1465,11 +1474,18 @@ mod tests {
                 parent_tool_use_id: Some("task-1".into()),
             })
             .expect("inject the sub-agent's result");
+        let sent_at = Utc::now();
+        // The output's persistence is slow; the timing waits behind it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        graph.release_chat_events("background_output");
 
-        let timing = tokio::time::timeout(Duration::from_millis(500), async {
+        let ended_at = tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 match events_rx.recv().await {
-                    Ok(ChatEvent::ToolTiming { id, .. }) => return id,
+                    Ok(ChatEvent::ToolTiming { id, ended_at, .. }) => {
+                        assert_eq!(id, "sub-1");
+                        return ended_at;
+                    }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => panic!("closed"),
                 }
@@ -1477,7 +1493,12 @@ mod tests {
         })
         .await
         .expect("a tool_timing between turns");
-        assert_eq!(timing, "sub-1");
+        let sent = crate::api::ws_chat_handler::wire_seconds(sent_at);
+        assert!(
+            ended_at < sent + 0.2,
+            "the end is when the result arrived ({ended_at}), not after the persistence (sent {sent})"
+        );
+
         let stored = graph.get_chat_events(sid, 0, 50).await.unwrap();
         let types: Vec<&str> = stored.iter().map(|r| r.event_type.as_str()).collect();
         assert_eq!(

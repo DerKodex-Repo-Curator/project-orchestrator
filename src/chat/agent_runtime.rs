@@ -4016,6 +4016,113 @@ mod tool_timing_tests {
         assert_eq!(taken, "allowed", "the first answer is the one handed over");
     }
 
+    /// The backend answers a request a session grant covers, the provider is slow to
+    /// take that allow, and the user denies the same request meanwhile: the deny waits
+    /// for the backend's answer, so the clock's outcome is the one the provider took.
+    #[tokio::test]
+    async fn a_user_answer_waits_for_the_backend_answer_to_a_covered_request() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "local",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        let write = |id: &str, call: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: Some(call.to_string()),
+        };
+        handle.emit(write("write-1", "t1")).await;
+        handle
+            .answer_permission_scoped("write-1", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t2".into(),
+                tool: "mcp__nexus__Write".into(),
+                input: json!({ "file_path": "a.txt", "content": "x" }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_allows.lock().unwrap() = Some(Arc::clone(&hold));
+        let covered = {
+            let handle = Arc::clone(&handle);
+            let request = write("write-2", "t2");
+            tokio::spawn(async move { handle.emit(request).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let deny = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("write-2", false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        hold.notify_one();
+        covered.await.unwrap();
+        let _ = deny.await.unwrap();
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t2".into(),
+                result: json!("written"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+
+        let taken: Vec<_> = provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "write-2")
+            .map(|(_, d)| d.clone())
+            .collect();
+        assert_eq!(taken.len(), 1, "one answer taken: {taken:?}");
+        let taken = match &taken[0] {
+            PermissionDecision::Allow { .. } => "allowed",
+            PermissionDecision::Deny { .. } => "denied",
+            other => panic!("an answer of another kind: {other:?}"),
+        };
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let decisions = stored
+            .iter()
+            .filter(|r| r.event_type == "permission_decision" && r.data.contains("write-2"))
+            .count();
+        assert_eq!(decisions, 1, "one decision for the request");
+        let timing = stored
+            .iter()
+            .find(|r| r.event_type == "tool_timing" && r.data.contains("\"t2\""))
+            .expect("a timing");
+        let timing: serde_json::Value = serde_json::from_str(&timing.data).unwrap();
+        assert_eq!(timing["permission_outcome"], taken, "{timing}");
+        assert_eq!(
+            taken, "allowed",
+            "the backend's answer was handed over first"
+        );
+    }
+
     /// A double click (or two tabs): the provider refuses the second answer to the
     /// same request. Its failure must not erase the first answer from the clock.
     #[tokio::test]
