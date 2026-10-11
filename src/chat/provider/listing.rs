@@ -265,9 +265,9 @@ pub fn assemble(
                 .map(|p| p.id.clone())
         })
         .or_else(|| {
-            let mut sole = providers.iter().filter(|p| {
-                !p.builtin && p.remote.is_none() && usable_here.iter().any(|u| *u == p.id)
-            });
+            let mut sole = providers
+                .iter()
+                .filter(|p| !p.builtin && p.remote.is_none() && usable_here.contains(&p.id));
             match (sole.next(), sole.next()) {
                 (Some(only), None) => Some(only.id.clone()),
                 _ => None,

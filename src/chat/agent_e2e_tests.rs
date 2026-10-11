@@ -361,7 +361,7 @@ async fn without_consent_nothing_reaches_the_endpoint() {
         .await
         .unwrap_err();
     assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
-    // No project at all: claude-code only.
+    // No project, and nothing allowed for the chats outside one (B3).
     let err = manager
         .create_session(&request(Some("local"), None, "default"))
         .await

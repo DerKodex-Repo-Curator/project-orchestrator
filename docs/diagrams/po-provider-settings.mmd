@@ -43,6 +43,8 @@ flowchart TD
 
     subgraph consent["Consentement par projet"]
         CONSENT["✅ PUT /api/projects/{slug}/llm-consent[s][/id] : l'origine montrée doit être l'actuelle (409 origin_mismatch) ; enregistre qui, quand, quelle origine ET quelle référence ; DELETE retire<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes, changing_the_credential_reference_after_consent_stops_the_sending"]
+        NOPROJ["✅ M1/B3 — GET/PUT /api/chat/llm-consents, PUT/DELETE /api/chat/llm-consents/{provider_id} : le consentement des chats HORS de tout projet (portée no_project) ;<br/>mêmes règles que celui d'un projet (put_consent / delete_consent partagés : humain seulement — middleware + require_human —, instance connue, claude-code refusé 400, origine montrée = actuelle sinon 409 origin_mismatch,<br/>lié à l'origine ET à la référence d'identifiant) ; un projet n'en hérite jamais ; allowed_here(portée) sert le default_provider du listing<br/>test : the_consent_for_chats_outside_a_project_follows_the_same_rules, agent_token_cannot_mutate_human_only_routes (middleware)"]
+        CONSENT --> NOPROJ
     end
 
     subgraph routing["Rôles, alias, politique"]
