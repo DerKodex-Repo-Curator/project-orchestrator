@@ -1258,6 +1258,34 @@ mod cognitive_routing {
         Value::Array(routes)
     }
 
+    /// `script` with every probe answered after `delay_ms`.
+    fn slow(mut script: Value, delay_ms: u64) -> Value {
+        for route in script.as_array_mut().unwrap() {
+            if route["method"] == "POST" {
+                route["delay_ms"] = json!(delay_ms);
+            }
+        }
+        script
+    }
+
+    /// `script` with `model` listed and refused by the endpoint itself (a 404, like an
+    /// embeddings model behind `/chat/completions`).
+    fn refusing(mut script: Value, model: &str) -> Value {
+        let routes = script.as_array_mut().unwrap();
+        routes.insert(
+            0,
+            json!({"method": "POST", "path": "/v1/chat/completions", "status": 404,
+                "body_contains": format!("\"model\":\"{model}\""),
+                "body": {"error": {"message": format!("{model} is not a chat model")}}}),
+        );
+        let models = routes.last_mut().unwrap();
+        models["body"]["data"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": model, "context_length": 32000}));
+        script
+    }
+
     /// A manager wired to the router over one instance (`local`, default model `m`)
     /// served by `routes`, with no session opened before: nothing is probed yet.
     async fn unwarmed(
@@ -1299,6 +1327,16 @@ mod cognitive_routing {
             .filter(|r| r["body"].to_string().contains("Call the ping tool now"))
             .filter_map(|r| r["body"]["model"].as_str().map(str::to_owned))
             .collect()
+    }
+
+    /// Probes the router has running on `local` now.
+    fn running_probes(s: &Setup) -> usize {
+        use crate::chat::provider::cognitive::decider::ProbeMark;
+        let routing = s.manager.cognitive_routing().unwrap();
+        let log = routing.probed.lock().unwrap();
+        log.iter()
+            .filter(|((id, _), mark)| id == "local" && matches!(mark, ProbeMark::InFlight { .. }))
+            .count()
     }
 
     fn with_tools(
@@ -1443,6 +1481,115 @@ mod cognitive_routing {
             "nothing is left to probe: {:?}",
             probes_sent(&s)
         );
+    }
+
+    /// Review of #709 (C1): slow probes never hold the opening (or a turn) longer than
+    /// the pool's short wait, and no more than the instance's budget is sent.
+    #[tokio::test]
+    async fn slow_probes_do_not_hold_the_opening_and_stay_within_the_budget() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            slow(catalogue_script(&["m", "a", "b", "c", "d"], &[]), 5_000),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        s.manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), None)
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(2_500), "{took:?}");
+        assert_eq!(
+            running_probes(&s),
+            3,
+            "the default and two more, still running"
+        );
+        let sent = probes_sent(&s);
+        assert!(sent.len() <= 3, "{sent:?}");
+    }
+
+    /// Review of #709 (C2): two builds at once share the instance's budget.
+    #[tokio::test]
+    async fn concurrent_builds_share_the_instance_budget() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            slow(
+                catalogue_script(&["m", "a", "b", "c", "d", "e"], &[]),
+                3_000,
+            ),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let _ = tokio::join!(
+            s.manager.routing_pool_for(Some("proj")),
+            s.manager.routing_pool_for(Some("proj"))
+        );
+        // The probes take 3 s, each build waited 1.5 s: all are still running. Read from
+        // the router's own log (the fake's log can lose concurrent lines before nexus#90).
+        assert_eq!(running_probes(&s), 3);
+    }
+
+    /// Review of #709 (C3): a model the endpoint refuses (404, not a chat model) is an
+    /// answer: asked once, never again, even with no retry delay.
+    #[tokio::test]
+    async fn a_model_the_endpoint_refuses_is_asked_once_and_never_again() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let policy = ProbePolicy {
+            per_instance: 1,
+            retry_after: Duration::ZERO,
+            ..ProbePolicy::standard()
+        };
+        let s = unwarmed(
+            refusing(catalogue_script(&["m"], &[]), "embed"),
+            "full",
+            "auto",
+            policy,
+        )
+        .await;
+        for _ in 0..2 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        let asked = |s: &Setup| probes_sent(s).iter().filter(|m| *m == "embed").count();
+        let first = asked(&s);
+        assert!((1..=2).contains(&first), "{:?}", probes_sent(&s));
+        for _ in 0..3 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        assert_eq!(asked(&s), first, "{:?}", probes_sent(&s));
+    }
+
+    /// Review of #709 (C4a): a conversation in Auto under `primary` + `shadow` has every
+    /// model of its provider probed after it opens, not only the first budget's worth.
+    #[tokio::test]
+    async fn a_conversation_in_auto_gets_every_model_of_its_provider_probed() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "a", "b", "c", "d"], &[]),
+            "primary",
+            "shadow",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let mut auto = pilot_request();
+        auto.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Full);
+        s.manager
+            .resolve_provider_choice_for(&auto, Some("proj"), None)
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        let mut known = Vec::new();
+        for _ in 0..100 {
+            known = with_tools(&s.manager.routing_pool_known(Some("proj")).await);
+            if known.len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(known, ["a", "b", "c", "d", "m"]);
     }
 
     /// A report on the routing reads the pool without spending a request.
