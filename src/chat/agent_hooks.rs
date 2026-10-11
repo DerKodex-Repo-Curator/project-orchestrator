@@ -566,6 +566,21 @@ impl TurnRouter {
             .map(|(_, decision)| decision)
     }
 
+    /// The conversation reached this session by a provider move (`moved_in`): its relayed
+    /// turn (0) runs on the pair the move chose, which is a change of model, recorded with
+    /// the class of that turn's message (set just before, [`Self::set_last_message`]). Turn 1
+    /// of the same class is then steady (R-S3, [`held_by_class`]), on top of being decided
+    /// on this provider only.
+    pub(crate) fn seed_relayed_turn(&self) {
+        if !self.moved_in.load(Ordering::SeqCst) {
+            return;
+        }
+        let class = self.signature().arm_key();
+        let mut state = locked(&self.state);
+        let model = state.current_model.clone();
+        record_change(&mut state, 0, &model, class);
+    }
+
     /// An applied change that could not be sent: the model did not change.
     pub(crate) fn forget_change(&self, model_before: &str) {
         let mut state = locked(&self.state);
@@ -621,14 +636,16 @@ fn settings_for(routing: &RoutingSettings, apply: bool) -> RoutingSettings {
     settings
 }
 
-/// The per-class guard of turn `turn` (R-S3): the PREVIOUS turn changed the model, and it
-/// was of the same class as this one.
+/// The per-class guard of turn `turn` (R-S3): the PREVIOUS turn changed the model (a
+/// provider move included: the relayed turn is a change, [`TurnRouter::seed_relayed_turn`]),
+/// and it was of the same class as this one.
 ///
 /// There is no "never two changes in a row" any more: a conversation that alternates a
 /// simple question and a heavy task is routed on the turn itself, not one turn late. A turn
-/// of ANOTHER class than the change is routed as any turn. A turn of the SAME class is
-/// decided without exploration ([`guarded`]): the decider keeps the pair in force unless a
-/// challenger beats it by [`HYSTERESIS_MARGIN`], so the margin alone prevents a flip-flop.
+/// of ANOTHER class than the change is routed as any turn. A turn of the SAME class is a
+/// steady decision ([`narrow`]): no exploration, and the decider keeps the pair in force
+/// unless a challenger beats it by [`HYSTERESIS_MARGIN`] on its posterior MEAN — a bound
+/// that does not depend on the draws, so two same-class turns never go A → B → A.
 fn held_by_class(state: &TurnState, turn: u32, class: &str) -> bool {
     state
         .last_change_turn
@@ -636,13 +653,24 @@ fn held_by_class(state: &TurnState, turn: u32, class: &str) -> bool {
         && state.last_change_class.as_deref() == Some(class)
 }
 
-/// `settings` for a turn [`held_by_class`]: no exploration draw, so only a challenger that
-/// clears the hysteresis margin replaces the pair the previous turn chose for this class.
-fn guarded(mut settings: RoutingSettings, held: bool) -> RoutingSettings {
+/// Reason suffix of a turn [`held_by_class`].
+pub(crate) const SAME_CLASS_NO_EXPLORE: &str = "same_class_no_explore";
+/// Reason suffix of the turn right after a provider move (no second move in a row).
+pub(crate) const AFTER_PROVIDER_MOVE: &str = "after_provider_move";
+
+/// Narrows `request` by the R-S3 guards, and says so in the reason it will be stored with:
+/// a turn [`held_by_class`] is steady (no exploration, hysteresis on the posterior means);
+/// the turn right after a provider move is decided among this provider's models only.
+fn narrow(request: &mut DecideRequest, held: bool, after_move: Option<&str>) {
     if held {
-        settings.exploration_epsilon = 0.0;
+        request.settings.exploration_epsilon = 0.0;
+        request.steady = true;
+        request.narrowed.push(SAME_CLASS_NO_EXPLORE);
     }
-    settings
+    if let Some(provider) = after_move {
+        request.restrict_provider = Some(provider.to_owned());
+        request.narrowed.push(AFTER_PROVIDER_MOVE);
+    }
 }
 
 /// Records a change of model made on `turn` by a decision of class `class`.
@@ -731,14 +759,12 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     let may_move = blind || !just_moved;
     let apply = routing.auto;
     let current = Pick::new(&router.provider_id, &current_model);
-    let mut request = DecideRequest::new(
-        signature,
-        guarded(settings_for(&choice.routing, apply), held),
-        pool,
+    let mut request = DecideRequest::new(signature, settings_for(&choice.routing, apply), pool);
+    narrow(
+        &mut request,
+        held,
+        (!may_move).then_some(router.provider_id.as_str()),
     );
-    if !may_move {
-        request.restrict_provider = Some(router.provider_id.clone());
-    }
     request.trust = router.trust;
     request.current = Some(current.clone());
     request.session_id = router.session_id;
@@ -829,7 +855,7 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
                 pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
             }
             let apply = routing.auto;
-            let mut settings = guarded(settings_for(&choice.routing, apply), held);
+            let mut settings = settings_for(&choice.routing, apply);
             // A pool is routed like `full` inside it, whatever the settings' mode.
             if choice.allowed_models.is_some() {
                 settings.mode = ProviderRoutingMode::Full;
@@ -838,6 +864,7 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             request.trust = router.trust;
             request.restrict_provider = Some(router.provider_id.clone());
             request.current = Some(Pick::new(&router.provider_id, &ctx.current_model));
+            narrow(&mut request, held, None);
             request.session_id = router.session_id;
             request.turn_index = Some(ctx.turn_index);
             let Some(decision) = router.ask(request).await else {
@@ -993,10 +1020,15 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
             if choice.allowed_models.is_some() {
                 settings.mode = ProviderRoutingMode::Full;
             }
-            let mut request = DecideRequest::new(router.signature(), settings, pool);
+            let signature = router.signature();
+            // R-S3 (review of #710, 5): an image turn right after a change of its class is
+            // steady too: never an exploration draw among the models that read images.
+            let held = held_by_class(&locked(&router.state), turn, &signature.arm_key());
+            let mut request = DecideRequest::new(signature, settings, pool);
             request.trust = router.trust;
             request.restrict_provider = Some(router.provider_id.clone());
             request.current = Some(Pick::new(&router.provider_id, &current_model));
+            narrow(&mut request, held, None);
             request.session_id = router.session_id;
             request.turn_index = Some(turn);
             let decision = router.ask(request).await?;
@@ -1852,6 +1884,55 @@ mod provider_move_tests {
         // The one after may move.
         assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
         assert_eq!(decider.last().restrict_provider, None);
+    }
+
+    /// Review of #710 (1): a provider move is a change of model. Turn 1 of the class of the
+    /// relayed turn is steady (no exploration, margin on the means) on top of being decided
+    /// on the arrival provider only; a turn 1 of another class is only narrowed to the
+    /// provider. Red without `seed_relayed_turn`: turn 1 explored as any turn.
+    #[tokio::test]
+    async fn after_a_move_turn_1_of_the_relayed_class_is_steady() {
+        let moved = |decider: Arc<Fake>| {
+            let mut s = spec(
+                decider,
+                Arc::new(ThreeProviders),
+                ProviderRoutingMode::Full,
+                LearningStage::Auto,
+            );
+            s.moved_in = true;
+            s.next_turn = 0;
+            s
+        };
+        let same = Fake::picking("local2", 0.9, 0.1);
+        let first = router(moved(same.clone()));
+        // What `register_turn_router` does once the relayed message is set.
+        first.seed_relayed_turn();
+        directive_for_turn(&first, &TurnContext::new(0, "m")).await;
+        assert_eq!(plan_provider_move(&first).await, ProviderPlan::Stay);
+        let request = same.last();
+        assert_eq!(request.turn_index, Some(1));
+        assert_eq!(request.settings.exploration_epsilon, 0.0);
+        assert!(request.steady);
+        assert_eq!(request.restrict_provider.as_deref(), Some("local"));
+        assert_eq!(
+            request.narrowed,
+            [SAME_CLASS_NO_EXPLORE, AFTER_PROVIDER_MOVE]
+        );
+
+        let other = Fake::picking("local2", 0.9, 0.1);
+        let second = router(moved(other.clone()));
+        second.seed_relayed_turn();
+        directive_for_turn(&second, &TurnContext::new(0, "m")).await;
+        second.set_last_message("rename this variable");
+        assert_eq!(plan_provider_move(&second).await, ProviderPlan::Stay);
+        let request = other.last();
+        assert_eq!(
+            request.settings.exploration_epsilon,
+            RoutingSettings::default().exploration_epsilon
+        );
+        assert!(!request.steady);
+        assert_eq!(request.restrict_provider.as_deref(), Some("local"));
+        assert_eq!(request.narrowed, [AFTER_PROVIDER_MOVE]);
     }
 
     /// Picks `local/<model>`, the current pair scored low: applied in `full` + `auto`.

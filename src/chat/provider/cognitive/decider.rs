@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::candidates::{self, ModelFacts, Slot};
 use super::decision::{CognitiveDecision, DecideRequest, Decider, DecisionAlternative, Pick};
-use super::mode::{LearningStage, ProviderRoutingMode};
+use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings};
 use super::scorer::{self, PriorHints, Scored};
 use super::signature::TaskSignature;
 use super::store::{ArmStats, RoutingArmStore};
@@ -132,7 +132,17 @@ pub fn decide_with(
         decision.reason = format!("{code}: {}", decision.reason);
         decision.used = request.current.clone();
     }
+    for code in &request.narrowed {
+        decision.reason = format!("{}; narrowed: {code}", decision.reason);
+    }
     decision
+}
+
+/// The utility of a scored pair with its posterior MEAN in place of its Thompson draw.
+fn mean_utility(scored: &Scored, settings: &RoutingSettings) -> f64 {
+    scored.alpha / (scored.alpha + scored.beta)
+        - settings.cost_weight * scored.cost_norm
+        - settings.latency_weight * scored.latency_norm
 }
 
 /// [`decide_with`] as if the chosen pair could always be used.
@@ -197,15 +207,34 @@ fn decide_free(
         return decision;
     }
 
+    // A steady turn (R-S3) never explores.
+    let steady_settings;
+    let score_settings = if request.steady {
+        let mut s = settings.clone();
+        s.exploration_epsilon = 0.0;
+        steady_settings = s;
+        &steady_settings
+    } else {
+        settings
+    };
     let mut scored = scorer::score(
         signature,
         &filtered.eligible,
         arms,
         hints,
-        settings,
+        score_settings,
         scorer::seed_of(id),
     );
-    // Hysteresis: the pair in force stays unless a challenger is clearly better.
+    // Hysteresis: the pair in force stays unless a challenger is clearly better — by its
+    // draw, or, on a steady turn, by its posterior mean (a bound that does not depend on
+    // the noise of the draws).
+    let gap = |best: &Scored, now: &Scored| {
+        if request.steady {
+            mean_utility(best, settings) - mean_utility(now, settings)
+        } else {
+            best.utility - now.utility
+        }
+    };
     let mut kept = false;
     if !scored[0].explored {
         if let Some(current) = &request.current {
@@ -213,7 +242,7 @@ fn decide_free(
                 .iter()
                 .position(|s| pick_of(&s.candidate) == *current);
             if let Some(index) = at_index {
-                if index > 0 && scored[0].utility - scored[index].utility < HYSTERESIS_MARGIN {
+                if index > 0 && gap(&scored[0], &scored[index]) < HYSTERESIS_MARGIN {
                     let stay = scored.remove(index);
                     scored.insert(0, stay);
                     kept = true;
@@ -675,5 +704,92 @@ mod tests {
         assert!(d.reason.contains("USD per turn"), "{}", d.reason);
         assert!(d.reason.contains("no run observed yet"), "{}", d.reason);
         assert!(d.reason.contains("chat general turn"), "{}", d.reason);
+    }
+
+    /// Two barely-observed arms of one class whose means are close (2/3 after one run,
+    /// 3/5 after two): their Thompson draws are noisy, so the margin on the DRAWS lets the
+    /// pair in force change often.
+    fn barely_observed(sig: &TaskSignature) -> Vec<ArmStats> {
+        let arm = |model: &str, alpha: f64, beta: f64, n: u64| ArmStats {
+            n,
+            ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", model), alpha, beta)
+        };
+        vec![arm("a", 2.0, 1.0, 1), arm("b", 3.0, 2.0, 2)]
+    }
+
+    /// `turns` consecutive same-class turns, each starting from the pair the previous one
+    /// chose; returns how many changed it.
+    fn changes_over(turns: u128, steady: bool) -> usize {
+        let sig = pilot();
+        let arms = barely_observed(&sig);
+        let mut req = request(sig, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![facts("local", "a", 1.0), facts("local", "b", 1.0)];
+        req.settings.exploration_epsilon = 0.2;
+        req.steady = steady;
+        let mut current = Pick::new("local", "a");
+        let mut changes = 0;
+        for seed in 0..turns {
+            req.current = Some(current.clone());
+            let d = decide_with(
+                Uuid::from_u128(seed),
+                Utc::now(),
+                &req,
+                &arms,
+                &PriorHints::new(),
+            );
+            let chosen = d.chosen.unwrap();
+            if chosen != current {
+                changes += 1;
+                current = chosen;
+            }
+        }
+        changes
+    }
+
+    /// R-S3, review of #710 (2): a steady turn (same class right after a change) applies
+    /// the hysteresis margin to the posterior MEANS and never explores: on two barely-observed
+    /// close arms, a thousand same-class turns never change the pair in force. The same turns
+    /// decided on the draws (and with exploration) change it hundreds of times.
+    #[test]
+    fn steady_turns_never_oscillate_between_two_close_barely_observed_arms() {
+        assert_eq!(changes_over(1_000, true), 0);
+        let noisy = changes_over(1_000, false);
+        assert!(noisy > 100, "the draws alone oscillate: {noisy}");
+    }
+
+    /// A steady turn still changes the pair when a challenger is better ON AVERAGE by the
+    /// margin; the guards that narrowed a decision are told in its reason.
+    #[test]
+    fn a_steady_turn_follows_a_clearly_better_mean_and_its_reason_says_it_was_narrowed() {
+        let sig = pilot();
+        let arms = vec![
+            ArmStats {
+                n: 20,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", "a"), 6.0, 16.0)
+            },
+            ArmStats {
+                n: 20,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", "b"), 16.0, 6.0)
+            },
+        ];
+        let mut req = request(sig, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![facts("local", "a", 1.0), facts("local", "b", 1.0)];
+        req.current = Some(Pick::new("local", "a"));
+        req.steady = true;
+        req.narrowed = vec!["same_class_no_explore", "after_provider_move"];
+        let d = decide_with(
+            Uuid::from_u128(7),
+            Utc::now(),
+            &req,
+            &arms,
+            &PriorHints::new(),
+        );
+        assert_eq!(d.chosen, Some(Pick::new("local", "b")));
+        assert!(
+            d.reason
+                .ends_with("; narrowed: same_class_no_explore; narrowed: after_provider_move"),
+            "{}",
+            d.reason
+        );
     }
 }

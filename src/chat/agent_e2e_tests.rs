@@ -3362,6 +3362,8 @@ mod provider_switch {
         struct Mover {
             answers: StdMutex<VecDeque<&'static str>>,
             checks: StdMutex<Vec<DecideRequest>>,
+            /// The model decisions of one provider (`restrict_provider` set).
+            restricted: StdMutex<Vec<DecideRequest>>,
         }
 
         impl Mover {
@@ -3369,6 +3371,7 @@ mod provider_switch {
                 Arc::new(Self {
                     answers: StdMutex::new(answers.into()),
                     checks: StdMutex::new(Vec::new()),
+                    restricted: StdMutex::new(Vec::new()),
                 })
             }
             fn checks(&self) -> Vec<DecideRequest> {
@@ -3381,7 +3384,10 @@ mod provider_switch {
             async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
                 let current = request.current.clone().unwrap_or_else(|| Pick::new("", ""));
                 let chosen = match &request.restrict_provider {
-                    Some(_) => current.clone(),
+                    Some(_) => {
+                        self.restricted.lock().unwrap().push(request.clone());
+                        current.clone()
+                    }
                     None => {
                         self.checks.lock().unwrap().push(request.clone());
                         let mut queue = self.answers.lock().unwrap();
@@ -3652,6 +3658,13 @@ mod provider_switch {
             let checks = mover.checks();
             assert_eq!(checks.len(), 1, "no provider question right after a move");
             assert_eq!(checks[0].current, Some(Pick::new("local", "m")));
+            let restricted = mover.restricted.lock().unwrap().clone();
+            let after = restricted
+                .iter()
+                .find(|r| r.current == Some(Pick::new("local2", "m")))
+                .expect("the turn after the move is decided on the arrival provider");
+            assert_eq!(after.restrict_provider.as_deref(), Some("local2"));
+            assert!(after.narrowed.contains(&"after_provider_move"), "{after:?}");
         }
 
         /// A session driven by the settings (`full` + `shadow`, nothing chosen on the
