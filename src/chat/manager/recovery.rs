@@ -3,24 +3,25 @@
 //! A session of the agent engine lives in the memory of the server: its provider process, its
 //! stream, its turn. A restart ends all of it, and nothing used to notice: the session stayed
 //! "streaming" in the interface until the user typed again. The events of a session are
-//! persisted, so a cut turn is READ from them: the last event is neither a `result` nor an
-//! `error`.
+//! persisted, so a cut turn is READ from them: the last meaningful event is neither a `result`
+//! nor an `error` (nor a deliberate `session_closed`).
 //!
 //! What it does, in two steps:
 //!
-//! 1. [`ChatManager::scan_interrupted_turns`] (fast, at boot): for each recent agent session,
-//!    judges its tail ([`judge`]). A turn that cannot be continued by itself (it was waiting for
-//!    an unanswered question or approval) is CLOSED with an `error` event, so the interface shows
-//!    it and the next boot does not look at it again. A turn that can be continued is queued, with
-//!    a context reconstructed from the stored events so the model knows what it was doing.
+//! 1. [`ChatManager::scan_interrupted_turns`] (fast, at boot): for each recent session, judges
+//!    its tail ([`judge`]). A turn that cannot be continued by itself (it was waiting for an
+//!    unanswered question or approval) is CLOSED with an `error` event, so the interface shows
+//!    it and the next boot does not look at it again. So is every cut turn recovery does not
+//!    resume: Claude Code CLI sessions, orchestrator children (the plan runner, pipeline,
+//!    gate-retry and delegation relaunch the TASK in a new session), turns cut more than
+//!    [`RECOVERY_WINDOW`] ago. A turn that can be continued is queued, with a context
+//!    reconstructed from the stored events so the model knows what it was doing.
 //! 2. [`ChatManager::drive_recovery`] (in the background): reopens each queued session and tells
-//!    the model what happened. ALL sessions wait for the vault to be unlocked before any resume
-//!    starts (a global guard: `vault:<name>` credentials are unreadable while locked, and the
-//!    guard is conservative — it blocks even sessions that do not need the vault). The startup
-//!    never waits for a person.
-//!
-//! Skipped: plan-runner child sessions. The runner relaunches them on its own at boot; recovery
-//! leaving them alone avoids a double-resume.
+//!    the model what happened. A session whose provider reads its key from the vault
+//!    (`vault:<name>`) waits while the vault is locked; the others resume at once. Each attempt
+//!    holds the session's resume lock, shared with a person's resume: a session somebody
+//!    brought back first is skipped, never written into. The startup never waits for a person;
+//!    what still waits when the wait ends is closed with an `error` event.
 //!
 //! A session cut again and again does not resume for ever: past [`MAX_AUTO_RESUMES`] it is
 //! closed with an `error` event.
@@ -28,18 +29,17 @@
 //! # User identity
 //!
 //! `ChatSessionNode` does not persist the owner's JWT claims (a schema limitation). Recovery
-//! calls `resume_agent_session` with `user_claims: None`, which is accepted by
-//! `authorize_provider_use`. The PO MCP token is generated without a user sub, so tools that
-//! gate on user identity will refuse. This is a known gap; fixing it requires storing the
-//! owner's sub on the session node (a future schema migration).
+//! reopens with `user_claims: None`, which is accepted by `authorize_provider_use`. The PO MCP
+//! server then gets no session token: when the server signs its tokens, the resumed session
+//! says it lacks the PO tools (`degraded_features`) instead of losing them silently. Replaying
+//! the owner's identity requires storing it on the session node (a future schema migration).
 
 use super::*;
 
-/// Sessions untouched for longer than this before the restart are left alone: a turn cut an
-/// hour ago is not one somebody is still waiting for. Used as both a coarse filter on
-/// `updated_at` and a fine filter on the actual last event timestamp (since `updated_at` is
-/// not refreshed during a running turn — a long turn would be filtered out by `updated_at`
-/// alone).
+/// A turn whose last event is older than this is closed, not resumed: a turn cut an hour ago
+/// is not one somebody is still waiting for. Judged on the actual last event timestamp
+/// (`updated_at` is not refreshed during a running turn); `updated_at` older than twice the
+/// window only shortens the tail read.
 pub(crate) const RECOVERY_WINDOW: chrono::Duration = chrono::Duration::hours(1);
 
 /// How many automatic resumes one session gets before it is closed instead.
@@ -65,17 +65,53 @@ pub(crate) enum Verdict {
     Close(&'static str),
 }
 
-/// Events that say nothing about whether a turn ended (timing, hints, bookkeeping).
+/// Events that say nothing about whether a turn ended: timing, hints, bookkeeping, and
+/// everything that can be written on an IDLE session after its turn's `result` (review of
+/// #711, finding 1). When one of them does start a turn (a background output given to the
+/// model), the turn's own events follow it and decide; a cut right after it is judged on
+/// what came before, which errs on the safe side (left as it is rather than closed).
 fn is_bookkeeping(event_type: &str) -> bool {
     matches!(
         event_type,
-        "tool_timing" | "system_hint" | "tool_use_input_resolved" | "permission_decision"
+        "tool_timing"
+            | "system_hint"
+            | "tool_use_input_resolved"
+            | "permission_decision"
+            // Settings changed on an idle session, and the announce of a (re)opened one.
+            | "permission_mode_changed"
+            | "model_changed"
+            | "auto_continue_state_changed"
+            | "system_init"
+            // Out of turn: the output of a background command or monitor (both engines
+            // store it after the turn ended: `oob_listener`, `pump_out_of_band`), the
+            // cancel of a background task, the state of the task list and the queue.
+            | "background_output"
+            | "tool_cancelled"
+            | "tools_cancelled"
+            | "active_tasks_update"
+            | "pending_queue"
+            | "secret_request_resolved"
+            | "conversation_relayed"
+            // Transient or announcing events (no turn content of their own).
+            | "stream_delta"
+            | "streaming_status"
+            | "retrying"
+            | "auto_continue"
+            | "compaction_started"
+            | "compaction_recovery"
+            | "compact_boundary"
+            | "refs_resolved"
+            // The agent engine stores a background task's notification out of turn as a
+            // `workflow` (`task_notification`, follow-up review of #711).
+            | "workflow"
     )
 }
 
 /// How many times this session has already been automatically resumed, counting only the
 /// resumes that belong to the CURRENT turn (after the last real user message). With TAIL=200
-/// earlier turns' resume markers would otherwise accumulate and trigger false closes.
+/// earlier turns' resume markers would otherwise accumulate and trigger false closes. A
+/// marker followed by a `session_closed` before the next marker is an attempt of the
+/// recovery that failed and was tried again (review of #711, finding 2), not a restart.
 fn count_resumes(tail: &[ChatEventRecord]) -> usize {
     // Find the start of the current turn: the last user_message that is NOT a resume marker.
     let turn_start = tail
@@ -83,10 +119,19 @@ fn count_resumes(tail: &[ChatEventRecord]) -> usize {
         .rposition(|e| e.event_type == "user_message" && !e.data.contains(RESUME_MARKER))
         .map(|i| i + 1)
         .unwrap_or(0);
-    tail[turn_start..]
-        .iter()
-        .filter(|e| e.event_type == "user_message" && e.data.contains(RESUME_MARKER))
-        .count()
+    let mut resumes = 0;
+    let mut open_marker = false;
+    for event in &tail[turn_start..] {
+        if event.event_type == "user_message" && event.data.contains(RESUME_MARKER) {
+            if open_marker {
+                resumes += 1;
+            }
+            open_marker = true;
+        } else if event.event_type == "session_closed" {
+            open_marker = false;
+        }
+    }
+    resumes + usize::from(open_marker)
 }
 
 /// Whether the `spawned_by` JSON string identifies a session managed by an orchestrator
@@ -115,7 +160,9 @@ pub(crate) fn judge(tail: &[ChatEventRecord]) -> Verdict {
         return Verdict::Settled;
     };
     match last.event_type.as_str() {
-        "result" | "error" => Verdict::Settled,
+        // `session_closed`: the session was closed on purpose (a turn running then was
+        // stopped by it, not cut by a restart); `session_error`: it ended in error.
+        "result" | "error" | "session_closed" | "session_error" => Verdict::Settled,
 
         "ask_user_question" => Verdict::Close(
             "The server restarted while this session waited for an answer; ask again.",
@@ -301,14 +348,42 @@ pub(crate) fn resume_message(dangling_tool: Option<&str>, cut_turn_context: &str
 pub(crate) struct PendingResume {
     pub node: ChatSessionNode,
     pub message: String,
-    /// The last event seen when it was queued: anything newer means somebody else acted.
+    /// The last event seen when it was queued (or after this recovery's own failed
+    /// attempt): anything newer means somebody else acted.
     pub seen_seq: i64,
+    /// Attempts that failed with a transient provider error so far.
+    pub failures: u32,
 }
+
+/// How many times a resume that failed with a transient provider error (provider not
+/// ready yet at boot, overloaded, unreachable, timed out) is tried again before the turn
+/// is closed (review of #697, finding 8c).
+pub(crate) const MAX_TRANSIENT_RETRIES: u32 = 3;
+
+/// Why a cut turn of a session recovery does not resume was closed.
+const CLOSED_LEFT_TO_OWNER: &str = "The server restarted while this turn was running. This session is driven by its orchestrator (plan run, pipeline, delegation), which relaunches the task itself: it is not resumed here.";
+const CLOSED_LEGACY: &str = "The server restarted while this turn was running, and this session is not resumed automatically: send your message again to continue.";
+const CLOSED_STALE: &str = "The server restarted while this turn was running, too long ago to resume it automatically: send your message again to continue.";
+const CLOSED_ABANDONED: &str = "The server restarted while this turn was running, and the vault stayed locked, so it could not be resumed: send your message again.";
+const CLOSED_FAILED: &str = "The server restarted while this turn was running, and the session could not be resumed: send your message again.";
+
+/// How many of the last events are read for a session that is closed rather than resumed
+/// when its turn was cut (enough to find its last meaningful event).
+const SHORT_TAIL: i64 = 20;
+
+/// A session whose last activity is older than this is not touched at all, cut or not: the
+/// older a thread, the less its "streaming" look matters and the more a wrong judgement of
+/// its tail would cost (review of #711, finding 1: rather left streaming than falsely
+/// closed). It also bounds what one boot reads and writes.
+pub(crate) const CLOSE_HORIZON: chrono::Duration = chrono::Duration::days(7);
 
 /// What the scan found.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanReport {
     pub scanned: usize,
+    /// Cut turns closed with an `error` event: waiting for a person, resumed too often, or
+    /// in a session recovery does not resume (Claude Code CLI, orchestrator child, out of
+    /// the window).
     pub closed: usize,
 }
 
@@ -316,49 +391,75 @@ pub struct ScanReport {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub resumed: usize,
-    /// Left alone because the session moved on by itself (the user wrote, or it is live).
+    /// Left alone because the session moved on by itself (the user wrote, or another
+    /// resume brought it back): seen under the session's resume lock, nothing written.
     pub skipped: usize,
     /// Closed with an `error` event because the resume failed for good.
     pub failed: usize,
-    /// Still waiting for the vault when the wait ended.
+    /// Attempts that failed with a transient error and were tried again.
+    pub retried: usize,
+    /// Still waiting for the vault when the wait ended: closed with an `error` event.
     pub abandoned: usize,
 }
 
+/// What one attempt at a queued session did.
+enum Attempt {
+    Resumed,
+    Skipped,
+    /// The vault is locked and the session needs it: later.
+    Wait,
+    /// A transient failure: later, counted.
+    Retry,
+    Failed,
+}
+
 impl ChatManager {
-    /// Reads the recent agent sessions and queues the cut turns (step 1).
+    /// Reads the recent sessions and queues the cut turns that can be resumed (step 1).
+    ///
+    /// Every cut turn recovery does not resume is CLOSED with an `error` event, so it no
+    /// longer shows "streaming": the sessions of the Claude Code CLI (nothing reopens them
+    /// at boot), the children of an orchestrator (it relaunches the TASK, in a new session),
+    /// and turns cut longer than [`RECOVERY_WINDOW`] ago. A session opened after the scan
+    /// began, or live on this server (a run relaunched meanwhile), is not looked at.
     pub(crate) async fn scan_interrupted_turns(&self) -> Result<(Vec<PendingResume>, ScanReport)> {
         let (sessions, _) = self
             .graph
             .list_chat_sessions(None, None, 200, 0, true)
             .await?;
-        let since = chrono::Utc::now() - RECOVERY_WINDOW;
+        let started = chrono::Utc::now();
+        let since = started - RECOVERY_WINDOW;
         let mut pending = Vec::new();
         let mut report = ScanReport::default();
         for node in sessions {
-            // The agent engine only: a session without a capability snapshot is a Claude Code
-            // CLI session, which the CLI itself resumes.
-            if node.capabilities.is_none() {
+            let sid = node.id.to_string();
+            if node.created_at >= started || self.is_session_active(&sid).await {
                 continue;
             }
-            // Orchestrator-managed sessions (runner, pipeline, gate-retry, delegation) are
-            // relaunched by their orchestrator at boot. Recovering them here too would
-            // double-resume. Conversation sub-sessions and trigger-spawned sessions have no
-            // orchestrator and are included.
-            if node
+            // `updated_at` is set at least when a turn starts: older than the horizon, so is
+            // the turn.
+            if node.updated_at < started - CLOSE_HORIZON {
+                continue;
+            }
+            // Not resumed here, closed when cut: a session without a capability snapshot
+            // is a Claude Code CLI session; an orchestrator-managed one (runner, pipeline,
+            // gate-retry, delegation) is relaunched by its orchestrator. Conversation
+            // sub-sessions and trigger-spawned sessions have no orchestrator: resumed.
+            let left_alone = if node.capabilities.is_none() {
+                Some(CLOSED_LEGACY)
+            } else if node
                 .spawned_by
                 .as_deref()
                 .is_some_and(is_orchestrator_child)
             {
-                continue;
-            }
-            // Coarse time filter: skip sessions that have been inactive for more than
-            // 2× RECOVERY_WINDOW. `updated_at` is not refreshed during a running turn
-            // (only at turn start/end), so a long turn would look stale; the factor-of-2
-            // margin prevents false exclusions. The fine filter below uses the actual last
-            // event timestamp.
-            if node.updated_at < since - RECOVERY_WINDOW {
-                continue;
-            }
+                Some(CLOSED_LEFT_TO_OWNER)
+            } else {
+                None
+            };
+            // `updated_at` is not refreshed during a running turn: a session that looks
+            // stale by it may still be resumable (fine filter below, on the last event).
+            // Only a session that can be resumed needs its whole tail.
+            let candidate = left_alone.is_none() && node.updated_at >= since - RECOVERY_WINDOW;
+            let depth = if candidate { TAIL } else { SHORT_TAIL };
             report.scanned += 1;
             let latest = match self.graph.get_latest_chat_event_seq(node.id).await {
                 Ok(seq) => seq,
@@ -369,7 +470,7 @@ impl ChatManager {
             };
             let tail = match self
                 .graph
-                .get_chat_events(node.id, (latest - TAIL).max(0), TAIL)
+                .get_chat_events(node.id, (latest - depth).max(0), depth)
                 .await
             {
                 Ok(tail) => tail,
@@ -378,24 +479,30 @@ impl ChatManager {
                     continue;
                 }
             };
-            // Fine time filter: `updated_at` is not refreshed during a turn, so use the
-            // actual last event timestamp instead.
             let last_event_at = tail.last().map(|e| e.created_at).unwrap_or(node.updated_at);
-            if last_event_at < since {
+            if last_event_at < started - CLOSE_HORIZON {
                 continue;
             }
             match judge(&tail) {
                 Verdict::Settled => {}
                 Verdict::Close(reason) => {
-                    self.close_cut_turn(node.id, latest, reason).await;
+                    self.close_cut_turn(node.id, reason).await;
                     report.closed += 1;
                 }
                 Verdict::Resume { dangling_tool } => {
+                    let closed_because =
+                        left_alone.or((last_event_at < since).then_some(CLOSED_STALE));
+                    if let Some(reason) = closed_because {
+                        self.close_cut_turn(node.id, reason).await;
+                        report.closed += 1;
+                        continue;
+                    }
                     let cut_context = reconstruct_cut_turn(&tail);
                     pending.push(PendingResume {
                         message: resume_message(dangling_tool.as_deref(), &cut_context),
                         node,
                         seen_seq: latest,
+                        failures: 0,
                     });
                 }
             }
@@ -403,8 +510,19 @@ impl ChatManager {
         Ok((pending, report))
     }
 
-    /// Ends a cut turn on the thread, so it shows and is not judged again.
-    async fn close_cut_turn(&self, session_id: Uuid, after_seq: i64, reason: &str) {
+    /// Ends a cut turn on the thread, so it shows and is not judged again. The event goes
+    /// after the LAST stored event, read now (an attempt of this recovery may have written
+    /// some since the scan), and is published like the events of a live session: to the
+    /// other instances (NATS), and as a session update for the lists (review of #697,
+    /// finding 8a). Never called on a session live here.
+    async fn close_cut_turn(&self, session_id: Uuid, reason: &str) {
+        let after_seq = match self.graph.get_latest_chat_event_seq(session_id).await {
+            Ok(seq) => seq,
+            Err(e) => {
+                warn!("recovery: could not close {session_id}: {e}");
+                return;
+            }
+        };
         let event = ChatEvent::Error {
             message: reason.to_string(),
             parent_tool_use_id: None,
@@ -424,22 +542,34 @@ impl ChatManager {
         };
         if let Err(e) = self.graph.store_chat_events(session_id, vec![record]).await {
             warn!("recovery: could not close {session_id}: {e}");
+            return;
+        }
+        let sid = session_id.to_string();
+        if let Some(nats) = &self.nats {
+            nats.publish_chat_event(&sid, event);
+        }
+        if let Some(emitter) = &self.event_emitter {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                &sid,
+                serde_json::json!({ "is_streaming": false }),
+                None,
+            );
         }
     }
 
-    /// Reopens the queued sessions (step 2), waiting while the vault is locked, for at most
-    /// `max_wait`. `poll` is the pause between two looks.
+    /// Reopens the queued sessions (step 2), for at most `max_wait`. `poll` is the pause
+    /// between two looks.
     ///
-    /// The vault guard is global: while the vault is locked, ALL pending sessions wait, even
-    /// those whose provider may not need it. This is a conservative simplification — tracking
-    /// vault-dependency per session requires a schema change (storing the owner's credential
-    /// reference on the session node) and is deferred. Sessions that get a `credentials_locked`
-    /// error from the provider (after an unlock that doesn't cover all providers) are also
-    /// pushed back to `waiting`.
+    /// A session whose provider reads its key from the vault waits while the vault is
+    /// locked; the others resume at once (review of #697, finding 7). A provider that still
+    /// answers `credentials_locked` (a key read elsewhere) puts its session back to wait. A
+    /// transient provider error is tried again, [`MAX_TRANSIENT_RETRIES`] times. What still
+    /// waits at the deadline is closed with an `error` event.
     ///
-    /// Note: `resume_agent_session` is called with `user_claims: None` because the session
-    /// owner's identity is not persisted (see module doc). PO tools gated on user identity will
-    /// refuse; this is a known limitation pending a schema migration to store the owner sub.
+    /// Note: the session is reopened with `user_claims: None` because the session owner's
+    /// identity is not persisted (see module doc); the session says it lacks the PO tools
+    /// when the server signs its tokens.
     pub(crate) async fn drive_recovery(
         &self,
         mut pending: Vec<PendingResume>,
@@ -454,42 +584,19 @@ impl ChatManager {
                 .as_ref()
                 .is_some_and(|v| !v.is_unlocked(chrono::Utc::now()));
             let mut waiting = Vec::new();
-            for item in pending {
-                if locked {
-                    waiting.push(item);
-                    continue;
-                }
-                let sid = item.node.id.to_string();
-                let moved_on = self.agent_runtime.get(&sid).await.is_some()
-                    || self
-                        .graph
-                        .get_latest_chat_event_seq(item.node.id)
-                        .await
-                        .map(|seq| seq != item.seen_seq)
-                        .unwrap_or(false);
-                if moved_on {
-                    report.skipped += 1;
-                    continue;
-                }
-                match self
-                    .resume_agent_session(&item.node, &item.message, None, None)
-                    .await
-                {
-                    Ok(()) => {
-                        info!("recovery: session {sid} resumed after a restart");
+            for mut item in pending {
+                match self.recover_one(&mut item, locked).await {
+                    Attempt::Resumed => {
+                        info!("recovery: session {} resumed after a restart", item.node.id);
                         report.resumed += 1;
                     }
-                    Err(e) if credentials_locked(&e) => waiting.push(item),
-                    Err(e) => {
-                        warn!("recovery: session {sid} could not be resumed: {e}");
-                        self.close_cut_turn(
-                            item.node.id,
-                            item.seen_seq,
-                            "The server restarted while this turn was running, and the session could not be resumed; send your message again.",
-                        )
-                        .await;
-                        report.failed += 1;
+                    Attempt::Skipped => report.skipped += 1,
+                    Attempt::Wait => waiting.push(item),
+                    Attempt::Retry => {
+                        report.retried += 1;
+                        waiting.push(item);
                     }
+                    Attempt::Failed => report.failed += 1,
                 }
             }
             pending = waiting;
@@ -497,13 +604,130 @@ impl ChatManager {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                report.abandoned = pending.len();
+                for item in &pending {
+                    if self.abandon(item).await {
+                        report.abandoned += 1;
+                    } else {
+                        report.skipped += 1;
+                    }
+                }
                 break;
             }
             tokio::time::sleep(poll).await;
         }
         report
     }
+
+    /// One attempt at a queued session.
+    ///
+    /// The look and the resume hold the session's resume lock, the lock a person's resume
+    /// takes (`resume_agent_session`): a person who resumed the session first is SEEN here
+    /// (a live handle, or newer events) and the session is skipped — its "continue" never
+    /// lands in the conversation the person took back, and nothing is written into it; a
+    /// person who comes second finds the session recovery brought back and talks to it
+    /// (follow-up review of #697, R1).
+    async fn recover_one(&self, item: &mut PendingResume, vault_locked: bool) -> Attempt {
+        let sid = item.node.id.to_string();
+        let _resuming = self.resume_locks.lock(&sid).await;
+        if self.moved_on(item).await {
+            return Attempt::Skipped;
+        }
+        if vault_locked && self.needs_vault(&item.node).await {
+            return Attempt::Wait;
+        }
+        // The checks of a person's resume (engine still switched on, project slug).
+        let mut node = item.node.clone();
+        let result = match self.ready_for_resume(&mut node).await {
+            Ok(()) => self.reopen_agent_session(&node, &item.message, None).await,
+            Err(e) => Err(e),
+        };
+        let Err(error) = result else {
+            return Attempt::Resumed;
+        };
+        // An attempt that got as far as adopting the session (its first message refused)
+        // ends it: a live session is never written into from here, and what this recovery
+        // writes next goes after the events the attempt stored (review of #697, finding 9).
+        if self.agent_runtime.owns(&sid).await {
+            let _ = self.close_session(&sid).await;
+        }
+        // `credentials_locked` waits only while the vault IS locked. With the vault open it
+        // says the key could not be read for another reason (vault unavailable, throttled,
+        // storage error: `credentials.rs`): counted like any transient error, not retried
+        // every `poll` until the deadline (review of #711, finding 3).
+        let locked_out = credentials_locked(&error)
+            && self
+                .vault
+                .as_ref()
+                .is_some_and(|v| !v.is_unlocked(chrono::Utc::now()));
+        let retryable = transient(&error) || credentials_locked(&error);
+        if locked_out || retryable {
+            if let Ok(seq) = self.graph.get_latest_chat_event_seq(item.node.id).await {
+                item.seen_seq = seq;
+            }
+        }
+        if locked_out {
+            return Attempt::Wait;
+        }
+        if retryable && item.failures < MAX_TRANSIENT_RETRIES {
+            item.failures += 1;
+            warn!("recovery: session {sid} not resumed yet ({error}), trying again");
+            return Attempt::Retry;
+        }
+        warn!("recovery: session {sid} could not be resumed: {error}");
+        self.close_cut_turn(item.node.id, CLOSED_FAILED).await;
+        Attempt::Failed
+    }
+
+    /// Closes a session still waiting when the recovery gives up, unless it moved on
+    /// meanwhile (`false`). Under the resume lock, as an attempt.
+    async fn abandon(&self, item: &PendingResume) -> bool {
+        let sid = item.node.id.to_string();
+        let _resuming = self.resume_locks.lock(&sid).await;
+        if self.moved_on(item).await {
+            return false;
+        }
+        self.close_cut_turn(item.node.id, CLOSED_ABANDONED).await;
+        true
+    }
+
+    /// Whether somebody acted on the session since it was queued: it is live here, or it
+    /// has newer events.
+    async fn moved_on(&self, item: &PendingResume) -> bool {
+        self.is_session_active(&item.node.id.to_string()).await
+            || self
+                .graph
+                .get_latest_chat_event_seq(item.node.id)
+                .await
+                .map(|seq| seq != item.seen_seq)
+                .unwrap_or(false)
+    }
+
+    /// Whether the session's provider reads its key from the vault: a registered instance
+    /// whose credential is a `vault:` reference (a remote Claude Code always is). A built-in
+    /// provider has no stored instance and no key of its own there. Unreadable: assumed so.
+    async fn needs_vault(&self, node: &ChatSessionNode) -> bool {
+        let provider_id = node
+            .provider_id
+            .as_deref()
+            .unwrap_or(crate::chat::provider::resolver::CLAUDE_CODE);
+        match crate::chat::provider::store::instance(self.graph.as_ref(), provider_id).await {
+            Ok(Some(record)) => {
+                record.credential_ref.starts_with("vault:")
+                    || record.kind == crate::chat::provider::settings::KIND_CLAUDE_CODE_REMOTE
+            }
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+}
+
+/// A provider error worth trying again (`ProviderError::retryable`).
+fn transient(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<nexus_claude::agent::ProviderError>()
+            .is_some_and(|p| p.retryable())
+    })
 }
 
 /// The provider's key lives in a vault that is locked: try again once it is not.
@@ -547,6 +771,97 @@ mod tests {
             ev(3, "tool_timing", "{}"),
         ];
         assert_eq!(judge(&tail), Verdict::Settled);
+    }
+
+    #[test]
+    fn a_closed_session_or_a_settings_change_after_the_result_is_settled() {
+        // Settings changed on an idle session, or the announce of a reopened one, do not
+        // make a finished turn look cut (closing a CLI session or an out-of-window one at
+        // boot would otherwise write a false "restart" error into it).
+        for after in [
+            "model_changed",
+            "permission_mode_changed",
+            "auto_continue_state_changed",
+            "system_init",
+        ] {
+            let tail = [
+                ev(1, "user_message", "{}"),
+                ev(2, "result", "{}"),
+                ev(3, after, "{}"),
+            ];
+            assert_eq!(judge(&tail), Verdict::Settled, "{after}");
+        }
+        // A session closed on purpose, or ended in a session error, was not cut by a
+        // restart, whatever ran before.
+        for last in ["session_closed", "session_error"] {
+            let tail = [
+                ev(1, "user_message", "{}"),
+                ev(2, "assistant_text", "{}"),
+                ev(3, last, "{}"),
+            ];
+            assert_eq!(judge(&tail), Verdict::Settled, "{last}");
+        }
+    }
+
+    #[test]
+    fn output_written_on_an_idle_session_does_not_reopen_its_turn() {
+        // Review of #711, finding 1: both engines store a background command's output
+        // AFTER the turn's result; so are the cancel of a background task and the like.
+        for after in [
+            "background_output",
+            "tool_cancelled",
+            "tools_cancelled",
+            "active_tasks_update",
+            "pending_queue",
+            "secret_request_resolved",
+            "conversation_relayed",
+            "retrying",
+            "compact_boundary",
+            "workflow",
+        ] {
+            let tail = [
+                ev(1, "user_message", "{}"),
+                ev(2, "result", "{}"),
+                ev(3, after, "{}"),
+            ];
+            assert_eq!(judge(&tail), Verdict::Settled, "{after}");
+        }
+        // A turn that a background output started is judged on its own events.
+        let started = [
+            ev(1, "result", "{}"),
+            ev(2, "background_output", "{}"),
+            ev(3, "assistant_text", "{}"),
+        ];
+        assert!(matches!(judge(&started), Verdict::Resume { .. }));
+    }
+
+    #[test]
+    fn a_failed_attempt_of_the_recovery_is_not_counted_as_a_restart() {
+        // Review of #711, finding 2: an attempt that adopted the session and failed left
+        // its marker, then `session_closed`; the attempt tried again is the one resume.
+        let resume = resume_message(None, "");
+        let marker = serde_json::json!({ "type": "user_message", "content": resume }).to_string();
+        let retried = [
+            ev(1, "user_message", r#"{"content":"go"}"#),
+            ev(2, "user_message", &marker),
+            ev(3, "session_closed", "{}"),
+            ev(4, "user_message", &marker),
+            ev(5, "assistant_text", "{}"),
+        ];
+        assert_eq!(count_resumes(&retried), 1);
+        assert!(matches!(judge(&retried), Verdict::Resume { .. }));
+        // Two real resumes still close.
+        let twice = [
+            ev(1, "user_message", r#"{"content":"go"}"#),
+            ev(2, "user_message", &marker),
+            ev(3, "session_closed", "{}"),
+            ev(4, "user_message", &marker),
+            ev(5, "assistant_text", "{}"),
+            ev(6, "user_message", &marker),
+            ev(7, "assistant_text", "{}"),
+        ];
+        assert_eq!(count_resumes(&twice), 2);
+        assert!(matches!(judge(&twice), Verdict::Close(_)));
     }
 
     #[test]
