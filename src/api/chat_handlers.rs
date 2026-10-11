@@ -102,6 +102,10 @@ pub async fn create_session(
                 AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
             })?;
 
+        // Read before the liveness check and the NATS RPC (up to its timeout): a resume
+        // that completes meanwhile then receives this message instead of being resumed
+        // over (follow-up of the review of #696).
+        let from = chat_manager.resume_point(&sid).await;
         if chat_manager.is_session_active(&sid).await {
             // 1. Session is local — send directly into the running CLI
             chat_manager
@@ -118,7 +122,7 @@ pub async fn create_session(
             // 3. No instance owns the session — resume locally (spawns CLI).
             //    Surfaces a 404 when the session doesn't exist in Neo4j.
             chat_manager
-                .resume_session(&sid, &request.message, request.user_claims.as_ref())
+                .resume_session_from(&sid, &request.message, request.user_claims.as_ref(), from)
                 .await
                 .map_err(|e| {
                     let typed =
@@ -309,6 +313,12 @@ async fn stored_place_and_access(
     }
 }
 
+/// What a stored capabilities snapshot says of `images`; `None` when there is no snapshot
+/// or it does not say.
+fn snapshot_images(capabilities: Option<&serde_json::Value>) -> Option<bool> {
+    capabilities?.get("images")?.as_bool()
+}
+
 /// Convert a ChatSessionNode to a ChatSession API response (without links).
 fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSession {
     ChatSession {
@@ -339,6 +349,7 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
         capabilities: None,
+        effective_capabilities: None,
         routed_by: s.routed_by,
         execution_place: s.execution_place,
         access: s.access,
@@ -532,8 +543,15 @@ pub async fn get_session(
         .capabilities
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let snapshot_images = snapshot_images(capabilities.as_ref());
     let mut session = session_node_to_response(node);
     session.capabilities = capabilities;
+    // F-R4: what the next turn can really carry, given the routing candidates.
+    if let Some(chat_manager) = state.chat_manager.as_ref() {
+        session.effective_capabilities = chat_manager
+            .effective_capabilities(&session_id.to_string(), snapshot_images)
+            .await;
+    }
 
     // Enrich with linked entities (best-effort — don't fail if enrichment fails)
     if let Ok(links) = neo4j.get_session_links(session_id).await {
@@ -681,13 +699,21 @@ pub async fn delete_session(
 ///
 /// ## Response codes
 ///
-/// Always **200** with `CancelToolsResult { cli_pid, killed_pids,
-/// capped }`. The frontend distinguishes:
+/// **200** with `CancelToolsResult { cli_pid, killed_pids, capped }` when the
+/// instance holding the session acted (here or over NATS). The frontend distinguishes:
 /// - `capped: false, !killed_pids.is_empty()` → tool(s) cancelled OK
 /// - `capped: false, killed_pids.is_empty()` → no tool was running
 ///   (agent thinking, between turns) — silently no-op
 /// - `capped: true` → rate cap hit (10/60s/session), display a
 ///   "slow down" toast and disable the button briefly
+///
+/// Otherwise a typed body `{error, code, retryable}` (`cancel_error`): 422
+/// `unsupported` (the provider cannot: Claude Code over SSH), 409
+/// `owner_unreachable` (no instance holds the session live — with or without
+/// NATS), 504 `owner_timeout` (`retryable: false` here: a late cancel may have
+/// happened, a retry would stop tools started since), 410 `session_gone`
+/// (retryable: the session moved), 502 `owner_protocol` / `owner_failed` /
+/// `relay_failed`.
 ///
 /// **404** — `chat_manager` not configured (server not started with
 /// chat support).
@@ -699,10 +725,10 @@ pub async fn delete_session(
 ///
 /// ## Cross-instance routing
 ///
-/// If the session lives on another instance, the request is forwarded
-/// transparently via the NATS subject `events.chat.{id}.cancel_tools`.
-/// The local response will have `cli_pid: None, killed_pids: []` since
-/// the SIGINT happens remotely.
+/// If the session lives on another instance, the request goes over NATS
+/// (`events.chat.{id}.cancel_tools`, request/reply, `chat::cancel_relay`) and
+/// the answer is the owner's: what it stopped (its `cli_pid`, `killed_pids`),
+/// or its typed refusal / the typed reason there is none (above).
 pub async fn cancel_tools(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
@@ -714,7 +740,10 @@ pub async fn cancel_tools(
     let result = chat_manager
         .cancel_running_tools(&session_id.to_string())
         .await
-        .map_err(AppError::Internal)?;
+        // A provider that cannot stop tools (Claude Code over SSH: no `tool_cancel`)
+        // is a typed refusal (422 `unsupported`), never a 500 nor a success; so is
+        // a session another instance holds and does not answer for (`cancel_error`).
+        .map_err(cancel_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -851,6 +880,9 @@ pub async fn interrupt_session(
 #[serde(deny_unknown_fields)]
 pub struct PermissionAnswerRequest {
     pub allow: bool,
+    /// How long an approval lasts: `once` (absent), `session`, `always`.
+    #[serde(default)]
+    pub scope: crate::chat::types::PermissionAnswerScope,
 }
 
 /// Body of `POST /api/chat/sessions/{id}/messages`.
@@ -867,15 +899,158 @@ pub struct SendMessageRequest {
     pub refs: Vec<serde_json::Value>,
 }
 
+/// The person a lasting-rule route serves: a signed-in PERSON with their own session
+/// token (P11b, "human routes only"). An agent session's token, an MCP token, the
+/// server's account and the anonymous user are refused: an agent never lists nor
+/// revokes the approvals of its person (it cannot add any either: a lasting rule only
+/// comes from that person answering a permission request of their own session).
+fn lasting_rules_person(
+    claims: &Option<axum::Extension<crate::auth::jwt::Claims>>,
+) -> Result<String, AppError> {
+    match claims {
+        Some(axum::Extension(c)) if c.may_keep_lasting_approvals() => Ok(c.sub.clone()),
+        Some(_) => Err(AppError::Forbidden(
+            "lasting permission rules are managed by their person only, signed in".to_string(),
+        )),
+        None => Err(AppError::Unauthorized(
+            "sign in to manage your lasting permission rules".to_string(),
+        )),
+    }
+}
+
+/// Query of `GET /api/chat/permission-rules`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionRulesQuery {
+    /// Only the rules of this project (slug).
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// One lasting rule as `GET /api/chat/permission-rules` lists it.
+#[derive(Debug, Serialize)]
+pub struct PermissionRuleView {
+    pub id: Uuid,
+    pub project: String,
+    /// The project's root directory (canonical) it is bound to: it only covers a call of a
+    /// session running in that very directory.
+    pub root: String,
+    /// The call asked to run outside the sandbox. Never kept by this server (refused for
+    /// good), shown should a rule file say so.
+    pub sandbox_disabled: bool,
+    /// The engine it holds on: `claude_code` (the Claude Code CLI) or `native`.
+    pub engine: String,
+    pub tool: String,
+    /// What it covers, as the decisions say it (`Bash: cat README.md`): the identical call.
+    pub rule: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub session_id: Option<String>,
+    /// Whether the backend's comparator still grants it, decided as a session of its project
+    /// would (a rule edited by hand, one whose read-only declaration was withdrawn or is
+    /// redefined by the project's `.mcp.json` is listed but holds nothing). It still needs
+    /// a session running in its root to apply.
+    pub holds: bool,
+}
+
+/// GET /api/chat/permission-rules[?project=<slug>]
+///
+/// The caller's lasting approvals (`always`, P11b), newest first. Human route only
+/// (a person signed in with their own session token).
+///
+/// - **200** `{ "enabled": bool, "rules": [PermissionRuleView] }` — `enabled: false` when
+///   this server keeps no lasting approval (`always` is then never offered).
+/// - **401** — not signed in. **403** — an agent's, an MCP or the server's token.
+pub async fn list_permission_rules(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    Query(query): Query<PermissionRulesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let person = lasting_rules_person(&claims)?;
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+    let Some(store) = chat_manager.lasting_rule_store() else {
+        return Ok(Json(serde_json::json!({ "enabled": false, "rules": [] })));
+    };
+    let declared = chat_manager.config.read_only_mcp_tools.clone();
+    let mut rules: Vec<PermissionRuleView> =
+        tokio::task::spawn_blocking(move || store.rules(&person))
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+            .into_iter()
+            .filter(|r| query.project.as_ref().is_none_or(|p| *p == r.project))
+            .map(|r| PermissionRuleView {
+                // Decided as a session of that project would decide it: the declared
+                // read-only MCP tools its `.mcp.json` does not redefine (review of #714,
+                // N2); a rule with no root (older format) holds nothing.
+                holds: !r.root.is_empty()
+                    && r.grant(&crate::chat::session_grants::declarations_for_project(
+                        &declared,
+                        Some(std::path::Path::new(&r.root)),
+                    ))
+                    .is_some(),
+                sandbox_disabled: r
+                    .input
+                    .get("dangerouslyDisableSandbox")
+                    .is_some_and(|v| !v.is_null() && *v != serde_json::Value::Bool(false)),
+                id: r.id,
+                project: r.project,
+                root: r.root,
+                engine: r.asker,
+                tool: r.tool,
+                rule: r.rule,
+                created_at: r.created_at,
+                session_id: r.session_id,
+            })
+            .collect();
+    rules.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(Json(serde_json::json!({ "enabled": true, "rules": rules })))
+}
+
+/// DELETE /api/chat/permission-rules/{id}
+///
+/// Revokes one of the caller's lasting approvals: from the next request on, the call it
+/// covered is asked again, in every session (the rules are read at each request).
+///
+/// - **204** — revoked. **404** — no such rule of the caller (or none kept here).
+/// - **401** / **403** — as for the list.
+pub async fn revoke_permission_rule(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    Path(id): Path<Uuid>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let person = lasting_rules_person(&claims)?;
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+    let store = chat_manager
+        .lasting_rule_store()
+        .ok_or_else(|| AppError::NotFound(format!("no lasting permission rule {id}")))?;
+    let revoked = tokio::task::spawn_blocking(move || store.revoke(&person, id))
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    if revoked {
+        Ok(axum::http::StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!(
+            "no lasting permission rule {id}"
+        )))
+    }
+}
+
 const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; continue par un message \
      (POST .../messages)";
 
-/// POST /api/chat/sessions/{id}/permissions/{request_id} `{ "allow": bool }`
+/// POST /api/chat/sessions/{id}/permissions/{request_id} `{ "allow": bool, "scope"?: "once" | "session" | "always" }`
 ///
 /// REST twin of the WS `permission_response` frame: both go through
 /// `ChatManager::route_permission_response`, so there is one routing.
 ///
 /// - **200** `{ "routed": "local" | "remote" }` — delivered to the CLI.
+/// - **400** `permission_scope_unsupported` — the session does not offer that scope
+///   (`capabilities.permission_scopes`); nothing was answered, the request still waits.
+/// - **403** — the session belongs to another person (`ChatSessionNode::owner`).
 /// - **404** — unknown session, or no such permission request on it.
 /// - **409** — the request was already decided (double click, two tabs).
 /// - **410** — the CLI that asked is gone; the answer is REFUSED, never
@@ -883,6 +1058,7 @@ const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; cont
 pub async fn respond_permission(
     State(state): State<OrchestratorState>,
     Path((session_id, request_id)): Path<(Uuid, String)>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
     Json(body): Json<PermissionAnswerRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::chat::attention::{permission_status, PermissionStatus};
@@ -895,11 +1071,38 @@ pub async fn respond_permission(
         return Err(AppError::BadRequest("request_id must not be empty".into()));
     }
     let neo4j = state.orchestrator.neo4j();
-    neo4j
+    let session = neo4j
         .get_chat_session(session_id)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
+    // Only the person the session belongs to answers it (review #679 finding 6): another
+    // signed-in user could otherwise approve, or grant for the session, a call in someone
+    // else's conversation. A caller without claims (authentication off) is nobody: a
+    // session that has an owner is refused, as on the WebSocket (which carries the
+    // anonymous user then); a session without one is answered as before.
+    let caller = claims
+        .as_ref()
+        .map_or("", |axum::Extension(c)| c.sub.as_str());
+    if !session.answerable_by(caller) {
+        return Err(AppError::Forbidden(
+            "only the person this conversation belongs to can answer its permission requests"
+                .to_string(),
+        ));
+    }
+    // A lasting approval only from the person, signed in with their own session token (review
+    // of #714, S1): an MCP token or the server's account answers once or for the session.
+    if body.allow
+        && body.scope == crate::chat::types::PermissionAnswerScope::Always
+        && !claims
+            .as_ref()
+            .is_some_and(|axum::Extension(c)| c.may_keep_lasting_approvals())
+    {
+        return Err(AppError::Forbidden(
+            "only the person, signed in with their own session, can allow a call for good"
+                .to_string(),
+        ));
+    }
 
     let status = |events: Vec<crate::neo4j::models::ChatEventRecord>| {
         permission_status(&events, &request_id)
@@ -924,7 +1127,13 @@ pub async fn respond_permission(
     }
 
     match chat_manager
-        .route_permission_response(&session_id.to_string(), &request_id, body.allow, true)
+        .route_permission_response(
+            &session_id.to_string(),
+            &request_id,
+            body.allow,
+            body.scope,
+            true,
+        )
         .await
     {
         Ok(route) => Ok(Json(serde_json::json!({ "routed": route }))),
@@ -940,6 +1149,13 @@ pub async fn respond_permission(
                 ))),
                 _ => Err(already()),
             }
+        }
+        Err(PermissionDeliveryError::ScopeUnsupported(scope)) => {
+            Err(AppError::BadRequest(format!(
+                "{}: this session cannot keep a permission for the scope '{}'",
+                crate::chat::manager::PERMISSION_SCOPE_UNSUPPORTED_RPC,
+                scope.as_str()
+            )))
         }
         Err(PermissionDeliveryError::Failed(e)) => Err(AppError::Internal(e)),
     }
@@ -1103,15 +1319,15 @@ pub async fn get_live_activity(
 ///
 /// ## Response codes
 ///
-/// Always **200** with `CancelTaskResult { task_id, killed_pids,
-/// capped }`:
-/// - `capped: false` → cancel applied (idempotent on unknown
-///   task_id / unknown session — see `ChatManager::cancel_task`).
+/// **200** with `CancelTaskResult { task_id, killed_pids, capped }` when the
+/// instance holding the session acted (here or over NATS):
+/// - `capped: false` → cancel applied (idempotent on an unknown or ended
+///   task_id — see `ChatManager::cancel_task`).
 /// - `capped: true` → rate cap hit (30/5min/session); display a
 ///   "slow down" toast and disable the button briefly.
 ///
-/// **501** — the session runs on the agent engine, which tracks no background
-/// task yet (`CancelTaskUnsupported`, P12).
+/// Otherwise the typed bodies of `cancel_tools` (`cancel_error`); here a 504
+/// `owner_timeout` IS retryable: a stopped task stays stopped.
 ///
 /// **404** — `chat_manager` not configured.
 pub async fn cancel_task(
@@ -1125,18 +1341,11 @@ pub async fn cancel_task(
     let result = chat_manager
         .cancel_task(&session_id.to_string(), &task_id)
         .await
-        .map_err(cancel_task_error)?;
+        // Same refusal as cancel-tools, also when the session lives on another
+        // instance (its answer comes back over NATS).
+        .map_err(cancel_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
-}
-
-/// The error of `cancel_task` as the route answers it.
-fn cancel_task_error(e: anyhow::Error) -> AppError {
-    match e.downcast_ref::<crate::chat::manager::CancelTaskUnsupported>() {
-        // A session of the agent engine: refused, said so (501).
-        Some(unsupported) => AppError::NotImplemented(unsupported.to_string()),
-        None => AppError::Internal(e),
-    }
 }
 
 // ============================================================================
@@ -1257,7 +1466,15 @@ pub async fn set_session_routing(
             "routed_by": updated.routed_by,
         })),
     );
+    let snapshot = updated
+        .capabilities
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
     let mut session = session_node_to_response(updated);
+    // F-R4: the routing changed, so may what the next turn can carry.
+    session.effective_capabilities = chat_manager
+        .effective_capabilities(&session_id.to_string(), snapshot_images(snapshot.as_ref()))
+        .await;
     stamp_activity(&state, std::slice::from_mut(&mut session)).await;
     Ok(Json(session))
 }
@@ -1865,21 +2082,6 @@ pub async fn associate_session(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn cancel_task_refused_by_the_agent_engine_is_a_501_not_a_500() {
-        let refused = anyhow::Error::new(crate::chat::manager::CancelTaskUnsupported {
-            session_id: "s".into(),
-        });
-        assert!(matches!(
-            super::cancel_task_error(refused),
-            crate::api::handlers::AppError::NotImplemented(_)
-        ));
-        assert!(matches!(
-            super::cancel_task_error(anyhow::anyhow!("boom")),
-            crate::api::handlers::AppError::Internal(_)
-        ));
-    }
-
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
@@ -4103,11 +4305,21 @@ mod tests {
     }
 
     async fn action_harness_with(cli_path: Option<&str>, refs_v1: bool) -> ActionHarness {
+        action_harness_keeping(cli_path, refs_v1, None).await
+    }
+
+    /// [`action_harness_with`], the lasting approvals kept in `lasting_rules_dir`.
+    async fn action_harness_keeping(
+        cli_path: Option<&str>,
+        refs_v1: bool,
+        lasting_rules_dir: Option<std::path::PathBuf>,
+    ) -> ActionHarness {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let app_state = crate::test_helpers::mock_app_state_with_graph(mock.clone());
         let graph = app_state.neo4j.clone();
         let mut config = test_support::chat_config();
         config.claude_cli_path = cli_path.map(str::to_string);
+        config.lasting_rules_dir = lasting_rules_dir;
         let manager = Arc::new(
             ChatManager::new_without_memory(
                 app_state.neo4j.clone(),
@@ -4193,6 +4405,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
         )
         .await;
@@ -4328,6 +4541,250 @@ mod tests {
         assert!(reason.contains("continue par un message"), "{reason}");
     }
 
+    /// P11b: a person lists and revokes THEIR lasting approvals, signed in; another person
+    /// sees none of them and cannot revoke them; an agent's token is refused.
+    #[tokio::test]
+    async fn a_person_lists_and_revokes_only_their_own_lasting_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rules");
+        let h = action_harness_keeping(None, true, Some(root.clone())).await;
+        let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let store = crate::chat::lasting_rules::LastingRuleStore::new(root);
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let place = crate::chat::lasting_rules::LastingScope::of_session(
+            Some(&store),
+            Some(&alice.to_string()),
+            Some("proj"),
+            Some(&project_root),
+            &project_root,
+        )
+        .unwrap();
+        let asked = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::ClaudeCode,
+            tool: "Bash".into(),
+            canonical: None,
+            input: serde_json::json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&asked).unwrap();
+        let rule = place.keep(&asked, &grant, "s1").unwrap();
+
+        let as_person = |method: &str, uri: String, person: Uuid| {
+            let token = crate::auth::jwt::encode_jwt(
+                person,
+                "someone@ffs.holdings",
+                "Someone",
+                "test-secret-key-minimum-32-chars!!",
+                28800,
+            )
+            .unwrap();
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let list = "/api/chat/permission-rules".to_string();
+        let (status, body) = call(&h.app, as_person("GET", list.clone(), alice)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["rules"][0]["rule"], "Bash: cat README.md", "{body}");
+        assert_eq!(body["rules"][0]["engine"], "claude_code", "{body}");
+        assert_eq!(body["rules"][0]["holds"], true, "{body}");
+        let (_, body) = call(
+            &h.app,
+            as_person("GET", format!("{list}?project=other"), alice),
+        )
+        .await;
+        assert_eq!(body["rules"], serde_json::json!([]), "{body}");
+        // Bob sees nothing of Alice's, and cannot revoke her rule.
+        let (_, body) = call(&h.app, as_person("GET", list.clone(), bob)).await;
+        assert_eq!(body["rules"], serde_json::json!([]), "{body}");
+        let revoke = format!("/api/chat/permission-rules/{}", rule.id);
+        let (status, _) = call(&h.app, as_person("DELETE", revoke.clone(), bob)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(store.rules(&alice.to_string()).len(), 1);
+        // Alice revokes it: gone, and a second revoke is 404.
+        let (status, _) = call(&h.app, as_person("DELETE", revoke.clone(), alice)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(store.rules(&alice.to_string()).is_empty());
+        let (status, _) = call(&h.app, as_person("DELETE", revoke, alice)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Not signed in: 401.
+        let anonymous = Request::builder()
+            .method("GET")
+            .uri(list)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(&h.app, anonymous).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Review of #714, S1: an MCP token of the session's owner may answer once or for the
+    /// session, never `always` (403, nothing answered); the person's own session token goes
+    /// through (here 410: the CLI is gone).
+    #[tokio::test]
+    async fn an_mcp_token_cannot_allow_a_call_for_good() {
+        let h = action_harness(None).await;
+        let owner = Uuid::new_v4();
+        let session = crate::neo4j::models::ChatSessionNode {
+            owner: Some(owner.to_string()),
+            ..test_chat_session(None)
+        };
+        h.graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        seed_permission_request(&h, sid, 1, "req-mcp").await;
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let (mcp, jti) = crate::auth::jwt::encode_mcp_token(
+            owner,
+            "owner@ffs.holdings",
+            "Owner",
+            "mcp:read mcp:write",
+            secret,
+            3600,
+        )
+        .unwrap();
+        h.graph
+            .create_mcp_token(
+                owner,
+                &jti,
+                "client",
+                "mcp:read mcp:write",
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let human =
+            crate::auth::jwt::encode_jwt(owner, "owner@ffs.holdings", "Owner", secret, 3600)
+                .unwrap();
+        let post = |token: &str, scope: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(perm_uri(sid, "req-mcp"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(r#"{{"allow":true,"scope":"{scope}"}}"#)))
+                .unwrap()
+        };
+        let (status, body) = call(&h.app, post(&mcp, "always")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let events = h.graph.get_attention_events(&[sid]).await.unwrap();
+        assert_eq!(
+            crate::chat::attention::permission_status(&events, "req-mcp"),
+            crate::chat::attention::PermissionStatus::Pending,
+        );
+        // The same token answering for the session is not refused by this rule.
+        let (status, body) = call(&h.app, post(&mcp, "session")).await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        let (status, body) = call(&h.app, post(&human, "always")).await;
+        assert_eq!(status, StatusCode::GONE, "the person goes through: {body}");
+    }
+
+    /// An agent's token, an MCP token, the server's account, the anonymous user: never
+    /// a person managing lasting approvals.
+    #[test]
+    fn only_a_person_signed_in_manages_lasting_rules() {
+        use crate::auth::jwt::Claims;
+        let person = Claims {
+            sub: Uuid::new_v4().to_string(),
+            email: "a@ffs.holdings".into(),
+            name: "A".into(),
+            iat: 0,
+            exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
+        };
+        let ext = |c: Claims| Some(axum::Extension(c));
+        assert_eq!(
+            lasting_rules_person(&ext(person.clone())).unwrap(),
+            person.sub
+        );
+        for kind in ["agent_session", "mcp", "vault"] {
+            let c = Claims {
+                token_type: Some(kind.into()),
+                ..person.clone()
+            };
+            assert!(
+                matches!(lasting_rules_person(&ext(c)), Err(AppError::Forbidden(_))),
+                "{kind}"
+            );
+        }
+        assert!(matches!(
+            lasting_rules_person(&ext(Claims::service_account("po"))),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            lasting_rules_person(&ext(Claims::anonymous())),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            lasting_rules_person(&None),
+            Err(AppError::Unauthorized(_))
+        ));
+    }
+
+    /// Review #679 finding 6: a person answers only the permission requests of THEIR
+    /// conversation. Another signed-in user gets 403 and nothing is answered (the request
+    /// still waits for its owner); the owner goes through (here 410: the CLI is gone).
+    #[tokio::test]
+    async fn only_the_owner_of_a_session_answers_its_permission_requests() {
+        let h = action_harness(None).await;
+        let owner = Uuid::new_v4();
+        let session = crate::neo4j::models::ChatSessionNode {
+            owner: Some(owner.to_string()),
+            ..test_chat_session(None)
+        };
+        h.graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        seed_permission_request(&h, sid, 1, "req-owned").await;
+        let post_as = |person: Uuid| {
+            let token = crate::auth::jwt::encode_jwt(
+                person,
+                "someone@ffs.holdings",
+                "Someone",
+                "test-secret-key-minimum-32-chars!!",
+                28800,
+            )
+            .unwrap();
+            Request::builder()
+                .method("POST")
+                .uri(perm_uri(sid, "req-owned"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(r#"{"allow":true,"scope":"session"}"#))
+                .unwrap()
+        };
+
+        let (status, body) = call(&h.app, post_as(Uuid::new_v4())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        // Nothing was decided for the owner.
+        let events = h.graph.get_attention_events(&[sid]).await.unwrap();
+        assert_eq!(
+            crate::chat::attention::permission_status(&events, "req-owned"),
+            crate::chat::attention::PermissionStatus::Pending,
+        );
+
+        let (status, body) = call(&h.app, post_as(owner)).await;
+        assert_eq!(status, StatusCode::GONE, "the owner is let through: {body}");
+    }
+
+    /// A session nobody owns (opened by the server itself, or before owners existed) is
+    /// answered as before: by any signed-in person.
+    #[tokio::test]
+    async fn a_session_without_an_owner_is_answered_by_any_person() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        seed_permission_request(&h, sid, 1, "req-free").await;
+        let (status, body) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-free"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+    }
+
     #[tokio::test]
     async fn permission_already_decided_on_a_dead_session_is_409() {
         let h = action_harness(None).await;
@@ -4341,6 +4798,8 @@ mod tests {
             ChatEvent::PermissionDecision {
                 id: "req-x".into(),
                 allow: true,
+                scope: None,
+                rule: None,
             },
         )
         .await;
@@ -4919,5 +5378,30 @@ mod switch_provider_tests {
         );
         // And it is not one of the switch's own answers.
         assert!(!matches!(&told, AppError::NotFound(_)), "{told:?}");
+    }
+}
+
+/// The HTTP answer of a cancel (`cancel-tools`, `cancel-task`) that did not
+/// happen: the provider's refusal (`unsupported` 422, …, `chat::provider::errors`)
+/// or why the instance holding the session gave no answer
+/// (`chat::cancel_relay::CancelRelayError`: `owner_unreachable` 409,
+/// `owner_timeout` 504, `session_gone` 410, `owner_protocol` / `owner_failed` 502).
+/// Anything else is a 500.
+pub(crate) fn cancel_error(error: anyhow::Error) -> AppError {
+    use crate::chat::cancel_relay::CancelRelayError;
+    if let Some(relay) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CancelRelayError>())
+    {
+        let failure = relay.failure();
+        tracing::warn!(code = failure.code, error = %error, "cancel: no answer from the instance holding the session");
+        return AppError::Provider(Box::new(failure));
+    }
+    match crate::chat::provider::errors::classify_open_error(&error, None) {
+        Some(failure) => {
+            tracing::warn!(code = failure.code, error = %error, "cancel refused by the provider");
+            AppError::Provider(Box::new(failure))
+        }
+        None => AppError::Internal(error),
     }
 }

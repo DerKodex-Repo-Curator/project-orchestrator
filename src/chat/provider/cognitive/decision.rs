@@ -149,6 +149,16 @@ pub struct DecideRequest {
     /// is still taken and stored, never applied, its reason prefixed with this code and
     /// `used` set to `current`.
     pub not_selectable: Option<&'static str>,
+    /// R-S3: the turn follows a change of model made for the SAME class on the previous turn.
+    /// No exploration draw, and the hysteresis margin is applied to the posterior MEANS of
+    /// the arms (not to the Thompson draws): the pair in force is replaced only by a
+    /// challenger better ON AVERAGE by [`super::decider::HYSTERESIS_MARGIN`], so two
+    /// same-class turns can never go A → B → A on noisy draws (decision f9363403).
+    pub steady: bool,
+    /// The caller's guards that narrowed this decision (`same_class_no_explore`,
+    /// `after_provider_move`): each is appended to the stored reason as
+    /// `; narrowed: <code>`, like `not_moved:` / `not_changed:`.
+    pub narrowed: Vec<&'static str>,
 }
 
 impl DecideRequest {
@@ -167,6 +177,8 @@ impl DecideRequest {
             run_id: None,
             turn_index: None,
             not_selectable: None,
+            steady: false,
+            narrowed: Vec::new(),
         }
     }
 }
@@ -176,7 +188,7 @@ impl DecideRequest {
 ///
 /// Contract: the decision is persisted before it is returned, whether it is
 /// applied or not. `applied` follows the mode and the stage: a `shadow` stage
-/// never applies, `primary` applies nothing, `mixed` applies to executors and
+/// never applies, `primary` applies nothing, `executors_only` applies to executors and
 /// utilities only, `full` applies to everyone. An explicit slot is returned
 /// unapplied with `chosen: None`.
 #[async_trait]

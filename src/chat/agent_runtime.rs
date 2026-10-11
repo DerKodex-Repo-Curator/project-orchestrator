@@ -20,15 +20,21 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use nexus_claude::agent::{
     AgentEvent, AgentProvider, AgentSession, CancelScope, Capabilities, InterruptScope,
-    PermissionDecision, PolicyMode, ProviderError, TurnInput,
+    PermissionDecision, PermissionScope, PolicyMode, ProviderError, TurnInput,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
 use super::config::RetryConfig;
-use super::manager::{CancelToolsResult, ChatManager, CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS};
+use super::manager::PermissionDeliveryError;
+use super::manager::{
+    CancelTaskResult, CancelToolsResult, ChatManager, CANCEL_TASK_CAP, CANCEL_TASK_WINDOW_SECS,
+    CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS,
+};
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
-use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
+use super::types::{
+    BackgroundTaskInfo, ChatEvent, PendingMessage, PendingMessageKind, PermissionAnswerScope,
+};
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
 
@@ -295,6 +301,7 @@ pub(crate) fn images_refused(reason: &str, message: String) -> ChatEvent {
         code: Some("images_refused".to_string()),
         reason: Some(reason.to_string()),
         index: None,
+        request_id: None,
     }
 }
 
@@ -449,6 +456,16 @@ pub trait TurnServices: Send + Sync {
     ) -> std::result::Result<Vec<super::message_attachments::AttachedImage>, String> {
         Ok(Vec::new())
     }
+    /// The model the turn about to be sent must run on because it carries images the
+    /// model in force cannot read (F-R4): PO routes the turn to a candidate that reads
+    /// them, BEFORE it is sent (the provider checks the active model's vision when the
+    /// turn is sent). `None`: nothing to change. Default: never.
+    async fn model_for_images(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+    /// The model [`Self::model_for_images`] named could not be made active: whatever the
+    /// host decided for the turn on that ground is undone. Default: nothing.
+    async fn image_model_not_applied(&self, _session_id: &str, _model: &str) {}
     /// Hands an event of the session to the other instances (NATS), as the Claude
     /// Code engine publishes each of its events. Default: nowhere.
     fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
@@ -527,6 +544,21 @@ pub struct AgentSessionHandle {
     cancel_tools_cap: u32,
     /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
     cancel_tools_window: Duration,
+    /// What the user granted "for the session" (`chat::session_grants`): the backend
+    /// answers itself the later requests of THIS session they cover ([`Self::emit`]);
+    /// never handed to the provider.
+    session_grants: std::sync::Mutex<super::session_grants::SessionGrants>,
+    /// The call each permission request still waiting asks for (request id -> call):
+    /// what a `session` grant is derived from.
+    asked_calls: std::sync::Mutex<HashMap<String, super::session_grants::AskedCall>>,
+    /// Who asks this session's permission requests (its provider kind): whether a
+    /// request carries the whole call (`session_grants::Asker`).
+    asker: super::session_grants::Asker,
+    /// When `cancel_task` was asked of this session: the sliding window of the
+    /// per-session cap the Claude Code engine applies to it
+    /// (`ActiveSession::cancel_task_history`, `CANCEL_TASK_CAP` per
+    /// `CANCEL_TASK_WINDOW_SECS`).
+    cancel_task_history: Arc<Mutex<VecDeque<Instant>>>,
     /// How the provider states the cost of a turn (`session_record::CostFigure`).
     cost_figure: super::session_record::CostFigure,
     /// The provider is known to keep a turn it ended `interrupted` in its history
@@ -550,16 +582,68 @@ pub struct AgentSessionHandle {
 
 impl AgentSessionHandle {
     /// Persists (except transient events) and broadcasts one event, then the timing
-    /// of the tool call it ends, if it ends one.
+    /// of the tool call it ends, if it ends one. A permission request a grant of this
+    /// session covers (an earlier `session` answer) is answered here, `once`, its
+    /// decision emitted with the scope `session` and the grant: the user is not asked.
+    /// Only requests the provider ASKED reach this point: its policy (read-only access,
+    /// denies, trust) has already decided.
     pub async fn emit(&self, event: ChatEvent) {
         let timing = self.tool_clock.observe(&event, chrono::Utc::now());
-        self.emit_one(event).await;
+        let covered = self.emit_one(event).await;
         if let Some(timing) = timing {
             self.emit_one(timing).await;
         }
+        let Some((covered, cover)) = covered else {
+            return;
+        };
+        // On the tool clock BEFORE the provider has it, as for an answer of the user,
+        // and handed over alone among the answers to this request.
+        let answering = self.tool_clock.answering(&covered).await;
+        let mark = self.tool_clock.decided(&covered, true, chrono::Utc::now());
+        let answered = self
+            .session
+            .answer_permission(&covered, PermissionDecision::allow_once())
+            .await;
+        if answered.is_err() {
+            self.tool_clock.undecided(&covered, mark);
+        }
+        drop(answering);
+        match answered {
+            Ok(()) => {
+                self.asked_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&covered);
+                let _ = self
+                    .emit_one(ChatEvent::PermissionDecision {
+                        id: covered,
+                        allow: true,
+                        scope: Some(if cover.lasting {
+                            PermissionAnswerScope::Always
+                        } else {
+                            PermissionAnswerScope::Session
+                        }),
+                        rule: Some(cover.rule),
+                    })
+                    .await;
+            }
+            // Left waiting: the user answers it.
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "a call a session grant covers could not be allowed: the user is asked"
+                )
+            }
+        }
     }
 
-    async fn emit_one(&self, mut event: ChatEvent) {
+    /// [`Self::emit`] for one event; returns the id of a permission request a grant of
+    /// this session covers, and that grant as the user is shown it.
+    async fn emit_one(
+        &self,
+        mut event: ChatEvent,
+    ) -> Option<(String, super::session_grants::Cover)> {
         self.touch();
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
@@ -577,13 +661,55 @@ impl AgentSessionHandle {
             degraded_features.get_or_insert_with(|| self.degraded.clone());
             provider.get_or_insert_with(|| self.provider.clone());
             capabilities.get_or_insert_with(|| {
-                serde_json::to_value(&self.capabilities).unwrap_or_default()
+                serde_json::to_value(self.offered_capabilities()).unwrap_or_default()
             });
             tool_policy.get_or_insert_with(|| self.tool_policy.clone());
         }
+        let mut covered = None;
+        // A command the shell may have moved with: lasting rules stop covering commands.
+        if let Some(call) = super::session_grants::observed_call(self.asker, &event) {
+            self.session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .observe_tool_use(&call);
+        }
+        if let ChatEvent::PermissionRequest {
+            id,
+            tool,
+            input,
+            canonical,
+            always,
+            ..
+        } = &mut event
+        {
+            let call = super::session_grants::AskedCall {
+                asker: self.asker,
+                tool: tool.clone(),
+                canonical: canonical.clone(),
+                input: input.clone(),
+            };
+            // Whether this very call may be answered `always` (the client offers it then).
+            *always = self
+                .session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .lasting_grant_for(&call)
+                .map(|_| true);
+            covered = Box::pin(super::session_grants::cover(&self.session_grants, &call))
+                .await
+                .map(|cover| (id.clone(), cover));
+            self.asked_calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.clone(), call);
+        }
         match &event {
             ChatEvent::StreamDelta { text, .. } => self.streaming_text.lock().await.push_str(text),
-            ChatEvent::StreamingStatus { .. } | ChatEvent::PendingQueue { .. } => {}
+            // `active_tasks_update` is a snapshot, never replayed (the client reads
+            // `GET .../background-tasks` when it joins), as on the Claude Code engine.
+            ChatEvent::StreamingStatus { .. }
+            | ChatEvent::PendingQueue { .. }
+            | ChatEvent::ActiveTasksUpdate { .. } => {}
             other => self.streaming_events.lock().await.push(other.clone()),
         }
         if !matches!(
@@ -591,14 +717,19 @@ impl AgentSessionHandle {
             ChatEvent::StreamDelta { .. }
                 | ChatEvent::StreamingStatus { .. }
                 | ChatEvent::PendingQueue { .. }
+                | ChatEvent::ActiveTasksUpdate { .. }
         ) {
             if let Some(uuid) = self.uuid {
+                // A stopped turn is stored in its neutral form, as on the Claude Code
+                // engine: the reloaded thread shows no error block under it.
+                let stored = super::manager::stored_interrupted_result(&event);
                 let record = ChatEventRecord {
                     id: Uuid::new_v4(),
                     session_id: uuid,
                     seq: self.next_seq.fetch_add(1, Ordering::SeqCst),
                     event_type: event.event_type().to_string(),
-                    data: serde_json::to_string(&event).unwrap_or_default(),
+                    data: serde_json::to_string(stored.as_ref().unwrap_or(&event))
+                        .unwrap_or_default(),
                     created_at: chrono::Utc::now(),
                 };
                 let _ = self.graph.store_chat_events(uuid, vec![record]).await;
@@ -609,6 +740,7 @@ impl AgentSessionHandle {
             services.observe(&self.session_id, &event);
         }
         let _ = self.events_tx.send(event);
+        covered
     }
 
     /// Persists the provider's resume token when it is not the one the graph holds.
@@ -662,6 +794,28 @@ impl AgentSessionHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .elapsed()
+    }
+
+    /// Tests: the session last did something `ago` before now.
+    #[cfg(test)]
+    pub(crate) fn backdate_activity(&self, ago: Duration) {
+        let then = Instant::now()
+            .checked_sub(ago)
+            .expect("a representable instant");
+        *self.last_activity.lock().unwrap_or_else(|e| e.into_inner()) = then;
+    }
+
+    /// Tests: the provider's background task snapshot, as its event would set it
+    /// (no event emitted, no activity recorded).
+    #[cfg(test)]
+    pub(crate) async fn set_background_tasks(
+        &self,
+        tasks: Vec<nexus_claude::agent::BackgroundTask>,
+    ) {
+        self.mapper
+            .lock()
+            .await
+            .map(&AgentEvent::BackgroundTasks { tasks });
     }
 
     /// The opening message of the session was counted when the session was created:
@@ -904,6 +1058,21 @@ impl AgentSessionHandle {
             },
             _ => Vec::new(),
         };
+        // F-R4: images the model in force cannot read go to a model PO routes to that
+        // reads them, made active before the turn is sent. A change that fails leaves the
+        // provider to say it refuses the images.
+        if !images.is_empty() {
+            if let Some(services) = &self.services {
+                if let Some(model) = services.model_for_images(&self.session_id).await {
+                    if let Err(error) = self.set_model(&model).await {
+                        tracing::warn!(session_id = %self.session_id, %model, %error, "the model that reads the images could not be made active");
+                        services
+                            .image_model_not_applied(&self.session_id, &model)
+                            .await;
+                    }
+                }
+            }
+        }
         let input = turn_input(sent, &images);
         let stream = match self.session.send_turn(input.clone()).await {
             Ok(stream) => stream,
@@ -949,7 +1118,10 @@ impl AgentSessionHandle {
                 Ok(opened) => turn = opened,
                 Err(error) => {
                     let event = AgentEvent::Error { error };
-                    for chat_event in self.mapper.lock().await.map(&event) {
+                    // Mapped under the lock, emitted without it (the cockpit's snapshot
+                    // reads the mapper).
+                    let chat_events = self.mapper.lock().await.map(&event);
+                    for chat_event in chat_events {
                         self.emit(chat_event).await;
                     }
                 }
@@ -1088,7 +1260,8 @@ impl AgentSessionHandle {
             {
                 // The turn ends as any stopped turn does: on its terminal event.
                 let stopped = interrupted_done();
-                for chat_event in self.mapper.lock().await.map(&stopped) {
+                let chat_events = self.mapper.lock().await.map(&stopped);
+                for chat_event in chat_events {
                     self.emit(chat_event).await;
                 }
                 break;
@@ -1097,7 +1270,8 @@ impl AgentSessionHandle {
                 Ok(next) => stream = next,
                 Err(e) => {
                     let ev = AgentEvent::Error { error: e };
-                    for chat_event in self.mapper.lock().await.map(&ev) {
+                    let chat_events = self.mapper.lock().await.map(&ev);
+                    for chat_event in chat_events {
                         self.emit(chat_event).await;
                     }
                     break;
@@ -1162,6 +1336,7 @@ impl AgentSessionHandle {
                 code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
                 reason: Some("after_turn".to_string()),
                 index: None,
+                request_id: None,
             })
             .await;
             return;
@@ -1220,8 +1395,118 @@ impl AgentSessionHandle {
         true
     }
 
-    /// Answers a permission request.
+    /// Answers a permission request for this call only.
     pub async fn answer_permission(&self, request_id: &str, allow: bool) -> Result<()> {
+        self.answer_permission_scoped(request_id, allow, PermissionAnswerScope::Once)
+            .await
+            .map_err(|e| match e {
+                PermissionDeliveryError::Failed(e) => e,
+                other => anyhow!(other.to_string()),
+            })
+    }
+
+    /// Keeps a grant as if the user had answered `session` (tests).
+    #[cfg(test)]
+    pub(crate) fn seed_session_grant(&self, grant: super::session_grants::SessionGrant) {
+        self.session_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(grant);
+    }
+
+    /// The capabilities this session offers: its provider's, `always` being the BACKEND's
+    /// (P11b) whatever the provider declares: offered only when this session keeps
+    /// lasting rules (a store, an owner, a project) for an engine that can
+    /// (`SessionGrants::keeps_lasting`), and the provider asks for the session at all.
+    /// What `system_init` carries.
+    pub fn offered_capabilities(&self) -> Capabilities {
+        let mut caps = self.capabilities.clone();
+        caps.permission_scopes
+            .retain(|scope| *scope != PermissionScope::Always);
+        let keeps = self
+            .session_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keeps_lasting(self.asker);
+        if keeps && caps.permission_scopes.contains(&PermissionScope::Session) {
+            caps.permission_scopes.push(PermissionScope::Always);
+        }
+        caps
+    }
+
+    /// Answers a permission request; an approval lasts as long as `scope` says. The
+    /// provider is ALWAYS answered `once` (never a provider-side session or lasting
+    /// rule, whose matching is looser than what the user approved):
+    ///
+    /// - `session`: the grant of this call (`session_grants::grant_for`: the identical
+    ///   call, or any call of a read-only tool of nexus) is kept in this session AFTER the
+    ///   provider took the answer; the backend answers the later requests it covers
+    ///   ([`Self::emit`]). A call that cannot be granted (a request that does not carry the
+    ///   whole call, a tool or a program off the allowlist) is refused.
+    /// - `always`: the lasting grant of this call (`session_grants::lasting_grant_for`:
+    ///   the identical call, stricter than `session`) is kept for the session's person and
+    ///   project (`chat::lasting_rules`) AFTER the provider took the answer; the backend
+    ///   answers the later requests it covers, in any of their sessions. Refused when the
+    ///   session keeps no lasting rule or the call cannot be approved for good. When the
+    ///   rule cannot be written, the call stays granted for this session and the decision
+    ///   says `session` (never an `always` that was not kept).
+    ///
+    /// A refusal ([`PermissionDeliveryError::ScopeUnsupported`]) answers nothing: the
+    /// request stays waiting.
+    pub async fn answer_permission_scoped(
+        &self,
+        request_id: &str,
+        allow: bool,
+        scope: PermissionAnswerScope,
+    ) -> std::result::Result<(), PermissionDeliveryError> {
+        // The call this request asks for: what a grant is derived from.
+        let asked = self
+            .asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(request_id)
+            .cloned();
+        // `always` kept as a lasting rule (`false`: as a session grant, the shell having
+        // possibly left the project's root; review of #714, A).
+        let mut for_good = false;
+        let grant = match (allow, scope) {
+            (false, _) | (true, PermissionAnswerScope::Once) => None,
+            (true, PermissionAnswerScope::Session) => {
+                if !self
+                    .offered_capabilities()
+                    .permission_scopes
+                    .contains(&PermissionScope::Session)
+                {
+                    return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                }
+                let grant = asked.as_ref().and_then(|call| {
+                    self.session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .grant_for(call)
+                });
+                Some(grant.ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?)
+            }
+            (true, PermissionAnswerScope::Always) => {
+                if !self
+                    .offered_capabilities()
+                    .permission_scopes
+                    .contains(&PermissionScope::Always)
+                {
+                    return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                }
+                let kept = asked.as_ref().and_then(|call| {
+                    self.session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .always_grant(call)
+                });
+                let (grant, lasting) =
+                    kept.ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?;
+                for_good = lasting;
+                Some(grant)
+            }
+        };
         let decision = if allow {
             PermissionDecision::allow_once()
         } else {
@@ -1230,17 +1515,64 @@ impl AgentSessionHandle {
         // On the tool clock BEFORE the provider has it: a fast tool's result cannot
         // overtake it.
         // A second answer (double click, two tabs) the provider refuses takes back
-        // only its own mark, never the first answer's.
+        // only its own mark, never the first answer's; and it waits until the first
+        // was handed over, so the provider gets them in the order the clock kept.
+        let answering = self.tool_clock.answering(request_id).await;
         let mark = self
             .tool_clock
             .decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = self.session.answer_permission(request_id, decision).await {
             self.tool_clock.undecided(request_id, mark);
-            return Err(anyhow::Error::new(e));
+            return Err(PermissionDeliveryError::Failed(anyhow::Error::new(e)));
         }
+        drop(answering);
+        // Kept only now that the provider took the answer.
+        let mut kept = scope;
+        match (&grant, &asked, scope) {
+            (Some(grant), Some(call), PermissionAnswerScope::Always) if for_good => {
+                let place = {
+                    let mut grants = self
+                        .session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    grants.begin_lasting(grant.clone());
+                    // The shell may have moved since: then nothing is written.
+                    (!grants.cwd_bound(call))
+                        .then(|| grants.lasting_scope())
+                        .flatten()
+                };
+                let written =
+                    super::lasting_rules::keep(place, call, grant, &self.session_id).await;
+                self.session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .end_lasting(grant, written);
+                if !written {
+                    kept = PermissionAnswerScope::Session;
+                }
+            }
+            (Some(grant), _, _) => {
+                if scope == PermissionAnswerScope::Always {
+                    kept = PermissionAnswerScope::Session;
+                }
+                self.session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .add(grant.clone())
+            }
+            (None, _, _) => {}
+        }
+        self.asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(request_id);
         self.emit(ChatEvent::PermissionDecision {
             id: request_id.to_string(),
             allow,
+            scope: kept.lasting(allow),
+            rule: grant
+                .as_ref()
+                .map(super::session_grants::SessionGrant::describe),
         })
         .await;
         Ok(())
@@ -1297,11 +1629,18 @@ impl AgentSessionHandle {
                 capped: true,
             });
         }
-        let outcome = self
-            .session
-            .cancel_tools(CancelScope::All)
-            .await
-            .map_err(anyhow::Error::new)?;
+        // Bounded like a cancel relayed from another instance (review N6): a
+        // provider that hangs is `owner_timeout` (not retryable for cancel_tools).
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::All),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Tools))?;
+        let outcome = match call {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(self.cancel_refused(error).await),
+        };
         let diagnostic = outcome.diagnostic.unwrap_or_default();
         tracing::info!(
             session_id = %self.session_id,
@@ -1319,6 +1658,101 @@ impl AgentSessionHandle {
             killed_pids: diagnostic.killed_pids,
             capped: false,
         })
+    }
+
+    /// Stops ONE background task (a `Bash run_in_background`, a `Monitor`) by its
+    /// wire id — the `tool_use` that started it, what `active_tasks_update` and the
+    /// Claude Code engine call it — through the provider
+    /// (`AgentSession::cancel_tools(task { id })`, the provider's own id found in
+    /// the last snapshot). The turn, if one runs, goes on. The per-session cap of
+    /// the Claude Code engine applies (`CANCEL_TASK_CAP` per window): past it,
+    /// nothing reaches the provider and the result says `capped`.
+    ///
+    /// The provider follows with a `background_tasks` snapshot (the task `killed`),
+    /// which goes out as `active_tasks_update` without it. A task that already
+    /// ended, or that no snapshot ever named, is the idempotent no-op of the Claude
+    /// Code engine (`killed_pids` empty). A provider that cannot stop a task
+    /// (`Unsupported`: a Claude Code over SSH has no `tool_cancel`, a session
+    /// without background tasks) is refused: typed on the wire
+    /// (`error { code: cancel_refused }`) and in the `Err` (the `ProviderError` in
+    /// the chain), never a success.
+    pub async fn cancel_task(&self, task_id: &str) -> Result<CancelTaskResult> {
+        let allowed = ChatManager::check_and_record_cancel_cap(
+            &self.cancel_task_history,
+            CANCEL_TASK_CAP,
+            Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
+        )
+        .await;
+        let result = |killed_pids: Vec<u32>, capped: bool| CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids,
+            capped,
+        };
+        if !allowed {
+            tracing::warn!(session_id = %self.session_id, task_id, "cancel_task: rate cap hit, refusing");
+            return Ok(result(Vec::new(), true));
+        }
+        let known = self.mapper.lock().await.provider_task(task_id);
+        let provider_id = match &known {
+            // Over already: nothing to stop, nothing changes (as on Claude Code).
+            Some((_, false)) => return Ok(result(Vec::new(), false)),
+            Some((id, true)) => id.clone(),
+            // No snapshot named it (yet): the provider decides.
+            None => task_id.to_string(),
+        };
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::Task {
+                id: provider_id.clone(),
+            }),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Task))?;
+        match call {
+            Ok(outcome) => {
+                let diagnostic = outcome.diagnostic.unwrap_or_default();
+                tracing::info!(
+                    session_id = %self.session_id,
+                    task_id,
+                    provider_task_id = %provider_id,
+                    tasks_cancelled = outcome.tools_cancelled,
+                    killed = ?diagnostic.killed_pids,
+                    "cancel_task: background task stopped"
+                );
+                Ok(result(diagnostic.killed_pids, false))
+            }
+            // An id the provider does not know (or no longer runs): the idempotent
+            // no-op of the Claude Code engine.
+            Err(ProviderError::InvalidRequest { detail }) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    task_id,
+                    %detail,
+                    known_in_snapshot = known.is_some(),
+                    "cancel_task: the provider does not know this task (unknown id, already over, or a Stop that came before the first background_tasks snapshot named it): idempotent no-op"
+                );
+                Ok(result(Vec::new(), false))
+            }
+            Err(error) => Err(self.cancel_refused(error).await),
+        }
+    }
+
+    /// The background tasks still running, as the last `active_tasks_update` said.
+    pub async fn active_background_tasks(&self) -> Vec<BackgroundTaskInfo> {
+        self.mapper.lock().await.active_tasks()
+    }
+
+    /// A cancel the provider refused: an `Unsupported` is announced to every
+    /// client of the session (`error { code: cancel_refused, reason: <capability> }`)
+    /// — the click had no effect and the user must know; the error is returned with
+    /// the `ProviderError` in its chain, which the HTTP layer answers typed
+    /// (`AppError::from_open_error`: 422 `unsupported`).
+    async fn cancel_refused(&self, error: ProviderError) -> anyhow::Error {
+        if let ProviderError::Unsupported { capability } = &error {
+            tracing::warn!(session_id = %self.session_id, %capability, "cancel refused: the provider cannot do it");
+            self.emit(cancel_refused_event(capability)).await;
+        }
+        anyhow::Error::new(error)
     }
 
     /// Changes the model live.
@@ -1351,10 +1785,36 @@ impl AgentSessionHandle {
     }
 }
 
+/// A cancel the provider did not answer within `OWNER_CANCEL_BOUND`.
+fn cancel_timeout(kind: super::cancel_relay::CancelKind) -> anyhow::Error {
+    anyhow::Error::new(super::cancel_relay::CancelRelayError::OwnerTimeout { kind })
+}
+
+/// The wire form of a cancel (`cancel_tools`, `cancel_task`) the provider refused
+/// for lack of `capability` (`tool_cancel`: a Claude Code over SSH or off Unix;
+/// `background_tasks`: a session that runs none).
+pub(crate) fn cancel_refused_event(capability: &str) -> ChatEvent {
+    ChatEvent::Error {
+        message: format!(
+            "Error: This session cannot stop running tools: its provider does not support \
+             `{capability}`. Nothing was stopped."
+        ),
+        parent_tool_use_id: None,
+        code: Some("cancel_refused".to_string()),
+        reason: Some(capability.to_string()),
+        index: None,
+        request_id: None,
+    }
+}
+
 /// The live sessions of the agent path.
 pub struct AgentRuntime {
     sessions: RwLock<HashMap<String, Arc<AgentSessionHandle>>>,
     graph: Arc<dyn GraphStore>,
+    /// The third-party MCP tools the operator declared read-only
+    /// (`ChatConfig::read_only_mcp_tools`): what each session's grants may cover
+    /// (`session_grants::SessionGrants::declaring`).
+    read_only_mcp_tools: Vec<String>,
 }
 
 impl AgentRuntime {
@@ -1363,7 +1823,15 @@ impl AgentRuntime {
         Self {
             sessions: RwLock::new(HashMap::new()),
             graph,
+            read_only_mcp_tools: Vec::new(),
         }
+    }
+
+    /// This runtime, its sessions declaring these third-party MCP tools read-only (exact
+    /// `mcp__<server>__<tool>` names): the only ones a session grant may cover.
+    pub fn declaring_read_only_mcp_tools(mut self, tools: Vec<String>) -> Self {
+        self.read_only_mcp_tools = tools;
+        self
     }
 
     /// The live session, if this runtime owns it.
@@ -1433,6 +1901,36 @@ impl AgentRuntime {
         services: Option<Arc<dyn TurnServices>>,
         extra_degraded: Vec<String>,
     ) -> Arc<AgentSessionHandle> {
+        self.adopt_declaring(
+            session_id,
+            provider_id,
+            session,
+            first_seq,
+            provider_kind,
+            tool_policy,
+            services,
+            extra_degraded,
+            super::session_grants::SessionGrants::declaring(self.read_only_mcp_tools.clone()),
+        )
+        .await
+    }
+
+    /// [`Self::adopt_with`] for a session whose grants start as `grants`: its declared
+    /// read-only MCP tools (the runtime's, minus what the session's project redefines:
+    /// `session_grants::declarations_for_project`) and the lasting rules it keeps.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn adopt_declaring(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        session: Arc<dyn AgentSession>,
+        first_seq: i64,
+        provider_kind: &str,
+        tool_policy: serde_json::Value,
+        services: Option<Arc<dyn TurnServices>>,
+        extra_degraded: Vec<String>,
+        grants: super::session_grants::SessionGrants,
+    ) -> Arc<AgentSessionHandle> {
         let mut degraded = degraded_features(session.capabilities());
         for feature in extra_degraded {
             if !degraded.contains(&feature) {
@@ -1469,6 +1967,10 @@ impl AgentRuntime {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             tool_clock: super::tool_clock::ToolClock::for_session(session_id),
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            session_grants: std::sync::Mutex::new(grants),
+            asked_calls: std::sync::Mutex::new(HashMap::new()),
+            asker: super::session_grants::Asker::from_provider_kind(provider_kind),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
             keeps_interrupted_turns: keeps_interrupted_turns(provider_kind),
             record: Mutex::new(()),
@@ -1616,6 +2118,8 @@ pub(crate) mod fake {
         pub permission_answers: StdMutex<Vec<(String, PermissionDecision)>>,
         pub interrupts: StdMutex<Vec<InterruptScope>>,
         pub models: StdMutex<Vec<String>>,
+        /// The next `set_model` fails with this error.
+        pub fail_set_model: StdMutex<Option<ProviderError>>,
         pub modes: StdMutex<Vec<PolicyMode>>,
         pub closed: AtomicBool,
         pub turns_started: StdMutex<Vec<String>>,
@@ -1632,6 +2136,8 @@ pub(crate) mod fake {
         /// When set, `answer_permission` waits for this signal before it returns: the
         /// provider is slow to take the answer.
         pub hold_answers: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        /// The same, for the answers that allow only (a denial is taken at once).
+        pub hold_allows: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl FakeState {
@@ -1715,6 +2221,10 @@ pub(crate) mod fake {
             if let Some(hold) = hold {
                 hold.notified().await;
             }
+            let hold_allow = self.state.hold_allows.lock().unwrap().clone();
+            if let (Some(hold), PermissionDecision::Allow { .. }) = (hold_allow, &decision) {
+                hold.notified().await;
+            }
             let mut answers = self.state.permission_answers.lock().unwrap();
             // As nexus does: a request is answered once.
             if answers.iter().any(|(id, _)| id == request_id) {
@@ -1744,6 +2254,9 @@ pub(crate) mod fake {
             Ok(CancelOutcome::default())
         }
         async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
+            if let Some(error) = self.state.fail_set_model.lock().unwrap().take() {
+                return Err(error);
+            }
             self.state.models.lock().unwrap().push(model.to_string());
             Ok(())
         }
@@ -1768,10 +2281,17 @@ pub(crate) mod fake {
     pub struct FakeProvider {
         pub state: Arc<FakeState>,
         pub fail_open: Arc<StdMutex<Option<ProviderError>>>,
+        /// Every `open` fails with this error, as long as it is set (`fail_open` fails one).
+        pub fail_every_open: Arc<StdMutex<Option<ProviderError>>>,
         /// Capabilities the sessions of this provider declare.
         pub caps: Arc<StdMutex<Capabilities>>,
         /// The kind it says it is (Claude Code unless a test plays another).
         pub kind: Arc<StdMutex<ProviderKind>>,
+        /// What `health` answers (ok unless a test plays another).
+        pub health: Arc<StdMutex<Option<ProviderHealth>>>,
+        /// How long `open` and `resume` take (none unless a test needs the opening to
+        /// yield, or to be dropped while it waits).
+        pub open_delay: Arc<StdMutex<Option<std::time::Duration>>>,
     }
 
     impl FakeProvider {
@@ -1779,8 +2299,11 @@ pub(crate) mod fake {
             Self {
                 state: Arc::new(FakeState::default()),
                 fail_open: Arc::new(StdMutex::new(None)),
+                fail_every_open: Arc::new(StdMutex::new(None)),
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
                 kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
+                health: Arc::new(StdMutex::new(None)),
+                open_delay: Arc::new(StdMutex::new(None)),
             }
         }
         pub(crate) fn session(&self) -> Arc<FakeSession> {
@@ -1803,7 +2326,11 @@ pub(crate) mod fake {
             *self.kind.lock().unwrap()
         }
         async fn health(&self) -> ProviderHealth {
-            ProviderHealth::ok(None)
+            self.health
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| ProviderHealth::ok(None))
         }
         async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
             Ok(Vec::new())
@@ -1816,6 +2343,13 @@ pub(crate) mod fake {
             caps
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            let delay = *self.open_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            if let Some(e) = self.fail_every_open.lock().unwrap().clone() {
+                return Err(e);
+            }
             if let Some(e) = self.fail_open.lock().unwrap().take() {
                 return Err(e);
             }
@@ -1828,6 +2362,10 @@ pub(crate) mod fake {
             spec: SessionSpec,
             token: ResumeToken,
         ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            let delay = *self.open_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             *self.state.provider_session_id.lock().unwrap() = token
                 .data()
                 .get("session_id")
@@ -2213,6 +2751,116 @@ mod adopt_tests {
                 .count(),
             1,
             "listed once, whatever the caller passes"
+        );
+    }
+
+    /// The review of #681 (finding 1): Codex asks a patch with `{reason}` only (nexus
+    /// `codex/map.rs`), no path, no diff. A `session` answer to a first patch is refused,
+    /// typed; the second patch, to another file, is asked to the user, never answered by
+    /// the backend.
+    #[tokio::test]
+    async fn a_codex_patch_is_never_granted_for_the_session_and_the_next_one_is_asked() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let handle = runtime
+            .adopt(
+                "codex-patches",
+                "codex",
+                provider.session(),
+                1,
+                "codex",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let patch = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "apply_patch".into(),
+            input: serde_json::json!({ "reason": null }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Edit".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        // The first patch (README.md): `session` refused, nothing answered; `once` goes.
+        handle.emit(patch("patch-readme")).await;
+        let refused = handle
+            .answer_permission_scoped("patch-readme", true, PermissionAnswerScope::Session)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Session
+                ))
+            ),
+            "{refused:?}"
+        );
+        assert!(provider.state.permission_answers.lock().unwrap().is_empty());
+        handle
+            .answer_permission_scoped("patch-readme", true, PermissionAnswerScope::Once)
+            .await
+            .unwrap();
+        // The second patch (~/.zshrc) reads the same: it waits for the user.
+        handle.emit(patch("patch-zshrc")).await;
+        let answered: Vec<String> = provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(answered, vec!["patch-readme".to_string()]);
+
+        // The same session kind on the native engine: a `nexus-tools` write IS granted
+        // for the identical call (its input is the whole call).
+        let native = runtime
+            .adopt(
+                "native-write",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        native.emit(write("write-1")).await;
+        native
+            .answer_permission_scoped("write-1", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        native.emit(write("write-2")).await;
+        let answered: Vec<String> = provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                "patch-readme".to_string(),
+                "write-1".into(),
+                "write-2".into()
+            ]
         );
     }
 }
@@ -2875,6 +3523,118 @@ mod after_turn_tests {
         }
         assert_eq!(cancelled, ["t-left"], "only the tool left without a result");
     }
+
+    /// F-R4: a turn with an image goes out with an image, and the model PO routes it to is
+    /// made active BEFORE it is sent (the provider checks the active model's vision when
+    /// the turn is sent, before any hook of the turn runs).
+    struct ImageHost {
+        state: Arc<super::fake::FakeState>,
+        turns_seen_when_asked: StdMutex<Option<usize>>,
+        route_to: Option<&'static str>,
+        not_applied: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnServices for ImageHost {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
+            sent.to_string()
+        }
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
+        }
+        async fn images(
+            &self,
+            _shown: &str,
+        ) -> std::result::Result<Vec<super::super::message_attachments::AttachedImage>, String>
+        {
+            Ok(vec![super::super::message_attachments::AttachedImage {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+                source: super::super::message_attachments::MessageAttachment {
+                    id: uuid::Uuid::new_v4(),
+                    filename: "x.png".into(),
+                    mime_type: "image/png".into(),
+                    size_bytes: 4,
+                },
+            }])
+        }
+        async fn model_for_images(&self, _session_id: &str) -> Option<String> {
+            *self.turns_seen_when_asked.lock().unwrap() =
+                Some(self.state.turns_started.lock().unwrap().len());
+            self.route_to.map(str::to_string)
+        }
+        async fn image_model_not_applied(&self, _session_id: &str, model: &str) {
+            self.not_applied.lock().unwrap().push(model.to_string());
+        }
+    }
+
+    async fn image_turn(route_to: Option<&'static str>) -> (FakeProvider, Arc<ImageHost>) {
+        image_turn_on(FakeProvider::new(), route_to).await
+    }
+
+    async fn image_turn_on(
+        provider: FakeProvider,
+        route_to: Option<&'static str>,
+    ) -> (FakeProvider, Arc<ImageHost>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let host = Arc::new(ImageHost {
+            state: Arc::clone(&provider.state),
+            turns_seen_when_asked: StdMutex::new(None),
+            route_to,
+            not_applied: StdMutex::new(Vec::new()),
+        });
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                Some(host.clone() as Arc<dyn TurnServices>),
+            )
+            .await;
+        handle
+            .send_message("what is on this picture?")
+            .await
+            .unwrap();
+        until("the turn started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
+        (provider, host)
+    }
+
+    #[tokio::test]
+    async fn an_image_turn_runs_on_the_model_po_routes_it_to_made_active_before_it_is_sent() {
+        let (provider, host) = image_turn(Some("vision")).await;
+        assert_eq!(*host.turns_seen_when_asked.lock().unwrap(), Some(0));
+        assert_eq!(*provider.state.models.lock().unwrap(), ["vision"]);
+    }
+
+    /// A model that could not be made active is handed back to the host, which undoes what
+    /// it decided for the turn (`TurnRouter::forget_image_change`).
+    #[tokio::test]
+    async fn a_model_that_could_not_be_made_active_is_handed_back_to_the_host() {
+        let provider = FakeProvider::new();
+        *provider.state.fail_set_model.lock().unwrap() = Some(ProviderError::Closed);
+        let (provider, host) = image_turn_on(provider, Some("vision")).await;
+        assert!(provider.state.models.lock().unwrap().is_empty());
+        assert_eq!(*host.not_applied.lock().unwrap(), ["vision"]);
+    }
+
+    #[tokio::test]
+    async fn an_image_turn_with_nothing_to_route_keeps_its_model() {
+        let (provider, _host) = image_turn(None).await;
+        assert!(provider.state.models.lock().unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -3225,6 +3985,7 @@ mod tool_timing_tests {
                 category: None,
                 canonical: None,
                 tool_use_id: Some("t1".into()),
+                always: None,
             })
             .await;
         let hold = Arc::new(tokio::sync::Notify::new());
@@ -3266,6 +4027,200 @@ mod tool_timing_tests {
         );
     }
 
+    /// Two answers at once (allow in one tab, deny in another): the provider is slow
+    /// to take the allow, the deny would overtake it. The deny waits until the allow
+    /// was handed over, so the clock's outcome is the one the provider took.
+    #[tokio::test]
+    async fn two_answers_at_once_reach_the_provider_in_the_order_the_clock_keeps() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "req-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: Some("t1".into()),
+                always: None,
+            })
+            .await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_allows.lock().unwrap() = Some(Arc::clone(&hold));
+        let allow = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("req-1", true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let deny = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("req-1", false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        hold.notify_one();
+        let _ = allow.await.unwrap();
+        let _ = deny.await.unwrap();
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: json!("a.rs"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+
+        let taken = provider.state.permission_answers.lock().unwrap().clone();
+        assert_eq!(taken.len(), 1, "one answer taken: {taken:?}");
+        let taken = match &taken[0].1 {
+            PermissionDecision::Allow { .. } => "allowed",
+            PermissionDecision::Deny { .. } => "denied",
+            other => panic!("an answer of another kind: {other:?}"),
+        };
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let timing = stored
+            .iter()
+            .find(|r| r.event_type == "tool_timing")
+            .expect("a timing");
+        let timing: serde_json::Value = serde_json::from_str(&timing.data).unwrap();
+        assert_eq!(timing["permission_outcome"], taken, "{timing}");
+        assert_eq!(taken, "allowed", "the first answer is the one handed over");
+    }
+
+    /// The backend answers a request a session grant covers, the provider is slow to
+    /// take that allow, and the user denies the same request meanwhile: the deny waits
+    /// for the backend's answer, so the clock's outcome is the one the provider took.
+    #[tokio::test]
+    async fn a_user_answer_waits_for_the_backend_answer_to_a_covered_request() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "local",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        let write = |id: &str, call: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: Some(call.to_string()),
+            always: None,
+        };
+        handle.emit(write("write-1", "t1")).await;
+        handle
+            .answer_permission_scoped("write-1", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t2".into(),
+                tool: "mcp__nexus__Write".into(),
+                input: json!({ "file_path": "a.txt", "content": "x" }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_allows.lock().unwrap() = Some(Arc::clone(&hold));
+        let covered = {
+            let handle = Arc::clone(&handle);
+            let request = write("write-2", "t2");
+            tokio::spawn(async move { handle.emit(request).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let deny = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("write-2", false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        hold.notify_one();
+        covered.await.unwrap();
+        let _ = deny.await.unwrap();
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t2".into(),
+                result: json!("written"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+
+        let taken: Vec<_> = provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "write-2")
+            .map(|(_, d)| d.clone())
+            .collect();
+        assert_eq!(taken.len(), 1, "one answer taken: {taken:?}");
+        let taken = match &taken[0] {
+            PermissionDecision::Allow { .. } => "allowed",
+            PermissionDecision::Deny { .. } => "denied",
+            other => panic!("an answer of another kind: {other:?}"),
+        };
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let decisions = stored
+            .iter()
+            .filter(|r| r.event_type == "permission_decision" && r.data.contains("write-2"))
+            .count();
+        assert_eq!(decisions, 1, "one decision for the request");
+        let timing = stored
+            .iter()
+            .find(|r| r.event_type == "tool_timing" && r.data.contains("\"t2\""))
+            .expect("a timing");
+        let timing: serde_json::Value = serde_json::from_str(&timing.data).unwrap();
+        assert_eq!(timing["permission_outcome"], taken, "{timing}");
+        assert_eq!(
+            taken, "allowed",
+            "the backend's answer was handed over first"
+        );
+    }
+
     /// A double click (or two tabs): the provider refuses the second answer to the
     /// same request. Its failure must not erase the first answer from the clock.
     #[tokio::test]
@@ -3304,6 +4259,7 @@ mod tool_timing_tests {
                 category: None,
                 canonical: None,
                 tool_use_id: Some("t1".into()),
+                always: None,
             })
             .await;
         handle.answer_permission("req-1", true).await.unwrap();
@@ -3335,5 +4291,70 @@ mod tool_timing_tests {
             timing["run_started_at"], timing["permission_resolved_at"],
             "{timing}"
         );
+    }
+}
+
+/// Follow-up review of #711, finding 2, on the agent engine: Claude Code answers an
+/// interrupt with `error_during_execution` and `is_error: true`; the turn is STORED in the
+/// neutral form the legacy loop stores (`manager::stored_interrupted_result`), so the
+/// thread reloads without an error block whichever engine ran it. What is broadcast live
+/// keeps the provider's form (the runner and the sub-agents read `is_error` there).
+#[cfg(test)]
+mod stored_interrupted_result_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+
+    #[tokio::test]
+    async fn a_stopped_turn_is_stored_neutral_and_broadcast_as_the_provider_said() {
+        let graph = Arc::new(MockGraphStore::new());
+        let node = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&node).await.unwrap();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let runtime = AgentRuntime::new(dyn_graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                &node.id.to_string(),
+                "local",
+                provider.session(),
+                1,
+                "claude_code",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let mut rx = handle.events_tx.subscribe();
+        handle
+            .emit(ChatEvent::Result {
+                session_id: "cc".into(),
+                duration_ms: 42,
+                cost_usd: None,
+                subtype: "error_during_execution".into(),
+                is_error: true,
+                num_turns: Some(1),
+                result_text: Some(String::new()),
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: Some("interrupted".into()),
+            })
+            .await;
+        let live = rx.recv().await.unwrap();
+        assert!(
+            matches!(&live, ChatEvent::Result { subtype, is_error: true, .. } if subtype == "error_during_execution"),
+            "{live:?}"
+        );
+        let stored = graph.get_chat_events(node.id, 0, 50).await.unwrap();
+        let ended: serde_json::Value = stored
+            .iter()
+            .find(|e| e.event_type == "result")
+            .map(|e| serde_json::from_str(&e.data).unwrap())
+            .expect("the result is stored");
+        assert_eq!(ended["subtype"], "interrupted", "{ended}");
+        assert_eq!(ended["is_error"], false, "{ended}");
+        assert_eq!(ended["stop_reason"], "interrupted", "{ended}");
+        assert_eq!(ended["duration_ms"], 42, "{ended}");
+        assert!(ended.get("result_text").is_none(), "{ended}");
     }
 }

@@ -92,7 +92,14 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
     (`npx -c "openclaw acp"`, `pnpm -c exec "openclaw acp"`, `env -S "openclaw acp"`).
     An option value, another argument or a URL is never read
     (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`, `wss://gw/openclaw` leave the
-    agent its servers): a wrapper script of another name needs `"per_session_mcp": false`;
+    agent its servers): a wrapper script of another name needs `"per_session_mcp": false`.
+    So does a command run through a shell or a wrapper the name is not read through: `sh -c`,
+    `bash -lc`, `timeout`, `nohup`, `sudo`, `bun x`, and the implicit launches
+    `yarn openclaw` / `pnpm openclaw`. Missing one is not a security gap, only a
+    round-trip: the agent refuses the servers, nexus opens the session again without them,
+    and the PO token that went out in the refused request is revoked (next point). The
+    options of a launcher that take a value (`--registry <url>`, `--prefix <dir>`,
+    `-p <package>`, …) are skipped;
   - **the refusal, learned**: an agent that refuses the servers is asked again once without
     them (the session says so on the thread, `system:mcp_servers_refused`), and the next
     sessions of that instance are opened without them. Learned **in memory**: a restart of the
@@ -113,7 +120,13 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
   (the server asking again, or nexus doing it inside `session/new` / `session/load`, which the
   session's capabilities then say with `per_session_mcp: false`), that token was sent in the
   refused request: it is revoked at once. An opening or a resume that fails before the session
-  is live revokes it too, and leaves no per-turn router behind.
+  is live revokes it too, and leaves no per-turn router behind. The resumes of one session run
+  one at a time on a given server instance (the lock is local to the process; two instances of
+  a cluster resuming the same session at once are not covered). A message that arrives while
+  another resume of that session on the same instance is opening it, or that was still asking
+  the other instances (up to the NATS RPC timeout) when that resume succeeded, is delivered to
+  the session it opened. It does not resume the session a second time, so no second token
+  supersedes the first one. If that session has died in the meantime, the message resumes it.
 
   To give OpenClaw the PO tools, configure them on the OpenClaw side
   (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the server's `/mcp`

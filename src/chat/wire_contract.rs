@@ -339,6 +339,7 @@ fn server_examples() -> Vec<ServerExample> {
                 category: Some(s("read")),
                 canonical: Some(s("read_file")),
                 tool_use_id: Some(s(TOOL_USE_ID)),
+                always: None,
             },
             ChatEvent::PermissionRequest {
                 id: s("perm_0001"),
@@ -348,6 +349,7 @@ fn server_examples() -> Vec<ServerExample> {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
         ),
         ServerExample::new(
@@ -456,6 +458,8 @@ fn server_examples() -> Vec<ServerExample> {
                 code: Some(s("refs_invalid")),
                 reason: Some(s("unknown_kind")),
                 index: Some(2),
+                // Only a refused permission scope carries it (`permission_scope_unsupported`).
+                request_id: Some(s("pr_1")),
             },
             ChatEvent::Error {
                 message: s("Tool execution failed: permission denied"),
@@ -463,6 +467,7 @@ fn server_examples() -> Vec<ServerExample> {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
         ),
         ServerExample::new(
@@ -496,10 +501,20 @@ fn server_examples() -> Vec<ServerExample> {
             },
             ChatEvent::RefsResolved { refs: vec![] },
         ),
-        ServerExample::same(ChatEvent::PermissionDecision {
-            id: s("perm_0001"),
-            allow: true,
-        }),
+        ServerExample::new(
+            ChatEvent::PermissionDecision {
+                id: s("perm_0001"),
+                allow: true,
+                scope: Some(crate::chat::types::PermissionAnswerScope::Session),
+                rule: Some(s("Bash: git status")),
+            },
+            ChatEvent::PermissionDecision {
+                id: s("perm_0001"),
+                allow: true,
+                scope: None,
+                rule: None,
+            },
+        ),
         ServerExample::new(
             ChatEvent::PermissionModeChanged {
                 mode: s("acceptEdits"),
@@ -635,6 +650,7 @@ fn server_examples() -> Vec<ServerExample> {
                         parent_tool_use_id: Some(s(TOOL_USE_ID)),
                         last_seen_at: ts("2026-01-15T10:31:12Z"),
                         pending_removal_at: None,
+                        signalled: false,
                     },
                     BackgroundTaskInfo {
                         id: s("recovered-48301"),
@@ -645,6 +661,7 @@ fn server_examples() -> Vec<ServerExample> {
                         parent_tool_use_id: None,
                         last_seen_at: ts("2026-01-15T10:30:30Z"),
                         pending_removal_at: None,
+                        signalled: false,
                     },
                 ],
             },
@@ -746,7 +763,12 @@ fn client_examples() -> Vec<ClientExample> {
         },
         ClientExample {
             tag: "permission_response",
-            full: json!({ "type": "permission_response", "id": "perm_0001", "allow": true }),
+            full: json!({
+                "type": "permission_response",
+                "id": "perm_0001",
+                "allow": true,
+                "scope": "session"
+            }),
             minimal: json!({ "type": "permission_response" }),
         },
         ClientExample {

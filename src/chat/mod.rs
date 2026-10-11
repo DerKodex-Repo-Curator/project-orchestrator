@@ -20,6 +20,7 @@ pub(crate) mod agent_hooks;
 pub mod agent_runtime;
 pub mod anchor;
 pub mod anchor_resolver;
+pub mod cancel_relay;
 pub mod cost;
 #[cfg(test)]
 mod engine_parity_tests;
@@ -28,6 +29,7 @@ pub mod entity_extractor;
 pub mod envelope;
 pub mod feedback;
 pub(crate) mod hook_ledger;
+pub mod lasting_rules;
 pub mod manager;
 pub mod message_attachments;
 pub mod model_catalog;
@@ -47,9 +49,11 @@ pub mod relay;
 pub mod routing;
 #[cfg(test)]
 mod routing_modes_e2e_tests;
+pub mod session_grants;
 pub mod session_record;
 pub(crate) mod skill_hook;
 pub mod stages;
+pub(crate) mod subagents;
 pub(crate) mod tool_clock;
 pub mod tree;
 pub mod types;

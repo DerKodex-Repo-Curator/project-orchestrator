@@ -76,6 +76,10 @@ pub enum WsChatClientMessage {
         id: Option<String>,
         #[serde(default)]
         allow: bool,
+        /// How long an approval lasts: `once` (absent), `session`, `always`. A scope
+        /// the session does not declare is refused (`permission_scope_unsupported`).
+        #[serde(default)]
+        scope: crate::chat::types::PermissionAnswerScope,
     },
     /// Response to an input request
     InputResponse {
@@ -614,8 +618,19 @@ async fn handle_ws_chat_loop(
         }};
     }
 
+    // Frames that tasks spawned by this connection send to its client (a
+    // cancel_tools answered after the loop moved on, review N3 of #663).
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     loop {
         tokio::select! {
+            Some(frame) = ctl_rx.recv() => {
+                if ws_sender.send(Message::Text(frame.into())).await.is_err() {
+                    debug!("WebSocket send failed (control frame), client disconnected");
+                    break;
+                }
+            }
+
             // Forward local broadcast events to the WebSocket client
             event = async {
                 match &mut event_rx {
@@ -897,28 +912,54 @@ async fn handle_ws_chat_loop(
                                         // turn. Broadcast of ChatEvent::ToolsCancelled
                                         // happens inside cancel_running_tools so
                                         // multi-tab clients see the cancel.
-                                        match chat_manager.cancel_running_tools(&session_id).await {
-                                            Ok(result) => {
-                                                debug!(
-                                                    session_id = %session_id,
-                                                    killed = result.killed_pids.len(),
-                                                    capped = result.capped,
-                                                    "WS: cancel_tools done"
-                                                );
+                                        // Spawned (review N3): a cancel relayed to another
+                                        // instance may take up to its timeout, and this loop
+                                        // forwards the session's events meanwhile. A failure
+                                        // the client was not already told of comes back as a
+                                        // typed `error { code: cancel_failed, reason }` frame.
+                                        let (manager, sid, tx) = (
+                                            std::sync::Arc::clone(chat_manager),
+                                            session_id.clone(),
+                                            ctl_tx.clone(),
+                                        );
+                                        tokio::spawn(async move {
+                                            match manager.cancel_running_tools(&sid).await {
+                                                Ok(result) => {
+                                                    debug!(
+                                                        session_id = %sid,
+                                                        killed = result.killed_pids.len(),
+                                                        capped = result.capped,
+                                                        "WS: cancel_tools done"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(session_id = %sid, error = %e, "WS: cancel_tools failed");
+                                                    if let Some(frame) = crate::chat::cancel_relay::ws_error_event(&e)
+                                                        .and_then(|event| control_frame(&event))
+                                                    {
+                                                        let _ = tx.send(frame);
+                                                    }
+                                                }
                                             }
-                                            Err(e) => {
-                                                warn!(
-                                                    session_id = %session_id,
-                                                    error = %e,
-                                                    "WS: cancel_tools failed"
-                                                );
-                                            }
-                                        }
+                                        });
                                     }
 
-                                    WsChatClientMessage::PermissionResponse { id, allow } => {
+                                    WsChatClientMessage::PermissionResponse { id, allow, scope } => {
                                         let request_id = id.clone().unwrap_or_default();
                                         let decision = if allow { "allow" } else { "deny" };
+
+                                        // Only the person the session belongs to answers it, as on REST
+                                        // (review #679 finding 6).
+                                        let refused = match may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
+                                            Err(why) => Some(why),
+                                            Ok(()) => lasting_answer_refused(&claims, allow, scope),
+                                        };
+                                        if let Some(why) = refused {
+                                            warn!(session_id = %session_id, request_id = %request_id, reason = why.reason(), "permission response refused before delivery");
+                                            let err = permission_forbidden_frame(&request_id, why);
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                            continue;
+                                        }
 
                                         // Dedup: ignore duplicate responses (double-click protection)
                                         if !request_id.is_empty() && !responded_permission_ids.insert(request_id.clone()) {
@@ -939,6 +980,7 @@ async fn handle_ws_chat_loop(
                                             session_id = %session_id,
                                             request_id = %request_id,
                                             decision,
+                                            scope = scope.as_str(),
                                             routing,
                                             "Permission decision"
                                         );
@@ -948,10 +990,15 @@ async fn handle_ws_chat_loop(
                                         // control protocol (JSON: {"allow": true/false}) and must
                                         // NOT be persisted or broadcast as user_message events.
                                         // Same routing as POST .../permissions/{request_id}.
-                                        let send_result = chat_manager
-                                            .route_permission_response(&session_id, &request_id, allow, false)
-                                            .await;
-                                        if let Err(e) = send_result {
+                                        let send_result =
+                                            answer_permission_frame(chat_manager, &session_id, &request_id, allow, scope).await;
+                                        if let Err(crate::chat::manager::PermissionDeliveryError::ScopeUnsupported(scope)) = &send_result {
+                                            // Refused, not answered: the request still waits, the same
+                                            // id may be answered again (with a scope the session offers).
+                                            responded_permission_ids.remove(&request_id);
+                                            let err = scope_unsupported_frame(&request_id, *scope);
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        } else if let Err(e) = send_result {
                                             warn!(
                                                 session_id = %session_id,
                                                 request_id = %request_id,
@@ -1291,6 +1338,136 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
     });
 }
 
+/// The `error` frame of a `permission_response` whose scope the session cannot keep
+/// (`permission_scope_unsupported`): nothing was answered, the request still waits.
+/// `request_id` is the `id` of the refused answer, so a client with several requests
+/// waiting puts the refusal on the right one (frontend #323, finding 1).
+pub(crate) fn scope_unsupported_frame(
+    request_id: &str,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> serde_json::Value {
+    serde_json::to_value(crate::chat::types::ChatEvent::Error {
+        message: format!(
+            "This session cannot keep a permission for the scope '{}': answer with a scope it offers.",
+            scope.as_str()
+        ),
+        parent_tool_use_id: None,
+        code: Some(crate::chat::manager::PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string()),
+        reason: Some(scope.as_str().to_string()),
+        index: None,
+        request_id: Some(request_id.to_string()),
+    })
+    .unwrap_or_default()
+}
+
+/// Code of the `error` frame refusing a `permission_response` from a person the session
+/// does not belong to (the REST twin answers 403).
+pub(crate) const PERMISSION_FORBIDDEN: &str = "permission_forbidden";
+
+/// Why a `permission_response` is refused before it reaches anything (the `reason` of
+/// its `permission_forbidden` frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerRefusal {
+    /// The session belongs to another person (`not_owner`).
+    NotOwner,
+    /// The session, hence its owner, cannot be read right now (`owner_unreadable`):
+    /// refused, never let through (fail closed), the person may answer again.
+    OwnerUnreadable,
+    /// An `always` answer from credentials that may not keep a lasting approval
+    /// (`not_a_person`: an MCP token, the anonymous user...; review of #714, S1).
+    NotAPerson,
+}
+
+impl AnswerRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotOwner => "not_owner",
+            Self::OwnerUnreadable => "owner_unreadable",
+            Self::NotAPerson => "not_a_person",
+        }
+    }
+}
+
+/// Whether the person behind `claims` may answer the permission requests of `session_id`
+/// ([`crate::neo4j::models::ChatSessionNode::answerable_by`]). FAILS CLOSED: a session
+/// whose owner cannot be read (a graph error, no such session, an id that is not one) is
+/// refused, like the REST twin (500 / 404 there). With the authentication off the socket
+/// carries the anonymous user, who owns nothing: a session that has an owner is refused,
+/// as on REST.
+pub(crate) async fn may_answer_permissions(
+    neo4j: &dyn crate::neo4j::traits::GraphStore,
+    session_id: &str,
+    claims: &Claims,
+) -> Result<(), AnswerRefusal> {
+    let Ok(id) = session_id.parse::<uuid::Uuid>() else {
+        return Err(AnswerRefusal::OwnerUnreadable);
+    };
+    match neo4j.get_chat_session(id).await {
+        Ok(Some(session)) if session.answerable_by(&claims.sub) => Ok(()),
+        Ok(Some(_)) => Err(AnswerRefusal::NotOwner),
+        Ok(None) | Err(_) => Err(AnswerRefusal::OwnerUnreadable),
+    }
+}
+
+/// An `always` answer these claims may not give (`Claims::may_keep_lasting_approvals`),
+/// checked before delivery like the owner.
+pub(crate) fn lasting_answer_refused(
+    claims: &Claims,
+    allow: bool,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> Option<AnswerRefusal> {
+    (allow
+        && scope == crate::chat::types::PermissionAnswerScope::Always
+        && !claims.may_keep_lasting_approvals())
+    .then_some(AnswerRefusal::NotAPerson)
+}
+
+/// The `error` frame refusing a `permission_response` before delivery: nothing was
+/// answered, the request still waits (for the session's owner, or for a retry when the
+/// owner could not be read).
+pub(crate) fn permission_forbidden_frame(
+    request_id: &str,
+    why: AnswerRefusal,
+) -> serde_json::Value {
+    let message = match why {
+        AnswerRefusal::NotOwner => {
+            "Only the person this conversation belongs to can answer its permission requests."
+        }
+        AnswerRefusal::OwnerUnreadable => {
+            "Who this conversation belongs to could not be checked: nothing was answered, try again."
+        }
+        AnswerRefusal::NotAPerson => {
+            "Only the person, signed in with their own session, can allow a call for good: nothing was answered."
+        }
+    };
+    serde_json::to_value(crate::chat::types::ChatEvent::Error {
+        message: message.to_string(),
+        parent_tool_use_id: None,
+        code: Some(PERMISSION_FORBIDDEN.to_string()),
+        reason: Some(why.reason().to_string()),
+        index: None,
+        request_id: Some(request_id.to_string()),
+    })
+    .unwrap_or_default()
+}
+
+/// A `permission_response` frame, delivered like `POST .../permissions/{id}` and the NATS
+/// RPC: STRICTLY. An answer to a request that no longer waits (the backend answered it
+/// under a session grant a moment before, another tab did) is refused (`NotPending`):
+/// never a second `control_response` for one request, never a stored decision that
+/// contradicts what ran.
+pub(crate) async fn answer_permission_frame(
+    chat_manager: &crate::chat::manager::ChatManager,
+    session_id: &str,
+    request_id: &str,
+    allow: bool,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> Result<DeliveryRoute, crate::chat::manager::PermissionDeliveryError> {
+    chat_manager
+        .route_permission_response(session_id, request_id, allow, scope, true)
+        .await
+}
+
 /// Phase 2 of the entity extraction: Hebbian learning via chat.
 ///
 /// Finds the notes linked to the discussed entities, boosts the energy of those
@@ -1397,6 +1574,17 @@ pub(crate) async fn neural_reinforcement(
     }
 }
 
+/// A frame a task spawned by the connection sends to its client: the event with
+/// `seq` 0, like every live event of the loop (`send_chat_event!`), so a client
+/// that orders or dedups by `seq` reads it the same way.
+fn control_frame(event: &crate::chat::types::ChatEvent) -> Option<String> {
+    let mut value = serde_json::to_value(event).ok()?;
+    value
+        .as_object_mut()?
+        .insert("seq".to_string(), serde_json::json!(0));
+    Some(value.to_string())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1407,6 +1595,21 @@ mod tests {
     use crate::chat::types::ChatEvent;
     use std::collections::HashSet;
     use tokio::sync::broadcast;
+
+    /// Review of #673, nit 6: the `cancel_failed` frame a spawned cancel_tools
+    /// sends carries `seq` like every live frame of the loop.
+    #[test]
+    fn a_control_frame_carries_seq_like_live_events() {
+        let error =
+            anyhow::Error::new(crate::chat::cancel_relay::CancelRelayError::OwnerUnreachable);
+        let event = crate::chat::cancel_relay::ws_error_event(&error).unwrap();
+        let frame: serde_json::Value =
+            serde_json::from_str(&control_frame(&event).unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "cancel_failed");
+        assert_eq!(frame["reason"], "owner_unreachable");
+        assert_eq!(frame["seq"], 0);
+    }
 
     /// Verify that dropping the broadcast sender causes RecvError::Closed.
     /// This is the mechanism that triggers the dormant transition.
@@ -1423,6 +1626,105 @@ mod tests {
             "Expected RecvError::Closed after sender is dropped, got: {:?}",
             result
         );
+    }
+
+    /// Two requests waiting, two `session` answers refused (frontend #323, finding 1): each
+    /// refusal names ITS request, so the client never puts A's refusal on B.
+    #[test]
+    fn a_refused_scope_names_the_request_it_refuses() {
+        use crate::chat::types::PermissionAnswerScope;
+        let a = scope_unsupported_frame("pr_A", PermissionAnswerScope::Session);
+        let b = scope_unsupported_frame("pr_B", PermissionAnswerScope::Always);
+        assert_eq!(a["type"], "error", "{a}");
+        assert_eq!(a["code"], "permission_scope_unsupported", "{a}");
+        assert_eq!(a["reason"], "session", "{a}");
+        assert_eq!(a["request_id"], "pr_A", "{a}");
+        assert_eq!(b["reason"], "always", "{b}");
+        assert_eq!(b["request_id"], "pr_B", "{b}");
+        // Still an `error` event any client reads (the readable line is kept).
+        let parsed: ChatEvent = serde_json::from_value(a.clone()).unwrap();
+        assert!(
+            matches!(parsed, ChatEvent::Error { request_id: Some(ref id), .. } if id == "pr_A"),
+            "{a}"
+        );
+    }
+
+    /// Review #679 finding 6, the WebSocket twin of the REST 403: another person's
+    /// `permission_response` is refused (an `error` frame naming the request), the owner's
+    /// and anyone's on a session nobody owns go through.
+    #[tokio::test]
+    async fn only_the_owner_answers_on_the_websocket() {
+        use crate::neo4j::traits::GraphStore;
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let owned = crate::neo4j::models::ChatSessionNode {
+            owner: Some(owner.clone()),
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        let free = crate::test_helpers::test_chat_session(None);
+        mock.create_chat_session(&owned).await.unwrap();
+        mock.create_chat_session(&free).await.unwrap();
+        let person = |sub: &str| Claims {
+            sub: sub.to_string(),
+            ..Claims::anonymous()
+        };
+        let other = uuid::Uuid::new_v4().to_string();
+
+        let owned_id = owned.id.to_string();
+        assert_eq!(
+            may_answer_permissions(&mock, &owned_id, &person(&other)).await,
+            Err(AnswerRefusal::NotOwner)
+        );
+        assert_eq!(
+            may_answer_permissions(&mock, &owned_id, &person(&owner)).await,
+            Ok(())
+        );
+        assert_eq!(
+            may_answer_permissions(&mock, &free.id.to_string(), &person(&other)).await,
+            Ok(())
+        );
+
+        let frame = permission_forbidden_frame("pr_9", AnswerRefusal::NotOwner);
+        assert_eq!(frame["type"], "error", "{frame}");
+        assert_eq!(frame["code"], PERMISSION_FORBIDDEN, "{frame}");
+        assert_eq!(frame["reason"], "not_owner", "{frame}");
+        assert_eq!(frame["request_id"], "pr_9", "{frame}");
+    }
+
+    /// Review of #699, finding 1: the owner check FAILS CLOSED. A session the graph cannot
+    /// read (an error, no such session, not an id) is refused, never let through: the
+    /// local routing does not check the owner again.
+    #[tokio::test]
+    async fn a_websocket_answer_is_refused_when_the_owner_cannot_be_read() {
+        use crate::neo4j::traits::GraphStore;
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let free = crate::test_helpers::test_chat_session(None);
+        mock.create_chat_session(&free).await.unwrap();
+        let someone = Claims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            ..Claims::anonymous()
+        };
+        let sid = free.id.to_string();
+        assert_eq!(may_answer_permissions(&mock, &sid, &someone).await, Ok(()));
+
+        mock.fail_reads.lock().unwrap().insert("get_chat_session");
+        assert_eq!(
+            may_answer_permissions(&mock, &sid, &someone).await,
+            Err(AnswerRefusal::OwnerUnreadable)
+        );
+        mock.fail_reads.lock().unwrap().clear();
+        assert_eq!(
+            may_answer_permissions(&mock, &uuid::Uuid::new_v4().to_string(), &someone).await,
+            Err(AnswerRefusal::OwnerUnreadable)
+        );
+        assert_eq!(
+            may_answer_permissions(&mock, "not-an-id", &someone).await,
+            Err(AnswerRefusal::OwnerUnreadable)
+        );
+        let frame = permission_forbidden_frame("pr_1", AnswerRefusal::OwnerUnreadable);
+        assert_eq!(frame["code"], PERMISSION_FORBIDDEN, "{frame}");
+        assert_eq!(frame["reason"], "owner_unreadable", "{frame}");
+        assert_eq!(frame["request_id"], "pr_1", "{frame}");
     }
 
     /// Verify the dormant event JSON format matches what the frontend expects.

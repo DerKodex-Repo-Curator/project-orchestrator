@@ -2,7 +2,7 @@
 //! `GET/PUT/DELETE /api/projects/{slug}/routing`.
 //!
 //! The settings decide how much of the provider and model choice the user
-//! delegates to PO (`primary | mixed | full`) and how far the learnt choices
+//! delegates to PO (`primary | executors_only | full`) and how far the learnt choices
 //! are trusted (`shadow | advisory | auto`). They are stored as `LlmSetting`
 //! documents (scope `global` or `project:<slug>`, key `routing`) and read with
 //! a default: no document means `primary` + `shadow`, the current behaviour.
@@ -275,7 +275,7 @@ async fn report_from(
     let prices = PoolPrices(match chat_manager {
         Some(manager) => {
             manager
-                .routing_pool_for(query.project_slug.as_deref())
+                .routing_pool_known(query.project_slug.as_deref())
                 .await
         }
         None => Vec::new(),
@@ -453,11 +453,11 @@ mod tests {
     #[tokio::test]
     async fn routing_put_valid_is_stored_and_read_back() {
         let app = app().await;
-        let want = json!({"mode": "mixed", "stage": "advisory", "exploration_epsilon": 0.1,
+        let want = json!({"mode": "executors_only", "stage": "advisory", "exploration_epsilon": 0.1,
                           "primary": {"provider": "claude-code", "alias": "deep"}});
         let (status, body) = call(&app, human("PUT", "/api/chat/routing", Some(want))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["mode"], "mixed");
+        assert_eq!(body["mode"], "executors_only");
         assert_eq!(body["stage"], "advisory");
         assert_eq!(body["exploration_epsilon"], 0.1);
         assert_eq!(body["cost_weight"], 0.3, "absent knob = default");
@@ -541,6 +541,7 @@ mod tests {
             human(
                 "PUT",
                 "/api/chat/routing",
+                // A client not updated yet still says `mixed`: stored and read back as `executors_only`.
                 Some(json!({"mode": "mixed", "stage": "advisory"})),
             ),
         )
@@ -548,7 +549,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         // Without an override the project inherits the global document.
         let (_, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
-        assert_eq!(body["mode"], "mixed");
+        assert_eq!(body["mode"], "executors_only");
         assert_eq!(body["scope"], "global");
         // The override wins for that project only.
         let (status, body) = call(
@@ -567,16 +568,16 @@ mod tests {
         assert_eq!(body["cost_weight"], 0.6);
         assert_eq!(body["scope"], "project");
         let (_, other) = call(&app, human("GET", "/api/projects/q/routing", None)).await;
-        assert_eq!(other["mode"], "mixed");
+        assert_eq!(other["mode"], "executors_only");
         assert_eq!(other["scope"], "global");
         let (_, global) = call(&app, human("GET", "/api/chat/routing", None)).await;
-        assert_eq!(global["mode"], "mixed");
+        assert_eq!(global["mode"], "executors_only");
         assert_eq!(global["scope"], "global");
         // DELETE returns the project to the global document.
         let (status, _) = call(&app, human("DELETE", "/api/projects/p/routing", None)).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, body) = call(&app, human("GET", "/api/projects/p/routing", None)).await;
-        assert_eq!(body["mode"], "mixed");
+        assert_eq!(body["mode"], "executors_only");
         assert_eq!(body["scope"], "global");
         let (status, _) = call(&app, human("DELETE", "/api/projects/p/routing", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "nothing left to remove");
@@ -669,7 +670,7 @@ mod tests {
                 reason: format!("d{i}"),
                 alternatives: vec![],
                 applied: false,
-                mode: ProviderRoutingMode::Mixed,
+                mode: ProviderRoutingMode::ExecutorsOnly,
                 stage: LearningStage::Shadow,
                 session_id: None,
                 task_id: None,
@@ -821,7 +822,7 @@ mod tests {
                 reason: "r".into(),
                 alternatives: vec![],
                 applied: false,
-                mode: ProviderRoutingMode::Mixed,
+                mode: ProviderRoutingMode::ExecutorsOnly,
                 stage: LearningStage::Shadow,
                 session_id: None,
                 task_id: None,

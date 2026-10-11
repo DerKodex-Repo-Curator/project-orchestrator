@@ -7,6 +7,50 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// PermissionAnswerScope — how long a permission granted by the user lasts
+// ---------------------------------------------------------------------------
+
+/// How long an approval given to a permission request lasts (`scope` of the
+/// `permission_response` frame, of `POST .../permissions/{request_id}` and of
+/// the NATS `control_response` RPC). Absent means `once`.
+///
+/// - `once`: this call only.
+/// - `session`: the backend answers itself the later requests of THIS session the
+///   grant covers (`chat::session_grants`: the identical call; any call of a read-only
+///   built-in tool of `nexus-tools`). Never handed to the provider as a rule.
+/// - `always` (P11b): kept by the backend for the session's person and project
+///   (`chat::lasting_rules`, `session_grants::lasting_grant_for`: the identical call, stricter
+///   than `session`), offered only by a session that has both. Never handed to the provider.
+///
+/// A scope the session does not declare (`capabilities.permission_scopes`) is
+/// REFUSED with a typed error, never answered as a narrower one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionAnswerScope {
+    #[default]
+    Once,
+    Session,
+    Always,
+}
+
+impl PermissionAnswerScope {
+    /// The wire name (`once`, `session`, `always`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Always => "always",
+        }
+    }
+
+    /// Wire form of [`ChatEvent::PermissionDecision::scope`]: only an approval
+    /// that outlives the call says how long.
+    pub fn lasting(self, allow: bool) -> Option<Self> {
+        (allow && self != Self::Once).then_some(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SpawnedBy — typed origin for sessions spawned by the pipeline or runner
 // ---------------------------------------------------------------------------
 
@@ -284,13 +328,31 @@ impl ChatRequest {
                 request.provider = Some(only.provider.clone());
                 request.model = Some(only.model.clone());
                 request.routing_mode =
-                    Some(crate::chat::provider::cognitive::ProviderRoutingMode::Primary);
+                    Some(crate::chat::provider::cognitive::ConversationRoutingMode::Primary);
                 request.routing_pool = None;
             }
             _ if settled == *pool => return None,
             _ => request.routing_pool = Some(settled),
         }
         Some(request)
+    }
+
+    /// The conversation is routed among the models ticked in the menu (two or more): its
+    /// OPENING model is a decision among them too (decision R-S4), and the `provider` /
+    /// `model` the menu names with them (its "pilot") are only the fallback when no
+    /// decision applies — never an explicit choice that the decision would have to obey.
+    ///
+    /// Only for the menu's `mixed` (or a pool without a mode): a pool sent with
+    /// `routing_mode: full` keeps its named provider/model explicit. That is also what a
+    /// conversation the ROUTER moved carries — its relayed request names the target the
+    /// router decided, with the pool and `full` read from the session — and that target is
+    /// never decided again at the opening of the new session (review of #713, C1).
+    pub fn routes_among_pool(&self) -> bool {
+        self.routing_mode != Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full)
+            && self
+                .routing_pool
+                .as_ref()
+                .is_some_and(|pool| pool.len() > 1)
     }
 }
 
@@ -334,14 +396,17 @@ pub struct ChatRequest {
     #[serde(default)]
     pub provider: Option<String>,
     /// Routing mode for THIS conversation (`primary` / `mixed` / `full`), replacing the
-    /// one of the settings. Absent: the settings in force decide. Only read when a
-    /// conversation opens.
+    /// one of the settings. `mixed` is the conversation's word (PO routes among
+    /// `routing_pool`), never the settings' `executors_only` (decision R-S4). Absent: the
+    /// settings in force decide. Only read when a conversation opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing_mode: Option<crate::chat::provider::cognitive::ProviderRoutingMode>,
+    pub routing_mode: Option<crate::chat::provider::cognitive::ConversationRoutingMode>,
     /// The (provider, model) pairs PO may route THIS conversation among (the models
     /// ticked in the menu), sent with `routing_mode: mixed`. The candidates of the open-time
     /// decision AND of every per-turn decision are restricted to it; a named pilot is not a
-    /// pin then. One entry = strict (that model, never substituted); absent or empty = every
+    /// pin then, nor the opening model: the opening is decided among the pool, and the pilot
+    /// (`provider` / `model`) only opens the conversation when no decision applies (R-S4).
+    /// One entry = strict (that model, never substituted); absent or empty = every
     /// eligible model. Per turn only the entries of the session's own provider count: a
     /// conversation runs on ONE provider, moving it is `switch-provider`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,6 +574,14 @@ pub struct BackgroundTaskInfo {
     /// has elapsed. Skipped on the wire — the frontend doesn't need it.
     #[serde(skip)]
     pub pending_removal_at: Option<std::time::Instant>,
+    /// Whether no signal may go to the task's pid any more: a stop actually sent
+    /// SIGINT to its subtree (by `cancel_task` when the pid was known, or by the
+    /// PID claim when the pid came after the stop), or the death poller found its
+    /// process gone (the pid may name another process by now). A `cancel_task`
+    /// asked again is a no-op only once this is set; before, it still has
+    /// something to do. Skipped on the wire.
+    #[serde(skip)]
+    pub signalled: bool,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
@@ -640,6 +713,12 @@ pub enum ChatEvent {
         /// `can_use_tool`, the agent engine's `permission_ask`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
+        /// `Some(true)` when THIS call may be answered `always` (P11b): the session keeps
+        /// lasting rules and the backend's comparator would approve this very call for good
+        /// (`session_grants::lasting_grant_for`). Absent: `always` would be refused, typed,
+        /// so a client does not offer it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        always: Option<bool>,
     },
     /// Claude Code called the AskUserQuestion tool — display the interactive
     /// question widget instead of a permission approval dialog.
@@ -723,6 +802,11 @@ pub enum ChatEvent {
         /// 0-based index of the offending element of a list, when one is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
+        /// The permission request a refusal is about (`permission_scope_unsupported`): the
+        /// `id` of the `permission_request` / `permission_response`, so a client with
+        /// several requests waiting puts the refusal on the right one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// User's decision on a permission request (allow or deny).
     /// Persisted alongside the original PermissionRequest so the decision
@@ -732,6 +816,14 @@ pub enum ChatEvent {
         id: String,
         /// Whether the tool was allowed
         allow: bool,
+        /// How long the approval lasts, when it outlives the call (`session`,
+        /// `always`). Absent: this call only, or a refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<PermissionAnswerScope>,
+        /// What the approval covers, as the user is shown it, when it outlives the call
+        /// (`session`: the grant of `chat::session_grants`, e.g. `Bash: git status`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
     },
     /// Permission mode was changed mid-session
     PermissionModeChanged {
@@ -1258,6 +1350,76 @@ pub enum ClientMessage {
     InputResponse { content: String },
 }
 
+/// Where an effective capability of a conversation was read (F-R4, decision 11cefdb2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveSource {
+    /// The capabilities snapshot of the model the session opened on (A4).
+    Snapshot,
+    /// The candidates PO may route the next turn to.
+    RoutingPool,
+}
+
+/// Why an effective capability says what it says: a stable code for the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveCause {
+    /// The session's own model has it: nothing to route for.
+    ModelHasIt,
+    /// PO does not choose this conversation's model (primary, a model imposed or changed by
+    /// hand, a stage that applies nothing, a session that cannot switch model): the snapshot.
+    NotRouted,
+    /// No router is live for this session (session not open, or no cognitive router): the snapshot.
+    NoRouter,
+    /// PO routes, but its pool lists no model at all (not built, not probed): the snapshot.
+    /// Not probed is not absent: it says nothing about the models PO could reach.
+    PoolUnbuilt,
+    /// At least one candidate of the pool has it: PO routes the turn that needs it there.
+    PoolHasIt,
+    /// The pool is built and none of its eligible candidates has it.
+    PoolLacksIt,
+}
+
+/// One capability of a conversation as the user and the composer may rely on it: the
+/// model's snapshot when PO does not route, else what the routing candidates offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveCapability {
+    /// Whether the capability is reachable for the next turn.
+    pub value: bool,
+    /// Where it was read.
+    pub source: EffectiveSource,
+    /// Why.
+    pub cause: EffectiveCause,
+    /// The candidates that have it, when the routing pool was read (who PO can route to).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<RoutingPoolEntry>,
+}
+
+impl EffectiveCapability {
+    /// The snapshot's word, with the reason it is the one that counts.
+    pub fn snapshot(value: bool, cause: EffectiveCause) -> Self {
+        Self {
+            value,
+            source: EffectiveSource::Snapshot,
+            cause: if value {
+                EffectiveCause::ModelHasIt
+            } else {
+                cause
+            },
+            via: Vec::new(),
+        }
+    }
+}
+
+/// The capabilities of a conversation that follow its routing candidates rather than the
+/// snapshot of the model it opened on (F-R4). Only `images` for now: the one the composer
+/// gates on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveCapabilities {
+    /// Whether a turn may carry images.
+    pub images: EffectiveCapability,
+}
+
 /// Chat session metadata (persisted in Neo4j)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -1333,6 +1495,11 @@ pub struct ChatSession {
     /// read, never by listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<serde_json::Value>,
+    /// What the conversation can really do for its next turn, given its routing (F-R4):
+    /// `capabilities` is the snapshot of the opening model, this follows the candidates PO
+    /// may route to. Only carried by the single-session read and the routing change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_capabilities: Option<EffectiveCapabilities>,
     /// Which precedence level chose the provider (`session`, `request`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_by: Option<String>,
@@ -2062,6 +2229,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             }
             .event_type(),
             "permission_request"
@@ -2158,6 +2326,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -2208,14 +2377,19 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::PermissionDecision {
                 id: "pr_1".into(),
                 allow: true,
+                scope: Some(PermissionAnswerScope::Session),
+                rule: Some("Bash: git status".into()),
             },
             ChatEvent::PermissionDecision {
                 id: "pr_2".into(),
                 allow: false,
+                scope: None,
+                rule: None,
             },
             ChatEvent::ModelChanged {
                 model: "claude-opus-4-6".into(),
@@ -2569,6 +2743,7 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::PermissionRequest {
                 id: "pr1".into(),
@@ -2578,6 +2753,7 @@ mod tests {
                 category: None,
                 canonical: None,
                 tool_use_id: None,
+                always: None,
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),
@@ -2681,6 +2857,7 @@ mod tests {
             activity: None,
             provider_id: None,
             capabilities: None,
+            effective_capabilities: None,
             routed_by: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -2906,6 +3083,7 @@ mod tests {
             activity: None,
             provider_id: None,
             capabilities: None,
+            effective_capabilities: None,
             routed_by: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -3495,6 +3673,7 @@ mod tests {
             pid: Some(42_424),
             parent_tool_use_id: Some("toolu_01ABC".to_string()),
             pending_removal_at: None,
+            signalled: false,
         };
         let json = serde_json::to_string(&info).expect("serialise");
         let back: BackgroundTaskInfo = serde_json::from_str(&json).expect("deserialise");
@@ -3520,6 +3699,7 @@ mod tests {
             pid: Some(12345),
             parent_tool_use_id: Some("toolu_01XYZ".into()),
             pending_removal_at: Some(std::time::Instant::now()),
+            signalled: true,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(
@@ -3527,10 +3707,17 @@ mod tests {
             "pending_removal_at must be skipped from the wire format, got: {}",
             json
         );
+        // `signalled` is server-side bookkeeping too (review of #694, point 3).
+        assert!(
+            !json.contains("signalled"),
+            "signalled must be skipped from the wire format, got: {}",
+            json
+        );
 
-        // Round-trip drops the field (becomes None on deserialise).
+        // Round-trip drops both fields (None / false on deserialise).
         let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
         assert!(back.pending_removal_at.is_none());
+        assert!(!back.signalled);
     }
 
     #[test]
@@ -3546,6 +3733,7 @@ mod tests {
                     pid: Some(42_424),
                     parent_tool_use_id: Some("toolu_01ABC".into()),
                     pending_removal_at: None,
+                    signalled: false,
                 },
                 BackgroundTaskInfo {
                     id: "toolu_02XYZ".into(),
@@ -3556,6 +3744,7 @@ mod tests {
                     pid: Some(42_425),
                     parent_tool_use_id: Some("toolu_02XYZ".into()),
                     pending_removal_at: None,
+                    signalled: false,
                 },
             ],
         };
@@ -3616,6 +3805,7 @@ mod tests {
             pid: Some(42_424),
             parent_tool_use_id: None,
             pending_removal_at: None,
+            signalled: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();

@@ -77,8 +77,9 @@ pub enum RoutedBy {
     /// A higher level was skipped (unhealthy or not allowed) for an executor.
     #[serde(rename = "fallback")]
     Fallback,
-    /// Chosen by the cognitive router (routing mode `mixed` or `full`, stage
-    /// `auto`); `ProviderChoice::reason` says why.
+    /// Chosen by the cognitive router (settings `executors_only` or `full`, or a
+    /// conversation in Auto or routed among its pool; stage `auto`); `ProviderChoice::reason`
+    /// says why.
     #[serde(rename = "auto")]
     Auto,
 }

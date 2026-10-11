@@ -353,7 +353,7 @@ mod tests {
             reason: "test".into(),
             alternatives: vec![],
             applied: true,
-            mode: ProviderRoutingMode::Mixed,
+            mode: ProviderRoutingMode::ExecutorsOnly,
             stage: LearningStage::Auto,
             session_id: None,
             task_id: None,

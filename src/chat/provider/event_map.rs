@@ -15,7 +15,8 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use nexus_claude::agent::{
-    AgentEvent, CompactionPhase, Cost, DeltaKind, ProviderError, QuestionReply, StopReason,
+    AgentEvent, BackgroundTask, BackgroundTaskKind as AgentTaskKind, BackgroundTaskStatus,
+    CompactionPhase, Cost, DeltaKind, ProviderError, QuestionReply, StopReason, TaskPhase,
     ToolCategory, ToolOutput, Usage,
 };
 use serde_json::{json, Value};
@@ -23,7 +24,7 @@ use serde_json::{json, Value};
 use super::errors::open_failure;
 use super::policy::{legacy_name, neutral_name};
 use crate::chat::manager::{MASKING_FAILED_MESSAGE, MASKING_FAILED_SUBTYPE};
-use crate::chat::types::ChatEvent;
+use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind, ChatEvent};
 
 /// What the mapping remembers from one event to the next.
 #[derive(Debug, Default, Clone)]
@@ -33,12 +34,77 @@ pub struct EventMapper {
     announced_tools: HashSet<String>,
     /// `event_id` of the task updates already forwarded (de-duplication).
     seen_task_events: HashSet<String>,
+    /// The last `background_tasks` snapshot of the provider: what
+    /// `active_tasks_update` shows, and how a wire task id (the `tool_use` that
+    /// started the task, as on the Claude Code engine) finds the provider's own id.
+    background_tasks: Vec<BackgroundTask>,
+}
+
+/// The id a background task has on the wire: the `tool_use` that started it,
+/// as the Claude Code engine keys its tasks (`BackgroundTaskInfo::id` ≡ the
+/// `correlation_id` of its output), else the provider's own id.
+fn wire_task_id(task: &BackgroundTask) -> String {
+    task.tool_call_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| task.id.clone())
+}
+
+/// A running provider task in the shape the Claude Code engine broadcasts.
+fn task_info(task: &BackgroundTask) -> BackgroundTaskInfo {
+    let started_at = task
+        .started_at_ms
+        .and_then(|ms| i64::try_from(ms).ok())
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or_else(Utc::now);
+    BackgroundTaskInfo {
+        id: wire_task_id(task),
+        kind: match task.kind {
+            AgentTaskKind::Monitor => BackgroundTaskKind::Monitor,
+            // The wire knows two kinds: anything that is not a watcher is a
+            // command left running.
+            _ => BackgroundTaskKind::BashBackground,
+        },
+        description: task.description.clone(),
+        started_at,
+        pid: task.pid,
+        parent_tool_use_id: task.parent.clone().or_else(|| task.tool_call_id.clone()),
+        last_seen_at: started_at,
+        pending_removal_at: None,
+        signalled: false,
+    }
 }
 
 impl EventMapper {
     /// A fresh mapper (one per session).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The background tasks still running, as `active_tasks_update` carries them
+    /// (`GET /api/chat/sessions/{id}/background-tasks` on the agent engine).
+    pub fn active_tasks(&self) -> Vec<BackgroundTaskInfo> {
+        self.background_tasks
+            .iter()
+            .filter(|task| task.status == BackgroundTaskStatus::Running)
+            .map(task_info)
+            .collect()
+    }
+
+    /// The provider's id of the background task the wire calls `wire_id` (its
+    /// `tool_use` id, or the provider's id itself), with whether it still runs.
+    /// `None`: the last snapshot does not know it.
+    pub fn provider_task(&self, wire_id: &str) -> Option<(String, bool)> {
+        self.background_tasks
+            .iter()
+            .find(|task| wire_task_id(task) == wire_id)
+            .or_else(|| self.background_tasks.iter().find(|task| task.id == wire_id))
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    task.status == BackgroundTaskStatus::Running,
+                )
+            })
     }
 
     /// Maps one event of a turn. Never panics on an event it does not know: it
@@ -154,6 +220,7 @@ impl EventMapper {
                 category: Some(category_name(*category)),
                 canonical: canonical.clone(),
                 tool_use_id: tool_call_id.clone(),
+                always: None,
             }],
             AgentEvent::Question {
                 question_id,
@@ -190,11 +257,19 @@ impl EventMapper {
                     }],
                 }
             }
-            // The live task list is kept by the backend's own tracking; the
-            // snapshot is not a wire event today.
-            AgentEvent::BackgroundTasks { .. } => Vec::new(),
+            // The complete snapshot of the provider's background tasks: the
+            // `active_tasks_update` of the Claude Code engine, the tasks still
+            // running only (an ended or killed task leaves the list, as there).
+            AgentEvent::BackgroundTasks { tasks } => {
+                self.background_tasks = tasks.clone();
+                vec![ChatEvent::ActiveTasksUpdate {
+                    tasks: self.active_tasks(),
+                }]
+            }
             AgentEvent::TaskUpdate {
                 phase,
+                task_id,
+                summary,
                 event_id,
                 data,
                 ..
@@ -203,6 +278,29 @@ impl EventMapper {
                     if !self.seen_task_events.insert(id.clone()) {
                         return Vec::new();
                     }
+                }
+                // A line of a background task (a `Monitor`): the Claude Code
+                // engine shows it as a `background_output` tied to the task's
+                // `tool_use` (`correlation_id`), the same here.
+                let background = task_id.as_deref().and_then(|id| {
+                    self.background_tasks
+                        .iter()
+                        .find(|task| task.id == id)
+                        .map(wire_task_id)
+                });
+                if let (TaskPhase::Progress, Some(correlation_id)) = (phase, background) {
+                    let content = summary.clone().unwrap_or_else(|| {
+                        data.get("line")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| data.to_string())
+                    });
+                    return vec![ChatEvent::BackgroundOutput {
+                        source: "tool_result".to_string(),
+                        content,
+                        received_at: Utc::now(),
+                        correlation_id: Some(correlation_id),
+                    }];
                 }
                 vec![ChatEvent::Workflow {
                     subtype: format!("task_{}", phase.as_str()),
@@ -255,6 +353,7 @@ impl EventMapper {
                     code: None,
                     reason: None,
                     index: None,
+                    request_id: None,
                 }]
             }
             // A notice is a diagnostic: nothing in a turn.
@@ -343,6 +442,7 @@ fn error_event(error: &ProviderError) -> ChatEvent {
         code: None,
         reason: None,
         index: None,
+        request_id: None,
     }
 }
 
@@ -859,9 +959,23 @@ mod tests {
     fn replay_gives_the_same_chat_events_as_the_legacy_path() {
         let mut state = MapState::new();
         let mut mapper = EventMapper::new();
+        // What the agent runtime stamps on the `system_init` of a Claude Code session
+        // (`AgentSessionHandle::offered_capabilities`: the provider's, without `always`).
+        let mut caps =
+            nexus_claude::providers::claude_code::ClaudeCodeConfig::default().capabilities(None);
+        caps.permission_scopes
+            .retain(|s| *s != nexus_claude::agent::PermissionScope::Always);
+        let agent_stamp = serde_json::to_value(caps).unwrap();
+        assert!(
+            agent_stamp["images"].is_boolean(),
+            "the whole object: {agent_stamp}"
+        );
         for (name, msg) in corpus() {
-            // The legacy init says which engine it is; the mapper leaves that to the
-            // session owner (the runtime stamps `engine` and `degraded_features`).
+            // The legacy init says which engine it is and what it declares; the mapper
+            // leaves that to the session owner (the agent runtime stamps `engine`,
+            // `degraded_features` and `capabilities` on `system_init`, `emit_one`).
+            // `capabilities` is compared: the legacy engine declares the whole object the
+            // agent runtime stamps on a Claude Code session.
             let legacy: Vec<Value> = ChatManager::message_to_events(&msg)
                 .iter()
                 .map(|e| {
@@ -873,9 +987,38 @@ mod tests {
                     v
                 })
                 .collect();
-            let via_contract = mapped(&msg, &mut state, &mut mapper);
+            let via_contract: Vec<Value> = mapped(&msg, &mut state, &mut mapper)
+                .into_iter()
+                .map(|mut v| {
+                    if v["type"] == "system_init"
+                        && v.get("capabilities").is_none_or(Value::is_null)
+                    {
+                        v["capabilities"] = agent_stamp.clone();
+                    }
+                    v
+                })
+                .collect();
             assert_eq!(via_contract, legacy, "message `{name}` maps differently");
         }
+    }
+
+    /// The two engines that drive Claude Code declare the same approval scopes: the
+    /// legacy one (`LEGACY_PERMISSION_SCOPES`, in its `system_init`) and the agent one
+    /// (the Claude Code provider's own, without `always`, as `offered_capabilities`).
+    #[test]
+    fn both_claude_code_engines_declare_the_same_permission_scopes() {
+        let provider = nexus_claude::providers::claude_code::ClaudeCodeConfig::default()
+            .capabilities(None)
+            .permission_scopes
+            .into_iter()
+            .filter(|s| *s != nexus_claude::agent::PermissionScope::Always)
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        let legacy = crate::chat::manager::LEGACY_PERMISSION_SCOPES
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(provider, legacy);
     }
 
     #[test]
@@ -996,6 +1139,93 @@ mod tests {
         };
         assert_eq!(mapper.map(&update).len(), 1);
         assert!(mapper.map(&update).is_empty());
+    }
+
+    fn bg_task(id: &str, tool_call: Option<&str>, status: BackgroundTaskStatus) -> BackgroundTask {
+        BackgroundTask {
+            id: id.into(),
+            kind: AgentTaskKind::Shell,
+            description: "sleep 30".into(),
+            status,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: tool_call.map(str::to_string),
+            parent: None,
+            pid: Some(4242),
+        }
+    }
+
+    /// P4: the provider's snapshot is the `active_tasks_update` of the Claude Code
+    /// engine — running tasks only, keyed by the `tool_use` that started them.
+    #[test]
+    fn a_background_tasks_snapshot_is_an_active_tasks_update_keyed_by_tool_use() {
+        let mut mapper = EventMapper::new();
+        let out = mapper.map(&AgentEvent::BackgroundTasks {
+            tasks: vec![
+                bg_task("nt-1", Some("c7"), BackgroundTaskStatus::Running),
+                bg_task("nt-2", None, BackgroundTaskStatus::Running),
+                bg_task("nt-3", Some("c9"), BackgroundTaskStatus::Killed),
+            ],
+        });
+        let [ChatEvent::ActiveTasksUpdate { tasks }] = out.as_slice() else {
+            panic!("one active_tasks_update: {out:?}");
+        };
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["c7", "nt-2"], "running only, by tool_use id");
+        assert_eq!(tasks[0].pid, Some(4242));
+        assert_eq!(tasks[0].kind, BackgroundTaskKind::BashBackground);
+        assert_eq!(tasks[0].started_at.timestamp_millis(), 1_700_000_000_000);
+        assert_eq!(tasks[0].parent_tool_use_id.as_deref(), Some("c7"));
+        // The wire id finds the provider's own; an ended task is known, not running.
+        assert_eq!(mapper.provider_task("c7"), Some(("nt-1".into(), true)));
+        assert_eq!(mapper.provider_task("nt-1"), Some(("nt-1".into(), true)));
+        assert_eq!(mapper.provider_task("c9"), Some(("nt-3".into(), false)));
+        assert_eq!(mapper.provider_task("zz"), None);
+        // An empty snapshot empties the list.
+        let out = mapper.map(&AgentEvent::BackgroundTasks { tasks: vec![] });
+        assert!(
+            matches!(out.as_slice(), [ChatEvent::ActiveTasksUpdate { tasks }] if tasks.is_empty())
+        );
+        assert!(mapper.active_tasks().is_empty());
+    }
+
+    /// A `Monitor` line of a background task is its `background_output`, tied to
+    /// its `tool_use`; a task update of anything else stays a workflow event.
+    #[test]
+    fn a_progress_line_of_a_background_task_is_background_output() {
+        let mut mapper = EventMapper::new();
+        mapper.map(&AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task("nt-1", Some("c7"), BackgroundTaskStatus::Running)],
+        });
+        let line = AgentEvent::TaskUpdate {
+            phase: TaskPhase::Progress,
+            task_id: Some("nt-1".into()),
+            tool_call_id: Some("c7".into()),
+            description: None,
+            status: None,
+            summary: Some("epoch 3 loss=0.1".into()),
+            event_id: None,
+            data: json!({"task_id": "nt-1", "line": "epoch 3 loss=0.1"}),
+        };
+        let out = mapper.map(&line);
+        assert!(
+            matches!(out.as_slice(), [ChatEvent::BackgroundOutput { source, content, correlation_id, .. }]
+                if source == "tool_result" && content == "epoch 3 loss=0.1"
+                    && correlation_id.as_deref() == Some("c7")),
+            "{out:?}"
+        );
+        let other = AgentEvent::TaskUpdate {
+            phase: TaskPhase::Progress,
+            task_id: Some("subagent-1".into()),
+            tool_call_id: None,
+            description: None,
+            status: None,
+            summary: None,
+            event_id: None,
+            data: json!({"x": 1}),
+        };
+        assert!(
+            matches!(mapper.map(&other).as_slice(), [ChatEvent::Workflow { subtype, .. }] if subtype == "task_progress")
+        );
     }
 
     #[test]
