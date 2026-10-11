@@ -892,6 +892,11 @@ pub async fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -
                 rule: grant.describe(),
             });
         }
+        // A lasting rule, written or being written, never covers a command once the shell
+        // may have moved (review of #726: checked before the pending ones too).
+        if grants.cwd_bound(call) {
+            return None;
+        }
         if !grants.pending_lasting.is_empty() {
             if let Some(grant) = lasting_grant_with(call, &grants.read_only_mcp) {
                 if grants.pending_lasting.contains(&grant) {
@@ -901,9 +906,6 @@ pub async fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -
                     });
                 }
             }
-        }
-        if grants.cwd_bound(call) {
-            return None;
         }
         (grants.lasting.clone()?, grants.read_only_mcp.clone())
     };

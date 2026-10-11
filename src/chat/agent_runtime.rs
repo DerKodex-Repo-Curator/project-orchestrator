@@ -1567,30 +1567,26 @@ impl AgentSessionHandle {
         // the answer: a CLI asks the identical call again as soon as it has it, before
         // `answer_permission` returns here (measured on CI, review of #726). Kept for good
         // once delivered, dropped if the provider refuses the answer.
-        if let Some(grant) = &grant {
-            let mut grants = self
-                .session_grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if scope == PermissionAnswerScope::Always && for_good {
-                grants.begin_lasting(grant.clone());
-            } else {
-                grants.begin_pending(grant.clone());
-            }
-        }
+        // Only while the request is still waiting: a second answer (another tab) that got
+        // here after the first one took it covers nothing, even for the time the provider
+        // takes to refuse it.
+        let still_asked = self
+            .asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(request_id);
+        // Rolls the pending grant back if this future is dropped before it is settled (the
+        // HTTP or WebSocket request that carries the answer is cancelled while the provider
+        // takes it): never a grant left pending for the rest of the session.
+        let mut pending = PendingGrant {
+            grants: &self.session_grants,
+            grant: grant.clone().filter(|_| still_asked),
+            lasting: scope == PermissionAnswerScope::Always && for_good,
+        };
+        pending.begin();
         if let Err(e) = self.session.answer_permission(request_id, decision).await {
             self.tool_clock.undecided(request_id, mark);
-            if let Some(grant) = &grant {
-                let mut grants = self
-                    .session_grants
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if scope == PermissionAnswerScope::Always && for_good {
-                    grants.abort_lasting(grant);
-                } else {
-                    grants.end_pending(grant, false);
-                }
-            }
+            drop(pending);
             return Err(PermissionDeliveryError::Failed(anyhow::Error::new(e)));
         }
         drop(answering);
@@ -1610,6 +1606,7 @@ impl AgentSessionHandle {
                 };
                 let written =
                     super::lasting_rules::keep(place, call, grant, &self.session_id).await;
+                pending.disarm();
                 self.session_grants
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -1622,6 +1619,7 @@ impl AgentSessionHandle {
                 if scope == PermissionAnswerScope::Always {
                     kept = PermissionAnswerScope::Session;
                 }
+                pending.disarm();
                 self.session_grants
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -1629,6 +1627,7 @@ impl AgentSessionHandle {
             }
             (None, _, _) => {}
         }
+        pending.disarm();
         self.asked_calls
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2141,6 +2140,49 @@ async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent:
     }
     // An out-of-turn `init` (the CLI repeats it) may carry a new session id.
     handle.sync_resume_token().await;
+}
+
+/// A grant made pending while its answer is handed to the provider
+/// (`AgentSessionHandle::answer_permission_scoped`): dropped before it is settled — the
+/// provider refused the answer, or the future carrying it was cancelled — it is rolled
+/// back, so no grant stays pending for the rest of the session.
+struct PendingGrant<'a> {
+    grants: &'a std::sync::Mutex<super::session_grants::SessionGrants>,
+    /// `None` once settled (or when there is nothing to grant).
+    grant: Option<super::session_grants::SessionGrant>,
+    /// A lasting grant (its rule is written next) rather than a session one.
+    lasting: bool,
+}
+
+impl PendingGrant<'_> {
+    fn begin(&self) {
+        if let Some(grant) = &self.grant {
+            let mut grants = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+            if self.lasting {
+                grants.begin_lasting(grant.clone());
+            } else {
+                grants.begin_pending(grant.clone());
+            }
+        }
+    }
+
+    /// Settled by the caller: nothing to roll back.
+    fn disarm(&mut self) {
+        self.grant = None;
+    }
+}
+
+impl Drop for PendingGrant<'_> {
+    fn drop(&mut self) {
+        if let Some(grant) = self.grant.take() {
+            let mut grants = self.grants.lock().unwrap_or_else(|p| p.into_inner());
+            if self.lasting {
+                grants.abort_lasting(&grant);
+            } else {
+                grants.end_pending(&grant, false);
+            }
+        }
+    }
 }
 
 /// The CLI path of the built-in Claude Code, shared by the chat manager (which changes it
@@ -2951,20 +2993,19 @@ mod adopt_tests {
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // Meanwhile the CLI asks the identical call.
-        let second = {
-            let handle = Arc::clone(&handle);
-            tokio::spawn(async move { handle.emit(write("write-2")).await })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // No sleep: the fake holds the answer once it took its own handle on `hold`
+        // (current-thread runtime: it is then parked on it).
+        while Arc::strong_count(&hold) < 3 {
+            tokio::task::yield_now().await;
+        }
+        // Meanwhile the CLI asks the identical call (answered at once: nothing holds it).
         *provider.state.hold_answers.lock().unwrap() = None;
-        hold.notify_waiters();
+        handle.emit(write("write-2")).await;
+        hold.notify_one();
         answering
             .await
             .unwrap()
             .expect("the first answer is delivered");
-        second.await.unwrap();
         let answered: Vec<String> = provider
             .state
             .permission_answers
@@ -2987,6 +3028,64 @@ mod adopt_tests {
             }
         }
         assert!(decided_by_backend, "permission_decision with its rule");
+    }
+
+    /// Follow-up review of #726, point 1: the request carrying a `session` answer is
+    /// cancelled (the client dropped its HTTP or WebSocket request) while the provider
+    /// takes it. The grant made pending for that time is rolled back: the identical call
+    /// asked afterwards waits for the user, it is not answered by a grant nobody kept.
+    #[tokio::test]
+    async fn a_session_answer_cancelled_in_flight_leaves_no_grant_behind() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let handle = runtime
+            .adopt(
+                "native-cancelled",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        handle.emit(write("write-1")).await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_answers.lock().unwrap() = Some(Arc::clone(&hold));
+        let answering = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                handle
+                    .answer_permission_scoped("write-1", true, PermissionAnswerScope::Session)
+                    .await
+            })
+        };
+        // The provider holds the answer (current-thread runtime: parked on `hold`).
+        while Arc::strong_count(&hold) < 3 {
+            tokio::task::yield_now().await;
+        }
+        // The client goes away: the future carrying the answer is dropped.
+        answering.abort();
+        assert!(answering.await.unwrap_err().is_cancelled());
+        *provider.state.hold_answers.lock().unwrap() = None;
+        handle.emit(write("write-2")).await;
+        assert!(
+            provider.state.permission_answers.lock().unwrap().is_empty(),
+            "nothing answered write-2 for the user"
+        );
     }
 
     /// The review of #681 (finding 1): Codex asks a patch with `{reason}` only (nexus
