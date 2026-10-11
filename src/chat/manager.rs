@@ -9561,7 +9561,14 @@ impl ChatManager {
                 .routing_mode
                 .as_deref()
                 .filter(|_| by_router)
-                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()),
+                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok())
+                // The router moves only a conversation that is `full` in effect; a pool kept
+                // without a mode (the settings said `full`) says so, or the opening of the new
+                // session would decide its target again among the pool (review of #713, C1-bis).
+                .or_else(|| {
+                    (by_router && node.routing_pool.is_some())
+                        .then_some(super::provider::cognitive::ConversationRoutingMode::Full)
+                }),
             attachments: Vec::new(),
             refs: Vec::new(),
             message: message.to_string(),
@@ -12627,11 +12634,8 @@ impl ChatManager {
             // conversation instead of the opening failing (review of #713, C2). The decision
             // is stored back as not applied, with why.
             Err(refused) if auto_pick.is_some() && pool_fallback.is_some() => {
-                input.project_rule = declared_project_rule;
-                input.request = pool_fallback.flatten();
-                let choice =
-                    resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?;
-                auto_pick = None;
+                // Rewritten BEFORE the fallback is resolved: the pick was not applied, whether
+                // the fallback then opens the conversation or is refused too (nothing opens).
                 if let Some(decision) = cognitive.as_mut() {
                     decision.applied = false;
                     decision.reason =
@@ -12642,7 +12646,10 @@ impl ChatManager {
                         }
                     }
                 }
-                choice
+                input.project_rule = declared_project_rule;
+                input.request = pool_fallback.flatten();
+                auto_pick = None;
+                resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?
             }
             Err(refused) => return Err(anyhow::Error::new(refused)),
         };

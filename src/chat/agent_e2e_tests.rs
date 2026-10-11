@@ -1758,29 +1758,48 @@ mod cognitive_routing {
         }
     }
 
-    /// Review of #713, C2: the pick among the pool is applied but the resolver refuses it
-    /// (here: no consent for its instance). A pilot never falls back inside the resolver;
-    /// the pool's own fallback — the menu's pilot — opens the conversation instead of the
-    /// opening failing. Before the fix: `not_allowed`, the conversation did not open.
-    #[tokio::test]
-    async fn a_pool_pick_the_resolver_refuses_falls_back_to_the_menus_pilot() {
+    /// A manager whose router applies `other/o1` (consent not given), its decisions stored
+    /// in the graph, and a pool request naming `pilot` as the menu's pilot.
+    async fn refused_pick(pilot: &str) -> (Setup, ChatRequest) {
         let Setup {
             _fake,
             graph,
             manager,
         } = setup_with("primary", "auto", false, false).await;
-        let mut other = instance(&_fake, "none");
-        other.id = "other".into();
-        other.label = "other".into();
-        store_instance(&graph, &other).await;
-        let manager =
-            manager.with_cognitive_routing(CognitiveRouting::with_decider(Arc::new(AppliesOther)));
+        for id in ["other", "other2"] {
+            let mut record = instance(&_fake, "none");
+            record.id = id.into();
+            record.label = id.into();
+            store_instance(&graph, &record).await;
+        }
+        let mut routing = CognitiveRouting::with_decider(Arc::new(AppliesOther));
+        routing.store = Some(Arc::new(Neo4jRoutingStore::new(graph.clone())));
+        let manager = manager.with_cognitive_routing(routing);
         let mut r = pilot_request();
         r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
-        r.routing_pool = pool_of(&[("other", "o1"), ("local", "m")]);
-        r.provider = Some("local".into());
+        r.routing_pool = pool_of(&[("other", "o1"), (pilot, "m")]);
+        r.provider = Some(pilot.into());
         r.model = Some("m".into());
-        let c = manager
+        (
+            Setup {
+                _fake,
+                graph,
+                manager,
+            },
+            r,
+        )
+    }
+
+    /// Review of #713, C2: the pick among the pool is applied but the resolver refuses it
+    /// (here: no consent for its instance). A pilot never falls back inside the resolver;
+    /// the pool's own fallback — the menu's pilot — opens the conversation instead of the
+    /// opening failing. Before the fix: `not_allowed`, the conversation did not open.
+    /// The stored decision says what happened: not applied, `not_opened: endpoint_not_allowed`.
+    #[tokio::test]
+    async fn a_pool_pick_the_resolver_refuses_falls_back_to_the_menus_pilot() {
+        let (s, r) = refused_pick("local").await;
+        let c = s
+            .manager
             .resolve_provider_choice(&r, Some("proj"))
             .await
             .unwrap_or_else(|e| panic!("the opening must fall back, not fail: {e:#}"));
@@ -1792,6 +1811,33 @@ mod cognitive_routing {
             c.shadow,
             Some(("other".to_owned(), Some("o1".to_owned()))),
             "what the router chose is recorded, not applied"
+        );
+        let stored = decisions(&s).await;
+        assert_eq!(stored.len(), 1, "{stored:#?}");
+        assert!(!stored[0].applied, "{stored:#?}");
+        assert!(
+            stored[0]
+                .reason
+                .ends_with("; not_opened: endpoint_not_allowed"),
+            "{}",
+            stored[0].reason
+        );
+    }
+
+    /// Review of #713 (follow-up, nit 2): the fallback is refused too — nothing opens, and
+    /// the stored decision does not claim it was applied.
+    #[tokio::test]
+    async fn a_refused_pick_whose_fallback_is_refused_too_is_stored_not_applied() {
+        let (s, r) = refused_pick("other2").await;
+        let refused = s.manager.resolve_provider_choice(&r, Some("proj")).await;
+        assert!(refused.is_err(), "{refused:?}");
+        let stored = decisions(&s).await;
+        assert_eq!(stored.len(), 1, "{stored:#?}");
+        assert!(!stored[0].applied, "{stored:#?}");
+        assert!(
+            stored[0].reason.contains("not_opened:"),
+            "{}",
+            stored[0].reason
         );
     }
 
