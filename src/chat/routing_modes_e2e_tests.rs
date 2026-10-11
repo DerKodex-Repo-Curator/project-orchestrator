@@ -43,6 +43,13 @@ use crate::test_helpers::mock_app_state;
 const SIMPLE: &str = "rename this variable";
 const DEBUG: &str = "why does this crash with a stack trace error";
 const PROBE: &str = "Call the ping tool now";
+/// R-S3: a second simple and a second debug turn, two plan turns (a class where `wa` and `wb`
+/// are as good), and an explore turn (a class the PRIMARY wins, `wb` second).
+const SIMPLE2: &str = "rename that function";
+const DEBUG2: &str = "the build fails with a panic";
+const PLAN: &str = "plan and implement the export feature";
+const PLAN2: &str = "now create the import feature too";
+const EXPLORE: &str = "explain the architecture overview";
 /// Text of the native compaction's summarisation prompt (nexus `SUMMARY_SYSTEM_PROMPT`).
 const SUMMARY_PROMPT: &str = "You are compacting the history";
 /// Turns of the compaction test, after the opening "hi there".
@@ -93,6 +100,9 @@ fn script(who: &str, models: &[&str]) -> Value {
     // before a turn once there is enough history to summarise.
     for text in LONG_TURNS.iter().rev() {
         routes.push(sse_route(text, answer("noted", 31_000)));
+    }
+    for text in [EXPLORE, PLAN2, PLAN, SIMPLE2, DEBUG2] {
+        routes.push(sse_route(text, answer("done", 10)));
     }
     routes.push(sse_route(DEBUG, answer("it crashes because", 10)));
     routes.push(sse_route(SIMPLE, answer("renamed", 10)));
@@ -149,6 +159,31 @@ async fn teach(store: &Neo4jRoutingStore, class: &str, winner: (&str, &str)) {
     }
 }
 
+/// `successes` then `failures` observations of one pair.
+async fn teach_counts(
+    store: &Neo4jRoutingStore,
+    class: &str,
+    (provider, model): (&str, &str),
+    successes: usize,
+    failures: usize,
+) {
+    let key = ArmKey::new(class, provider, model);
+    for reward in std::iter::repeat_n(1.0, successes).chain(std::iter::repeat_n(0.0, failures)) {
+        store
+            .observe(
+                &key,
+                &ArmObservation {
+                    reward,
+                    success_threshold: 0.5,
+                    cost_usd: None,
+                    latency_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+}
+
 async fn world(mode: &str, stage: &str) -> World {
     let primary = FakeOpenAi::start(script("primary", &["pm"]));
     let worker = FakeOpenAi::start(script("worker", &["wa", "wb"]));
@@ -188,6 +223,22 @@ async fn world(mode: &str, stage: &str) -> World {
         "two classes to route between"
     );
     teach(&store, &class_of(DEBUG), ("worker", "wb")).await;
+    // R-S3: the plan class has two candidates as good (their draws stay within the
+    // hysteresis margin); the explore class prefers the primary, then `wb`, then `wa`.
+    for (pair, successes, failures) in [
+        (("primary", "pm"), 0, 60),
+        (("worker", "wa"), 60, 0),
+        (("worker", "wb"), 60, 0),
+    ] {
+        teach_counts(&store, &class_of(PLAN), pair, successes, failures).await;
+    }
+    for (pair, successes, failures) in [
+        (("primary", "pm"), 60, 0),
+        (("worker", "wa"), 0, 60),
+        (("worker", "wb"), 45, 15),
+    ] {
+        teach_counts(&store, &class_of(EXPLORE), pair, successes, failures).await;
+    }
     teach(
         &store,
         &TaskSignature::utility(TaskClass::UtilityCompaction, 0, None).arm_key(),
@@ -805,4 +856,219 @@ async fn a_resumed_conversation_in_auto_still_routes_at_the_auto_stage() {
         .expect("the debug turn is decided");
     assert_eq!(change.stage, LearningStage::Auto);
     assert!(change.applied, "{change:#?}");
+}
+
+/// R-S3: a conversation in Auto (`routing_mode: full` over `primary` + `shadow`), opened on
+/// `worker/wa` with `wb` probed.
+async fn auto_conversation(w: &World) -> String {
+    use super::provider::cognitive::ProviderRoutingMode;
+    probe_wb(w).await;
+    let mut auto = pilot();
+    auto.routing_mode = Some(ProviderRoutingMode::Full);
+    let p = open(w, &auto).await;
+    assert_eq!(node(w, &p).await.model, "wa", "the plain opening: wa");
+    p
+}
+
+/// The models a turn's events say the conversation changed to.
+fn changes(events: &[ChatEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ChatEvent::ModelChanged { model } => Some(model.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The decisions of a session's turns (not its opening), in turn order.
+async fn turn_decisions(w: &World, session_id: &str) -> Vec<CognitiveDecision> {
+    let mut mine: Vec<CognitiveDecision> = decisions_of(w, session_id)
+        .await
+        .into_iter()
+        .filter(|d| d.turn_index.is_some_and(|i| i > 0))
+        .collect();
+    mine.sort_by_key(|d| d.turn_index);
+    mine
+}
+
+/// R-S3 (1): simple and debug turns alternate; each turn runs on the model its class
+/// wants, ON THE TURN: `wb`, `wa`, `wb`, `wa`, a `model_changed` every turn, and every
+/// turn's decision applied with its reason. Red with the old guard ("never two changes in
+/// consecutive turns"): the turn right after a change stayed on the previous model.
+#[tokio::test]
+async fn alternating_classes_change_the_model_on_every_turn_never_one_turn_late() {
+    let w = world("primary", "shadow").await;
+    assert_eq!(class_of(SIMPLE2), class_of(SIMPLE));
+    assert_eq!(class_of(DEBUG2), class_of(DEBUG));
+    let p = auto_conversation(&w).await;
+    let mut seen = Vec::new();
+    for text in [DEBUG, SIMPLE, DEBUG2, SIMPLE2] {
+        seen.push(changes(&turn_events(&w, &p, text).await));
+    }
+    assert_eq!(
+        seen,
+        [["wb"], ["wa"], ["wb"], ["wa"]],
+        "a model_changed per turn"
+    );
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[SIMPLE]), ["wb"]);
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[DEBUG2]), ["wa"]);
+    assert_eq!(model_of_turn(&w.worker, DEBUG2, &[SIMPLE2]), ["wb"]);
+    assert_eq!(model_of_turn(&w.worker, SIMPLE2, &[]), ["wa"]);
+    assert!(turns(&w.primary).is_empty());
+    let decided = turn_decisions(&w, &p).await;
+    let summary: Vec<(String, bool)> = decided
+        .iter()
+        .map(|d| {
+            (
+                d.chosen
+                    .as_ref()
+                    .map(|c| c.model.clone())
+                    .unwrap_or_default(),
+                d.applied,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("wb".to_owned(), true),
+            ("wa".to_owned(), true),
+            ("wb".to_owned(), true),
+            ("wa".to_owned(), true)
+        ],
+        "{decided:#?}"
+    );
+    assert!(decided.iter().all(|d| !d.reason.is_empty()), "{decided:#?}");
+}
+
+/// R-S3 (2): two turns of a class whose two best candidates score alike, right after a
+/// change of another class: the hysteresis margin keeps the model in force, no flip-flop.
+#[tokio::test]
+async fn two_turns_of_a_class_with_close_candidates_never_flip_flop() {
+    let w = world("primary", "shadow").await;
+    assert_eq!(class_of(PLAN2), class_of(PLAN));
+    assert_ne!(class_of(PLAN), class_of(DEBUG));
+    let p = auto_conversation(&w).await;
+    assert_eq!(changes(&turn_events(&w, &p, DEBUG).await), ["wb"]);
+    let plan = changes(&turn_events(&w, &p, PLAN).await);
+    let plan2 = changes(&turn_events(&w, &p, PLAN2).await);
+    assert!(plan.is_empty() && plan2.is_empty(), "{plan:?} {plan2:?}");
+    assert_eq!(model_of_turn(&w.worker, PLAN, &[PLAN2]), ["wb"]);
+    assert_eq!(model_of_turn(&w.worker, PLAN2, &[]), ["wb"]);
+    let decided = turn_decisions(&w, &p).await;
+    assert!(
+        decided[1..]
+            .iter()
+            .all(|d| d.chosen == Some(Pick::new("worker", "wb"))),
+        "kept by the margin: {decided:#?}"
+    );
+}
+
+/// R-S3 (3): two simple turns in a row on the model their class wants: no change at all.
+#[tokio::test]
+async fn two_simple_turns_in_a_row_change_nothing() {
+    let w = world("primary", "shadow").await;
+    let p = auto_conversation(&w).await;
+    let first = changes(&turn_events(&w, &p, SIMPLE).await);
+    let second = changes(&turn_events(&w, &p, SIMPLE2).await);
+    assert!(
+        first.is_empty() && second.is_empty(),
+        "{first:?} {second:?}"
+    );
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[SIMPLE2]), ["wa"]);
+    assert_eq!(model_of_turn(&w.worker, SIMPLE2, &[]), ["wa"]);
+    assert!(turns(&w.primary).is_empty());
+}
+
+/// R-S3 (4), and the measure behind the decision to KEEP "no two provider moves in a row":
+/// the router moves the conversation to the worker (a relay: a new session, the history
+/// rendered into its first message); the next turn is of another class, which the PRIMARY
+/// wins (`explore`): its model changes on the worker (`wa` → `wb`), its provider does not.
+/// Red with the old guard: the turn after a move was only recorded, the model stayed `wa`.
+#[tokio::test]
+async fn after_a_provider_move_the_next_turn_of_another_class_changes_model_not_provider() {
+    let w = world("full", "auto").await;
+    probe_wb(&w).await;
+    let mut named = pilot();
+    named.provider = Some("primary".into());
+    let p = open(&w, &named).await;
+    w.manager
+        .set_session_routing(
+            &p,
+            &SessionRoutingRequest {
+                auto: true,
+                routing_pool: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut rx = w.manager.subscribe(&p).await.unwrap();
+    let moved_at = std::time::Instant::now();
+    w.manager.send_message(&p, SIMPLE).await.unwrap();
+    let ChatEvent::ConversationRelayed { to_session_id, .. } = wait_for(&mut rx, |e| {
+        matches!(e, ChatEvent::ConversationRelayed { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    for _ in 0..400 {
+        if !model_of_turn(&w.worker, SIMPLE, &[]).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    idle(&w, &to_session_id).await;
+    let move_turn = moved_at.elapsed();
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[]), ["wa"]);
+
+    let changed_at = std::time::Instant::now();
+    let events = turn_events(&w, &to_session_id, EXPLORE).await;
+    let change_turn = changed_at.elapsed();
+    assert_eq!(changes(&events), ["wb"], "the model may change");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::ConversationRelayed { .. })),
+        "no second move"
+    );
+    assert_eq!(model_of_turn(&w.worker, EXPLORE, &[]), ["wb"]);
+    assert!(
+        model_of_turn(&w.primary, EXPLORE, &[]).is_empty(),
+        "the provider stays"
+    );
+    assert_eq!(
+        node(&w, &to_session_id).await.provider_id.as_deref(),
+        Some("worker")
+    );
+    let explore = turn_decisions(&w, &to_session_id)
+        .await
+        .into_iter()
+        .find(|d| d.signature.arm_key() == class_of(EXPLORE))
+        .expect("the explore turn is decided");
+    assert!(explore.applied, "{explore:#?}");
+    assert_eq!(explore.chosen, Some(Pick::new("worker", "wb")));
+    assert!(
+        explore
+            .alternatives
+            .iter()
+            .all(|a| a.pick.provider_id == "worker"),
+        "decided among the worker's models only: {explore:#?}"
+    );
+    // The measure (decision R-S3): what a move costs next to a change of model.
+    let size = |text: &str, fake: &FakeOpenAi| {
+        turns(fake)
+            .into_iter()
+            .filter(|(_, body)| body.contains(text))
+            .map(|(_, body)| body.len())
+            .min()
+            .unwrap_or_default()
+    };
+    eprintln!(
+        "R-S3 measure: move turn {move_turn:?} (relay: new session, first request {} bytes), \
+         model-change turn {change_turn:?} (same session, request {} bytes)",
+        size(SIMPLE, &w.worker),
+        size(EXPLORE, &w.worker),
+    );
 }

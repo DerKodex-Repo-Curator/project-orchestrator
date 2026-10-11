@@ -324,6 +324,10 @@ pub trait PoolSource: Send + Sync {
 struct TurnState {
     current_model: String,
     last_change_turn: Option<u32>,
+    /// Class (`TaskSignature::arm_key`) of the turn whose decision made the last change of
+    /// model: the next turn of the SAME class is decided without exploration, so that only
+    /// the hysteresis margin can move it again (R-S3, [`held_by_class`]).
+    last_change_class: Option<String>,
     /// Index of the next turn: counted here for the legacy engine, which has no harness
     /// to count turns, and copied from the harness on the agent engine.
     next_turn: u32,
@@ -335,7 +339,7 @@ struct TurnState {
 struct PreDecided {
     turn_index: u32,
     pick: Option<Pick>,
-    /// The pick may be applied (stage `auto`, not right after a change).
+    /// The pick may be applied (stage `auto`).
     apply: bool,
 }
 
@@ -355,7 +359,8 @@ pub(crate) struct TurnRouter {
     /// The user changed the model by hand: no more automatic change.
     manual: AtomicBool,
     /// The conversation reached this session by a provider move: the next provider check
-    /// is recorded, never applied (no two moves in a row).
+    /// is decided among this provider's models only (no two PROVIDER moves in a row, R-S3);
+    /// its model may still change.
     moved_in: AtomicBool,
     predecided: Mutex<Option<PreDecided>>,
     /// The last decision asked for a turn, with the turn's index: the decision a change of
@@ -459,6 +464,7 @@ impl TurnRouter {
             state: Mutex::new(TurnState {
                 current_model: spec.current_model,
                 last_change_turn: None,
+                last_change_class: None,
                 next_turn: spec.next_turn,
             }),
             timeout: DECIDE_TIMEOUT,
@@ -565,6 +571,7 @@ impl TurnRouter {
         let mut state = locked(&self.state);
         state.current_model = model_before.to_owned();
         state.last_change_turn = None;
+        state.last_change_class = None;
     }
 
     /// The signature of the turn about to start, from the text it carries.
@@ -614,6 +621,37 @@ fn settings_for(routing: &RoutingSettings, apply: bool) -> RoutingSettings {
     settings
 }
 
+/// The per-class guard of turn `turn` (R-S3): the PREVIOUS turn changed the model, and it
+/// was of the same class as this one.
+///
+/// There is no "never two changes in a row" any more: a conversation that alternates a
+/// simple question and a heavy task is routed on the turn itself, not one turn late. A turn
+/// of ANOTHER class than the change is routed as any turn. A turn of the SAME class is
+/// decided without exploration ([`guarded`]): the decider keeps the pair in force unless a
+/// challenger beats it by [`HYSTERESIS_MARGIN`], so the margin alone prevents a flip-flop.
+fn held_by_class(state: &TurnState, turn: u32, class: &str) -> bool {
+    state
+        .last_change_turn
+        .is_some_and(|t| t.checked_add(1) == Some(turn))
+        && state.last_change_class.as_deref() == Some(class)
+}
+
+/// `settings` for a turn [`held_by_class`]: no exploration draw, so only a challenger that
+/// clears the hysteresis margin replaces the pair the previous turn chose for this class.
+fn guarded(mut settings: RoutingSettings, held: bool) -> RoutingSettings {
+    if held {
+        settings.exploration_epsilon = 0.0;
+    }
+    settings
+}
+
+/// Records a change of model made on `turn` by a decision of class `class`.
+fn record_change(state: &mut TurnState, turn: u32, model: &str, class: String) {
+    state.current_model = model.to_owned();
+    state.last_change_turn = Some(turn);
+    state.last_change_class = Some(class);
+}
+
 /// What the turn about to start does about its provider.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProviderPlan {
@@ -638,9 +676,11 @@ pub(crate) enum ProviderPlan {
 /// * otherwise the decider chooses among every model the project consented to (the
 ///   conversation's pool when it has one), the current pair in force. The decision is kept
 ///   for the turn (the hook does not ask again) and recorded applied or not;
-/// * a move needs the stage `auto`, no move or model change on the previous turn, a pick
-///   that is not an exploration draw and that beats the current pair by the hysteresis
-///   margin. Anything else stays.
+/// * a move needs the stage `auto`, no move on the previous turn (the turn right after a
+///   move is decided among the models of its provider: its model may change, its provider
+///   not), a pick that is not an exploration draw and that beats the current pair by the
+///   hysteresis margin. Anything else stays. Right after a change of model, a turn of the
+///   same class is decided without exploration ([`held_by_class`], R-S3).
 pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     let choice = locked(&router.choice).clone();
     let routing = routing_of(router, &choice);
@@ -669,14 +709,15 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     {
         return ProviderPlan::Stay;
     }
-    let (turn, current_model, just_changed) = {
+    let signature = router.signature();
+    let (turn, current_model, held) = {
         let state = locked(&router.state);
-        let just_changed = state
-            .last_change_turn
-            .is_some_and(|t| t.checked_add(1) == Some(state.next_turn));
-        (state.next_turn, state.current_model.clone(), just_changed)
+        let held = held_by_class(&state, state.next_turn, &signature.arm_key());
+        (state.next_turn, state.current_model.clone(), held)
     };
-    // No two moves in a row: the turn right after a move (or a model change) is only recorded.
+    // No two PROVIDER moves in a row (decision R-S3: a move relays the history to a new
+    // session, a model change does not): the turn right after a move is decided among the
+    // models of the provider it moved to, so its model may still change.
     let just_moved = router.moved_in.swap(false, Ordering::SeqCst);
     // F-R4: a turn the pair in force cannot read must leave it, whatever the anti-flapping.
     let blind = cannot_read_turn(router, &pool, &router.provider_id, &current_model);
@@ -687,13 +728,17 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
             f.provider_id != router.provider_id || same_model(&f.model, &current_model)
         });
     }
-    let apply = routing.auto && (blind || (!just_moved && !just_changed));
+    let may_move = blind || !just_moved;
+    let apply = routing.auto;
     let current = Pick::new(&router.provider_id, &current_model);
     let mut request = DecideRequest::new(
-        router.signature(),
-        settings_for(&choice.routing, apply),
+        signature,
+        guarded(settings_for(&choice.routing, apply), held),
         pool,
     );
+    if !may_move {
+        request.restrict_provider = Some(router.provider_id.clone());
+    }
     request.trust = router.trust;
     request.current = Some(current.clone());
     request.session_id = router.session_id;
@@ -709,7 +754,7 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
         apply,
     });
     let pick = match &decision.chosen {
-        Some(pick) if apply && pick.provider_id != router.provider_id => pick.clone(),
+        Some(pick) if apply && may_move && pick.provider_id != router.provider_id => pick.clone(),
         _ => return ProviderPlan::Stay,
     };
     if decision.explored && !blind {
@@ -744,10 +789,12 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
 ///   that cannot switch model live: nothing is asked and nothing changes;
 /// * a decision already taken for this turn by [`plan_provider_move`] is used as is (a
 ///   pick on another provider changes nothing here: the move was the host's to make);
-/// * `full` mode before the `auto` stage (and the turn right after a change): the decider
-///   is still asked, so the decision is recorded, but nothing is applied;
+/// * `full` mode before the `auto` stage: the decider is still asked, so the decision is
+///   recorded, but nothing is applied;
 /// * `full` + `auto`: the pick is used when the decision is applied and differs from the
-///   current model. A failing or slow decider (2 s) never fails the turn.
+///   current model, on the turn itself, even right after a change (R-S3: a turn of the same
+///   class as that change is decided without exploration, so only the hysteresis margin can
+///   move it again). A failing or slow decider (2 s) never fails the turn.
 pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -> TurnDirective {
     // What the turn carries is the turn's own: whatever this returns, a later decision of the
     // same session (a compaction during the turn, the next turn before its input is set) never
@@ -768,26 +815,26 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
     if !routing.model {
         return TurnDirective::none();
     }
+    let signature = router.signature();
+    let class = signature.arm_key();
     let pick = match predecided {
         Some(pre) => pre.pick.filter(|_| pre.apply),
         None => {
-            // Never two changes in consecutive turns: the turn right after one is only recorded.
-            let just_changed = locked(&router.state)
-                .last_change_turn
-                .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
+            // R-S3: right after a change, a turn of the same class is decided without
+            // exploration (the hysteresis margin alone may move it); another class is routed
+            // as any turn.
+            let held = held_by_class(&locked(&router.state), ctx.turn_index, &class);
             let mut pool = provider_pool(router).await;
             if let Some(allowed) = &choice.allowed_models {
                 pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
             }
-            // F-R4: a turn the model in force cannot read must leave it, even right after a change.
-            let blind = cannot_read_turn(router, &pool, &router.provider_id, &ctx.current_model);
-            let apply = routing.auto && (blind || !just_changed);
-            let mut settings = settings_for(&choice.routing, apply);
+            let apply = routing.auto;
+            let mut settings = guarded(settings_for(&choice.routing, apply), held);
             // A pool is routed like `full` inside it, whatever the settings' mode.
             if choice.allowed_models.is_some() {
                 settings.mode = ProviderRoutingMode::Full;
             }
-            let mut request = DecideRequest::new(router.signature(), settings, pool);
+            let mut request = DecideRequest::new(signature, settings, pool);
             request.trust = router.trust;
             request.restrict_provider = Some(router.provider_id.clone());
             request.current = Some(Pick::new(&router.provider_id, &ctx.current_model));
@@ -808,10 +855,13 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
     };
     match pick {
         Some(pick) if pick.provider_id == router.provider_id && pick.model != ctx.current_model => {
-            debug!(model = %pick.model, turn = ctx.turn_index, "turn routing changes the model");
-            let mut state = locked(&router.state);
-            state.current_model = pick.model.clone();
-            state.last_change_turn = Some(ctx.turn_index);
+            debug!(model = %pick.model, turn = ctx.turn_index, class = %class, "turn routing changes the model");
+            record_change(
+                &mut locked(&router.state),
+                ctx.turn_index,
+                &pick.model,
+                class,
+            );
             TurnDirective::model(pick.model)
         }
         _ => TurnDirective::none(),
@@ -853,8 +903,8 @@ fn same_model(a: &str, b: &str) -> bool {
 }
 
 /// The turn about to start carries an image and the pool KNOWS the pair in force cannot read
-/// it. Staying is then no option: the anti-flapping rules (no two changes in a row, no move on
-/// an exploration draw) give way to the hard constraint. A pair the pool does not list (an
+/// it. Staying is then no option: the anti-flapping rules (no two provider moves in a row, no
+/// move on an exploration draw) give way to the hard constraint. A pair the pool does not list (an
 /// alias, a catalogue that does not name it, a pool not built) is NOT blind: nothing says it
 /// cannot read the image, so nothing overrides the guards — the provider refuses honestly if
 /// it really cannot.
@@ -970,9 +1020,8 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
         return None;
     }
     *locked(&router.image_change) = Some((turn, current_model));
-    let mut state = locked(&router.state);
-    state.current_model = pick.model.clone();
-    state.last_change_turn = Some(turn);
+    let class = router.signature().arm_key();
+    record_change(&mut locked(&router.state), turn, &pick.model, class);
     Some(pick.model)
 }
 
@@ -1780,7 +1829,8 @@ mod provider_move_tests {
     }
 
     #[tokio::test]
-    async fn the_turn_after_a_move_is_only_recorded_then_the_router_may_move_again() {
+    async fn the_turn_after_a_move_may_change_model_but_not_provider_then_the_router_may_move_again(
+    ) {
         let decider = Fake::picking("local2", 0.9, 0.1);
         let mut s = spec(
             decider.clone(),
@@ -1793,12 +1843,119 @@ mod provider_move_tests {
         // The relayed turn (0) runs on the pair the move chose: nothing is asked.
         directive_for_turn(&router, &TurnContext::new(0, "m")).await;
         assert_eq!(decider.calls(), 0);
-        // The next turn: recorded, never applied (no two moves in a row).
+        // The next turn: no second move (R-S3), decided among THIS provider's models, at
+        // the auto stage: its model may change.
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
-        assert_eq!(decider.last().settings.stage, LearningStage::Shadow);
+        assert_eq!(decider.last().restrict_provider.as_deref(), Some("local"));
+        assert_eq!(decider.last().settings.stage, LearningStage::Auto);
         directive_for_turn(&router, &TurnContext::new(1, "m")).await;
         // The one after may move.
         assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+        assert_eq!(decider.last().restrict_provider, None);
+    }
+
+    /// Picks `local/<model>`, the current pair scored low: applied in `full` + `auto`.
+    fn picking_model(model: &str) -> Arc<Fake> {
+        Arc::new(Fake {
+            pick: Pick::new("local", model),
+            ..Arc::try_unwrap(Fake::picking("local", 0.9, 0.1))
+                .ok()
+                .unwrap()
+        })
+    }
+
+    #[tokio::test]
+    async fn the_turn_after_a_move_changes_its_model_on_the_provider_it_moved_to() {
+        let decider = picking_model("m2");
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        s.moved_in = true;
+        let router = router(s);
+        directive_for_turn(&router, &TurnContext::new(0, "m")).await;
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(
+            directive.model.as_deref(),
+            Some("m2"),
+            "the model may change"
+        );
+        assert_eq!(decider.calls(), 1, "one decision for the turn");
+    }
+
+    /// R-S3: right after a change of model, a turn of ANOTHER class is routed as any turn
+    /// (it used to be only recorded: one turn late), with the exploration of the settings.
+    #[tokio::test]
+    async fn right_after_a_change_a_turn_of_another_class_is_routed_on_the_turn() {
+        let decider = picking_model("m2");
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(OneProvider),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        ));
+        router.set_last_message("why does this crash with a stack trace error");
+        let debug = router.signature().arm_key();
+        {
+            let mut state = locked(&router.state);
+            record_change(&mut state, 1, "m", "chat.general".into());
+        }
+        assert_ne!(debug, "chat.general");
+        let directive = directive_for_turn(&router, &TurnContext::new(2, "m")).await;
+        assert_eq!(directive.model.as_deref(), Some("m2"));
+        let request = decider.last();
+        assert_eq!(request.settings.stage, LearningStage::Auto);
+        assert_eq!(
+            request.settings.exploration_epsilon,
+            RoutingSettings::default().exploration_epsilon
+        );
+        let state = locked(&router.state);
+        assert_eq!(state.last_change_turn, Some(2));
+        assert_eq!(state.last_change_class.as_deref(), Some(debug.as_str()));
+    }
+
+    /// R-S3: right after a change, a turn of the SAME class is decided without exploration:
+    /// the decider's hysteresis margin alone decides whether it moves again (it is still
+    /// applied when the challenger clears it).
+    #[tokio::test]
+    async fn right_after_a_change_a_turn_of_the_same_class_is_decided_without_exploration() {
+        assert!(RoutingSettings::default().exploration_epsilon > 0.0);
+        let decider = picking_model("m2");
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(OneProvider),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        ));
+        let class = router.signature().arm_key();
+        record_change(&mut locked(&router.state), 1, "m", class.clone());
+        let directive = directive_for_turn(&router, &TurnContext::new(2, "m")).await;
+        assert_eq!(directive.model.as_deref(), Some("m2"), "the margin cleared");
+        assert_eq!(decider.last().settings.exploration_epsilon, 0.0);
+        assert_eq!(decider.last().settings.stage, LearningStage::Auto);
+        // Two turns later, the guard is gone.
+        record_change(&mut locked(&router.state), 2, "m2", class);
+        directive_for_turn(&router, &TurnContext::new(4, "m2")).await;
+        assert!(decider.last().settings.exploration_epsilon > 0.0);
+    }
+
+    /// R-S3: the provider check is guarded per class too: right after a change of model of
+    /// another class, a move is allowed on the turn.
+    #[tokio::test]
+    async fn right_after_a_change_of_another_class_the_provider_may_move() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let router = full_auto(decider.clone());
+        record_change(&mut locked(&router.state), 0, "m", "chat.general".into());
+        assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+        assert!(decider.last().settings.exploration_epsilon > 0.0);
+        let same = full_auto(decider.clone());
+        let class = same.signature().arm_key();
+        record_change(&mut locked(&same.state), 0, "m", class);
+        assert!(is_move_to(&plan_provider_move(&same).await, "local2"));
+        assert_eq!(decider.last().settings.exploration_epsilon, 0.0);
     }
 
     #[tokio::test]
