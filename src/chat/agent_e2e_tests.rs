@@ -12294,8 +12294,8 @@ mod native_subagents {
     }
 
     /// Lot review of #721, finding 1 (decision ed628dad): a child opened by the `Agent` tool
-    /// emits exactly ONE CRUD `created`, whose payload carries the record's `spawned_by` —
-    /// `parent_session_id` and the `tool_use_id` of the call the client joins it to. Red
+    /// emits exactly ONE CRUD `created`, whose payload names its parent — the client then
+    /// refetches its `/children`, where the record's `tool_use_id` joins it to the call. Red
     /// before: none at all (the agent engine's opening returned before the only emission,
     /// and `run_subagent` is no HTTP handler), so the card never appeared live.
     #[tokio::test]
@@ -12316,14 +12316,19 @@ mod native_subagents {
         }
         assert_eq!(created.len(), 1, "exactly one, for the child: {created:?}");
         assert_eq!(created[0].entity_id, child);
-        let spawned_by = &created[0].payload["spawned_by"];
-        assert_eq!(spawned_by["type"], "conversation");
-        assert_eq!(spawned_by["parent_session_id"], r.parent.as_str());
-        assert_eq!(spawned_by["tool_use_id"], "toolu_live");
-        // The same shape as the record the API answers.
+        // Exactly the project and the parent (review nexus-41 of #727, finding 1): the
+        // `tool_use_id` join is read from the filtered `/children`, which holds the record.
+        let project_slug = created[0].payload["project_slug"].clone();
+        assert_eq!(
+            created[0].payload,
+            serde_json::json!({
+                "project_slug": project_slug,
+                "spawned_by": { "type": "conversation", "parent_session_id": r.parent.as_str() },
+            })
+        );
         let stored: serde_json::Value =
             serde_json::from_str(children[0].spawned_by.as_deref().unwrap()).unwrap();
-        assert_eq!(spawned_by, &stored);
+        assert_eq!(stored["tool_use_id"], "toolu_live");
         assert!(r.none_alive().await);
     }
 

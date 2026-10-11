@@ -1592,14 +1592,23 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     fn git_log_touched_files(root_path: &Path, max_commits: usize) -> Result<Vec<GitCommitFiles>> {
         use std::process::Command;
 
+        // The repository at `root_path`, read the same way whatever the caller's git setup:
+        // an inherited `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` (a git hook) would point
+        // at another repository, and a user's `color.ui=always` or `log.showRoot=false`
+        // would change what is parsed below (review of #727, nit 7).
         let output = Command::new("git")
+            .args(["-c", "color.ui=false", "-c", "log.showRoot=true"])
             .args([
                 "log",
+                "--no-color",
                 "--numstat",
                 &format!("--max-count={}", max_commits),
                 "--format=COMMIT_START%n%H%n%s%n%an%n%aI",
             ])
             .current_dir(root_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()?;
 
         if !output.status.success() {
@@ -7581,7 +7590,8 @@ mod tests {
     }
 
     /// Runs `git args` in `dir` with a fixed identity and no user/system config, so the
-    /// test does not depend on the machine's git setup.
+    /// test does not depend on the machine's git setup — nor on a repository an inherited
+    /// `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` names (cargo test run from a git hook).
     fn git_in(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args([
@@ -7596,6 +7606,9 @@ mod tests {
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");

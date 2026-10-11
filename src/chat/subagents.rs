@@ -549,17 +549,56 @@ impl ChatManager {
                     "sub-agent not live here: its undecided permission request is refused on its thread"
                 );
             }
-            self.emit_on_session(
-                sid,
-                ChatEvent::PermissionDecision {
-                    id,
-                    allow: false,
-                    scope: None,
-                    rule: None,
-                },
-            )
-            .await;
+            self.deny_on_thread_if_undecided(sid, &id, live.as_deref())
+                .await;
         }
+    }
+
+    /// The fallback refusal of [`Self::deny_waiting_permissions`]: writes
+    /// `permission_decision {allow: false}` for `id` on the thread of `sid` ONLY if the
+    /// request is still undecided right now (review nexus-41 of #727, finding 2, and the
+    /// second review's finding 2). Between the collection of the requests and this write,
+    /// an allow may have won the race — the automatic answer of a grant, or the user's
+    /// answer whose decision is stored only after its lasting rule is written — and that
+    /// is the very reason the provider refused the deny: a refusal written then would
+    /// leave two contradictory decisions on the thread for a call that ran. Undecided
+    /// means: the live session (when there is one) neither answers it itself nor had an
+    /// answer to it taken (`answers_itself`, marked the moment the provider takes it), and
+    /// the thread, read again, holds no decision for it. Returns whether it was written.
+    pub(super) async fn deny_on_thread_if_undecided(
+        &self,
+        sid: &str,
+        id: &str,
+        live: Option<&super::agent_runtime::AgentSessionHandle>,
+    ) -> bool {
+        if live.is_some_and(|handle| handle.answers_itself(id)) {
+            tracing::info!(
+                child = %sid, request = %id,
+                "the sub-agent's request was answered meanwhile: no refusal written"
+            );
+            return false;
+        }
+        let decided = self.persisted_events(sid).await.iter().any(|event| {
+            matches!(event, ChatEvent::PermissionDecision { id: decided, .. } if decided == id)
+        });
+        if decided {
+            tracing::info!(
+                child = %sid, request = %id,
+                "the sub-agent's request is decided on its thread already: no refusal written"
+            );
+            return false;
+        }
+        self.emit_on_session(
+            sid,
+            ChatEvent::PermissionDecision {
+                id: id.to_owned(),
+                allow: false,
+                scope: None,
+                rule: None,
+            },
+        )
+        .await;
+        true
     }
 
     /// The first `result` of the session `sid`, live or already persisted.
@@ -725,6 +764,12 @@ impl Watch {
 
     /// Brings the waiting requests in line with the stored thread: what it shows decided
     /// is not waiting any more, what it shows asked and undecided is.
+    ///
+    /// Contract with `answers_itself` (review nexus-41 of #727, nit 3; second review,
+    /// finding 3): a request the live session saw asked and whose answer it took counts
+    /// as answered even before its decision is stored; one it never saw — asked before a
+    /// resume under the same id — does NOT: nobody here will answer it, so
+    /// [`Self::unanswered_ask`] fails the call on it at once, as on any undecided request.
     fn reconcile(&mut self, persisted: &[ChatEvent]) {
         for event in persisted {
             if let ChatEvent::PermissionRequest { id, tool, .. } = event {
