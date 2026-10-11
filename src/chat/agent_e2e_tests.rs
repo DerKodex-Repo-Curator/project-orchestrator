@@ -1225,6 +1225,242 @@ mod cognitive_routing {
         assert_eq!(all[0].session_id, Some(session));
     }
 
+    // ── Probing every model of a native instance (task 58fa9980) ──────────────
+
+    /// One route per model: those in `tools` call the probe's tool, those in `no_tools`
+    /// answer the 400 a model without tool support gives. `/v1/models` lists `m` (the
+    /// default) and the others, in this order.
+    fn catalogue_script(tools: &[&str], no_tools: &[&str]) -> Value {
+        let mut routes = Vec::new();
+        for model in tools {
+            routes.push(json!({"method": "POST", "path": "/v1/chat/completions", "status": 200,
+                "body_contains": format!("\"model\":\"{model}\""),
+                "sse": [
+                    delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+                    "[DONE]",
+                ]}));
+        }
+        for model in no_tools {
+            routes.push(
+                json!({"method": "POST", "path": "/v1/chat/completions", "status": 400,
+                "body_contains": format!("\"model\":\"{model}\""),
+                "body": {"error": {"message": format!("{model} does not support tools")}}}),
+            );
+        }
+        let listed: Vec<Value> = tools
+            .iter()
+            .chain(no_tools)
+            .map(|id| json!({"id": id, "context_length": 32000}))
+            .collect();
+        routes.push(json!({"method": "GET", "path": "/v1/models", "status": 200,
+            "body": {"object": "list", "data": listed}}));
+        Value::Array(routes)
+    }
+
+    /// A manager wired to the router over one instance (`local`, default model `m`)
+    /// served by `routes`, with no session opened before: nothing is probed yet.
+    async fn unwarmed(
+        routes: Value,
+        mode: &str,
+        stage: &str,
+        policy: crate::chat::provider::cognitive::decider::ProbePolicy,
+    ) -> Setup {
+        let fake = FakeOpenAi::start(routes);
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({"mode": mode, "stage": stage, "exploration_epsilon": 0.0}).to_string(),
+            )
+            .await
+            .unwrap();
+        let store = Arc::new(Neo4jRoutingStore::new(graph.clone()));
+        let mut routing = CognitiveRouting::new(store);
+        routing.probe_policy = policy;
+        let manager = manager(graph.clone(), true)
+            .with_provider_source(Arc::new(NoBuiltin))
+            .with_cognitive_routing(routing);
+        Setup {
+            _fake: fake,
+            graph,
+            manager,
+        }
+    }
+
+    /// The probes sent so far: requests carrying the probe's prompt, by model.
+    fn probes_sent(s: &Setup) -> Vec<String> {
+        s._fake
+            .chat_requests()
+            .into_iter()
+            .filter(|r| r["body"].to_string().contains("Call the ping tool now"))
+            .filter_map(|r| r["body"]["model"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn with_tools(
+        pool: &[crate::chat::provider::cognitive::candidates::ModelFacts],
+    ) -> Vec<String> {
+        let mut known: Vec<String> = pool
+            .iter()
+            .filter(|f| f.provider_id == "local" && f.supports_tools)
+            .map(|f| f.model.clone())
+            .collect();
+        known.sort();
+        known
+    }
+
+    /// Before: only the instance's default model was probed, so `other` had no tools
+    /// until a session had been opened on it, and Auto could never pick it.
+    #[tokio::test]
+    async fn a_model_other_than_the_default_is_a_candidate_with_its_facts_without_any_session() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "other"], &[]),
+            "mixed",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let choice = s
+            .manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), None)
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        assert_eq!(choice.routed_by, RoutedBy::Auto);
+        let decision = decisions(&s).await.remove(0);
+        let other = decision
+            .alternatives
+            .iter()
+            .find(|a| a.pick.model == "other")
+            .unwrap_or_else(|| panic!("other is in the pool: {:?}", decision.alternatives));
+        assert!(
+            other.rejected.is_none() && other.score.is_some(),
+            "other is eligible, not rejected: {other:?}"
+        );
+        let pool = s.manager.routing_pool_for(Some("proj")).await;
+        assert_eq!(with_tools(&pool), ["m", "other"]);
+        let other_facts = pool.iter().find(|f| f.model == "other").unwrap();
+        assert_eq!(
+            other_facts.context_window,
+            Some(32_000),
+            "the window is known too"
+        );
+    }
+
+    /// `primary` + `shadow` is routing switched off: deciding and building the pool send
+    /// nothing to the instance (before: its default model was probed anyway).
+    #[tokio::test]
+    async fn primary_and_shadow_send_no_probe_at_all() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "other"], &[]),
+            "primary",
+            "shadow",
+            ProbePolicy::standard(),
+        )
+        .await;
+        for r in [pilot_request(), executor_request()] {
+            choose(&s, &r).await;
+        }
+        let pool = s.manager.routing_pool_for(Some("proj")).await;
+        assert!(
+            pool.iter().any(|f| f.model == "other"),
+            "listed all the same"
+        );
+        assert!(with_tools(&pool).is_empty());
+        assert!(s._fake.chat_requests().is_empty(), "{:?}", probes_sent(&s));
+    }
+
+    /// One build starts at most `per_instance` probes (three), the next builds take the
+    /// rest, the default model first. Read from the facts, not from the fake's log.
+    #[tokio::test]
+    async fn one_build_probes_at_most_its_budget_and_the_next_builds_take_the_rest() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["a", "b", "m", "c", "d"], &[]),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        // `/v1/models` order: a, b, m, c, d; the default `m` goes first.
+        let first = s.manager.routing_pool_for(Some("proj")).await;
+        assert_eq!(with_tools(&first), ["a", "b", "m"]);
+        let second = s.manager.routing_pool_for(Some("proj")).await;
+        assert_eq!(with_tools(&second), ["a", "b", "c", "d", "m"]);
+    }
+
+    /// A model that refused tools (`ModelNoTools`) is a conclusion: never asked again,
+    /// even with no retry delay at all. One probe per build here, so the fake's log has
+    /// no concurrent write to lose.
+    #[tokio::test]
+    async fn a_model_without_tools_is_asked_once_and_never_again() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let policy = ProbePolicy {
+            per_instance: 1,
+            retry_after: Duration::ZERO,
+            ..ProbePolicy::standard()
+        };
+        let s = unwarmed(
+            catalogue_script(&["m", "a"], &["plain"]),
+            "full",
+            "auto",
+            policy,
+        )
+        .await;
+        let count = |sent: &[String], model: &str| sent.iter().filter(|m| *m == model).count();
+        assert_eq!(
+            with_tools(&s.manager.routing_pool_for(Some("proj")).await),
+            ["m"]
+        );
+        assert_eq!(
+            with_tools(&s.manager.routing_pool_for(Some("proj")).await),
+            ["a", "m"]
+        );
+        let third = s.manager.routing_pool_for(Some("proj")).await;
+        assert!(
+            !third
+                .iter()
+                .find(|f| f.model == "plain")
+                .unwrap()
+                .supports_tools
+        );
+        let sent = probes_sent(&s);
+        assert_eq!((count(&sent, "m"), count(&sent, "a")), (1, 1), "{sent:?}");
+        // The forced call refused, then the same probe asks again with `auto`.
+        assert!((1..=2).contains(&count(&sent, "plain")), "{sent:?}");
+        let before = s._fake.chat_requests().len();
+        for _ in 0..3 {
+            s.manager.routing_pool_for(Some("proj")).await;
+        }
+        assert_eq!(
+            s._fake.chat_requests().len(),
+            before,
+            "nothing is left to probe: {:?}",
+            probes_sent(&s)
+        );
+    }
+
+    /// A report on the routing reads the pool without spending a request.
+    #[tokio::test]
+    async fn the_known_pool_never_probes() {
+        use crate::chat::provider::cognitive::decider::ProbePolicy;
+        let s = unwarmed(
+            catalogue_script(&["m", "other"], &[]),
+            "full",
+            "auto",
+            ProbePolicy::standard(),
+        )
+        .await;
+        let pool = s.manager.routing_pool_known(Some("proj")).await;
+        assert!(with_tools(&pool).is_empty());
+        assert!(s._fake.chat_requests().is_empty());
+    }
+
     fn pool_of(models: &[(&str, &str)]) -> Option<Vec<crate::chat::types::RoutingPoolEntry>> {
         Some(
             models
