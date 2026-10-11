@@ -3129,6 +3129,8 @@ impl ChatManager {
             },
         ));
         router.set_last_message(turn.message);
+        // R-S3: a move is a change of model; its relayed turn guards the next one of its class.
+        router.seed_relayed_turn();
         self.turn_routing.insert(session_id, Arc::clone(&router));
         Some(router)
     }
