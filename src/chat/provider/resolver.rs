@@ -255,6 +255,11 @@ pub enum ResolveError {
     },
     /// The session was opened on the agent engine, which is not switched on
     /// any more (`CHAT_PROVIDER_PATH`): it cannot be resumed as it is.
+    ///
+    /// No longer built since M2: the engine is frozen at opening and a session resumes on
+    /// it whatever the flag says (`ChatManager::ready_for_resume`). Kept for its wire code
+    /// `engine_unavailable`, which a v0.0.17 server still returns; removal is tracked in
+    /// PO (plan "Claude Code devient optionnel", M2 follow-ups).
     EngineUnavailable {
         /// Provider of the session.
         provider_id: String,

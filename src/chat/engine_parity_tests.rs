@@ -2,11 +2,16 @@
 //!
 //! ONE scenario, played on the two engines a conversation can live on:
 //!
-//! - **Claude Code** on the historical engine (`ProviderPath::Legacy`, what
-//!   production runs for Claude Code): `InteractiveClient` on `fake_claude`, the
-//!   scripted stand-in for the `claude` CLI of the nexus repository, behind a
-//!   wrapper that hands every spawn its own transcript (the CLI is spawned again
-//!   by a resume and by a switch back) and records what each spawn read;
+//! - **Claude Code** on the historical engine (`ProviderPath::Legacy`):
+//!   `InteractiveClient` on `fake_claude`, the scripted stand-in for the `claude` CLI
+//!   of the nexus repository, behind a wrapper that hands every spawn its own
+//!   transcript (the CLI is spawned again by a resume and by a switch back) and
+//!   records what each spawn read;
+//! - **Claude Code on the agent engine** (`ProviderPath::Agent`, the default since
+//!   M2): the same CLI and transcript, driven through the nexus Claude Code façade.
+//!   The scenario runs a second time for it, on its own stage (only the place of the
+//!   work context restored after a compaction differs: its own turn on the historical
+//!   engine, in front of the next message on the agent engine);
 //! - the **native harness** (agent engine): a registered OpenAI-compatible
 //!   instance on `fake_openai`, the project-orchestrator MCP server played by
 //!   `fake_mcp`, and the REAL `nexus-tools` (Read, Edit, Bash...).
@@ -63,18 +68,29 @@ use crate::test_helpers::mock_app_state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
+    /// Claude Code on the historical engine (`ProviderPath::Legacy`).
     ClaudeCode,
+    /// Claude Code on the agent engine (`ProviderPath::Agent`): the nexus façade over the
+    /// same `fake_claude`, the same transcript (M2).
+    ClaudeCodeAgent,
     Native,
 }
+
+/// The columns of the table, in order.
+const ENGINES: [Engine; 3] = [Engine::ClaudeCode, Engine::ClaudeCodeAgent, Engine::Native];
 
 impl Engine {
     fn label(self) -> &'static str {
         match self {
             Engine::ClaudeCode => "Claude Code",
+            Engine::ClaudeCodeAgent => "Claude Code (moteur agent)",
             Engine::Native => "natif",
         }
     }
 }
+
+/// What one run of the scenario measured, per engine.
+type Run<'a> = [(Engine, &'a Measures)];
 
 /// Why a function is missing on an engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,14 +251,35 @@ const FUNCTIONS: &[(&str, &str)] = &[
 /// Every cell of the table that is not `ok`, declared. A gap measured and not
 /// listed here fails the test; an entry here that the scenario no longer
 /// measures fails it too (update this list and regenerate the table).
-const EXPECTED: &[(Engine, &str, Expect)] = &[(
-    Engine::ClaudeCode,
-    "nexus_tools",
-    Expect::NotMeasured {
-        why: "Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue \
-                  un transcript et n'exécute aucun outil",
-    },
-)];
+const EXPECTED: &[(Engine, &str, Expect)] = &[
+    (
+        Engine::ClaudeCode,
+        "nexus_tools",
+        Expect::NotMeasured { why: CLI_TOOLS },
+    ),
+    (
+        Engine::ClaudeCodeAgent,
+        "hooks.before_compaction",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "M2c",
+            why:
+                "la façade Claude Code de nexus consulte le hook PreCompact du graphe mais répond \
+                  `{}` au CLI (provider_notice compaction_instructions_unsupported) ; le moteur \
+                  historique répond `reason` = les instructions. Non mesuré : le vrai CLI lit-il \
+                  `reason` sur PreCompact",
+        },
+    ),
+    (
+        Engine::ClaudeCodeAgent,
+        "nexus_tools",
+        Expect::NotMeasured { why: CLI_TOOLS },
+    ),
+];
+
+/// Why `nexus_tools` is not measured on Claude Code, whatever its engine.
+const CLI_TOOLS: &str = "Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude \
+                         rejoue un transcript et n'exécute aucun outil";
 
 /// The verdicts of one engine, with what was seen (diagnostics, not in the table).
 #[derive(Default)]
@@ -291,14 +328,10 @@ fn expected(engine: Engine, function: &str) -> Option<Expect> {
 
 /// What is wrong with the measures against [`EXPECTED`]: empty when the table is
 /// true. Pure, so the two ways it turns red are tested without the fakes.
-fn audit(
-    cc: &Measures,
-    native: &Measures,
-    expected: &dyn Fn(Engine, &str) -> Option<Expect>,
-) -> Vec<String> {
+fn audit(run: &Run<'_>, expected: &dyn Fn(Engine, &str) -> Option<Expect>) -> Vec<String> {
     let mut problems = Vec::new();
     for (function, _) in FUNCTIONS {
-        for (engine, m) in [(Engine::ClaudeCode, cc), (Engine::Native, native)] {
+        for &(engine, m) in run {
             let Some((verdict, seen)) = m.get(function) else {
                 problems.push(format!(
                     "{} / {function}: not measured at all",
@@ -375,7 +408,7 @@ const UPDATE_COMMAND: &str =
 
 /// `docs/parity/engines.md`, from the verdicts and the declarations only (never
 /// from what varies between runs: ids, timings, paths).
-fn render(cc: &Measures, native: &Measures) -> String {
+fn render(run: &Run<'_>) -> String {
     let mut out = String::new();
     out.push_str("# Parité des moteurs de chat — matrice MESURÉE\n\n");
     out.push_str(&format!(
@@ -384,33 +417,40 @@ fn render(cc: &Measures, native: &Measures) -> String {
     ));
     out.push_str(
         "Un seul scénario, joué sur les deux moteurs, même assertion par fonction :\n\n\
-         - **Claude Code** : moteur historique (chemin de production de Claude Code) sur \
+         - **Claude Code** : moteur historique (`CHAT_PROVIDER_PATH=legacy`) sur \
          `fake_claude`, le faux CLI du dépôt nexus ;\n\
+         - **Claude Code (moteur agent)** : le même CLI et le même transcript, piloté par le \
+         moteur agent à travers la façade Claude Code de nexus (`CHAT_PROVIDER_PATH=agent`) ;\n\
          - **natif** : moteur agent, instance OpenAI-compatible sur `fake_openai`, outils \
          project-orchestrator sur `fake_mcp`, outils de base sur le vrai `nexus-tools`.\n\n\
          `ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent, cause `harnais` \
          (le backend ou le harnais nexus ne le fait pas) ou `modèle` (le modèle ne le peut pas), \
-         fermé par la tâche PO nommée (plan 5ad54c48). `not_measured` : les faux binaires ne \
+         fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `not_measured` : les faux binaires ne \
          permettent pas de l'exercer sur ce moteur (raison ci-dessous). Un écart non déclaré, \
          ou un écart déclaré qui disparaît, fait échouer le test.\n\n",
     );
-    out.push_str("| Fonction | Ce qui est vérifié | Claude Code | natif |\n");
-    out.push_str("|---|---|---|---|\n");
+    let labels: Vec<&str> = run.iter().map(|(engine, _)| engine.label()).collect();
+    out.push_str(&format!(
+        "| Fonction | Ce qui est vérifié | {} |\n",
+        labels.join(" | ")
+    ));
+    out.push_str(&format!("|---|---|{}\n", "---|".repeat(run.len())));
     for (function, what) in FUNCTIONS {
+        let cells: Vec<String> = run
+            .iter()
+            .map(|&(engine, m)| cell(engine, function, m))
+            .collect();
         out.push_str(&format!(
-            "| `{function}` | {what} | {} | {} |\n",
-            cell(Engine::ClaudeCode, function, cc),
-            cell(Engine::Native, function, native)
+            "| `{function}` | {what} | {} |\n",
+            cells.join(" | ")
         ));
     }
     let ok = |m: &Measures| m.rows.iter().filter(|(_, v, _)| *v == Verdict::Ok).count();
-    out.push_str(&format!(
-        "\n`ok` : Claude Code {}/{}, natif {}/{}.\n",
-        ok(cc),
-        FUNCTIONS.len(),
-        ok(native),
-        FUNCTIONS.len()
-    ));
+    let totals: Vec<String> = run
+        .iter()
+        .map(|&(engine, m)| format!("{} {}/{}", engine.label(), ok(m), FUNCTIONS.len()))
+        .collect();
+    out.push_str(&format!("\n`ok` : {}.\n", totals.join(", ")));
     out.push_str("\n## Écarts déclarés\n\n");
     out.push_str("| Moteur | Fonction | Cause | Tâche | Ce qui manque |\n|---|---|---|---|---|\n");
     for (engine, function, x) in declared_in_table_order() {
@@ -435,7 +475,7 @@ fn render(cc: &Measures, native: &Measures) -> String {
 /// [`EXPECTED`] by engine, then in the order of the table.
 fn declared_in_table_order() -> Vec<(Engine, &'static str, Expect)> {
     let mut out = Vec::new();
-    for engine in [Engine::ClaudeCode, Engine::Native] {
+    for engine in ENGINES {
         for (function, _) in FUNCTIONS {
             if let Some(x) = expected(engine, function) {
                 out.push((engine, *function, x));
@@ -445,9 +485,9 @@ fn declared_in_table_order() -> Vec<(Engine, &'static str, Expect)> {
     out
 }
 
-/// The drift gate and the audit, once the scenario ran on both engines.
-fn gate(cc: &Measures, native: &Measures) {
-    for (engine, m) in [(Engine::ClaudeCode, cc), (Engine::Native, native)] {
+/// The drift gate and the audit, once the scenario ran on every engine.
+fn gate(run: &Run<'_>) {
+    for &(engine, m) in run {
         for (function, verdict, seen) in &m.rows {
             eprintln!(
                 "parity {} / {function}: {verdict:?} — {seen}",
@@ -455,8 +495,8 @@ fn gate(cc: &Measures, native: &Measures) {
             );
         }
     }
-    let table = render(cc, native);
-    let problems = audit(cc, native, &expected);
+    let table = render(run);
+    let problems = audit(run, &expected);
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MATRIX_PATH);
     if std::env::var(UPDATE_ENV).as_deref() == Ok("1") {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -654,9 +694,14 @@ impl Stage {
     /// A backend process: a manager on the stage's graph and NATS, Claude Code on
     /// the CLI `cli`, the native instance tapped (its hooks recorded in `answers`).
     /// Called again to "restart" the backend: the graph is all that survives.
-    async fn backend(&self, cli: &FakeClaude, answers: &Arc<Answers>) -> Arc<ChatManager> {
+    async fn backend(
+        &self,
+        cli: &FakeClaude,
+        answers: &Arc<Answers>,
+        path: ProviderPath,
+    ) -> Arc<ChatManager> {
         let config = ChatConfig {
-            provider_path: ProviderPath::Legacy,
+            provider_path: path,
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: Some(fake_bin("nexus-tools")),
             nexus_browser_path: None,
@@ -684,9 +729,18 @@ impl Stage {
             .provider_for("local")
             .await
             .unwrap_or_else(|e| panic!("the native instance: {e:#}"));
-        let manager = Arc::new(manager.with_provider_source(Arc::new(Tap {
-            inner: real,
-            answers: Arc::clone(answers),
+        let claude = super::agent_runtime::BuiltinProviders::new(Some(cli.path()))
+            .get(super::provider::resolver::CLAUDE_CODE)
+            .expect("the built-in Claude Code");
+        let manager = Arc::new(manager.with_provider_source(Arc::new(Taps {
+            native: Tap {
+                inner: real,
+                answers: Arc::clone(answers),
+            },
+            claude: Tap {
+                inner: claude,
+                answers: Arc::clone(answers),
+            },
         })));
         // The native sessions run their `Agent` calls as child sessions (P18).
         manager.enable_subagents();
@@ -1180,7 +1234,7 @@ fn answer(key: &str, t: &str) -> Vec<Value> {
 }
 
 /// The first Claude Code process: the whole scenario up to the restart.
-fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
+fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
     let grep_input = json!({"pattern": "build_agent_spec", "path": "."});
     let mut t: Vec<Value> = vec![
         // The SDK registers its hooks at connect; their callback ids are minted at
@@ -1225,16 +1279,24 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
                     "compact_metadata": {"trigger": "auto", "pre_tokens": 1200}})),
         text("answered one"),
         result_ok("answered one"),
-        // After a compaction the engine re-injects the work context (a turn of its own).
-        await_in("Work Already Done"),
-        text("noted"),
-        result_ok("noted"),
+    ];
+    // After a compaction the engine re-injects the work context: the historical engine in a
+    // turn of its own; the agent engine in front of the next user message (TURN-TWO's line
+    // carries it, `post_compaction_recovery` of `TurnServices`).
+    if path == ProviderPath::Legacy {
+        t.extend(vec![
+            await_in("Work Already Done"),
+            text("noted"),
+            result_ok("noted"),
+        ]);
+    }
+    t.extend(vec![
         // TURN-TWO runs; TURN-THREE is sent meanwhile: the engine queues it and
         // interrupts the turn, then plays the queue.
         await_in(&k.k("TURN-TWO")),
         await_in("\"interrupt\""),
         result("error_during_execution", "", true),
-    ];
+    ]);
     t.extend(answer(&k.k("TURN-THREE"), "answered three"));
     // TURN-FOUR stops on the turn limit; auto-continue sends the continuation.
     t.extend(vec![
@@ -1515,9 +1577,22 @@ impl AgentProvider for Tap {
     }
 }
 
-impl ProviderSource for Tap {
+/// The providers of a backend of the scenario: the native instance (`local`) and the
+/// built-in Claude Code on the fake CLI, both tapped.
+struct Taps {
+    native: Tap,
+    claude: Tap,
+}
+
+impl ProviderSource for Taps {
     fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
-        (provider_id == "local").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        match provider_id {
+            "local" => Some(Arc::new(self.native.clone()) as Arc<dyn AgentProvider>),
+            super::provider::resolver::CLAUDE_CODE => {
+                Some(Arc::new(self.claude.clone()) as Arc<dyn AgentProvider>)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2018,15 +2093,65 @@ fn excerpt(s: &str) -> String {
 // The scenario
 // ============================================================================
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
-    // On the heap: the scenario's future outgrew the test thread's stack (block_on keeps
-    // the future it drives on the stack).
-    Box::pin(the_scenario()).await;
+/// The scenario twice: Claude Code on the historical engine, then on the agent engine
+/// (each run on its own stage, CLI and endpoint); the native column is the first run's.
+#[test]
+fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
+    // A thread of its own with a large stack: the scenario's future outgrew the test
+    // thread's (block_on keeps the future it drives on the stack), and Claude Code on the
+    // agent engine nests deeper still in a debug build.
+    std::thread::Builder::new()
+        .name("parity".into())
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(16 << 20)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (cc, na) = run_naming_the_column(ProviderPath::Legacy).await;
+                    let (cca, _) = run_naming_the_column(ProviderPath::Agent).await;
+                    gate(&[
+                        (Engine::ClaudeCode, &cc),
+                        (Engine::ClaudeCodeAgent, &cca),
+                        (Engine::Native, &na),
+                    ]);
+                })
+        })
+        .unwrap()
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-/// The body of [`the_same_scenario_on_both_engines_gives_the_parity_matrix`].
-async fn the_scenario() {
+/// One run of the scenario; a run that panics says WHICH run (the Claude Code column it
+/// measures), so a failure on CI names its engine (review of #726).
+async fn run_naming_the_column(path: ProviderPath) -> (Measures, Measures) {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(Box::pin(the_scenario(path)))
+        .catch_unwind()
+        .await
+    {
+        Ok(measures) => measures,
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let column = match path {
+                ProviderPath::Legacy => Engine::ClaudeCode.label(),
+                ProviderPath::Agent => Engine::ClaudeCodeAgent.label(),
+            };
+            panic!("parity run with Claude Code as « {column} » ({path:?}) failed: {why}");
+        }
+    }
+}
+
+/// The body of [`the_same_scenario_on_both_engines_gives_the_parity_matrix`], with Claude
+/// Code on the engine `path` names: the measures of Claude Code, then of the native harness.
+async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     let stage = Stage::new().await;
     let cwd = stage.cwd();
     let claims = crate::auth::jwt::Claims::service_account("parity");
@@ -2034,7 +2159,7 @@ async fn the_scenario() {
     let kn = Keys("NA");
 
     let cli = FakeClaude::new();
-    cli.transcript(0, &transcript_main(kc, &cwd));
+    cli.transcript(0, &transcript_main(kc, &cwd, path));
     cli.transcript(1, &transcript_resumed(kc));
     cli.transcript(2, &transcript_switched_back());
 
@@ -2050,7 +2175,7 @@ async fn the_scenario() {
     // ===================================================================
     // Claude Code, historical engine (backend process #1)
     // ===================================================================
-    let manager = stage.backend(&cli, &answers).await;
+    let manager = stage.backend(&cli, &answers, path).await;
     let mut req = request(None, Some("proj"), "default");
     req.cwd = cwd.clone();
     req.message = format!("{}: where is the spec built?", kc.k("TURN-ONE"));
@@ -2062,8 +2187,8 @@ async fn the_scenario() {
         .unwrap_or_else(|e| panic!("opening the Claude Code session: {e:#}"))
         .session_id;
     assert!(
-        !manager.agent_runtime.owns(&sid).await,
-        "Claude Code runs on the historical engine"
+        manager.agent_runtime.owns(&sid).await == (path == ProviderPath::Agent),
+        "Claude Code runs on the engine {path:?} names"
     );
     let w = Watch::start(
         stage.graph.clone(),
@@ -2628,7 +2753,7 @@ async fn the_scenario() {
     drop(w);
     drop(manager);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let manager = stage.backend(&cli, &answers).await;
+    let manager = stage.backend(&cli, &answers, path).await;
     manager
         .resume_session(&sid, &format!("{}: go on", kc.k("RESUMED")), Some(&claims))
         .await
@@ -3410,7 +3535,7 @@ async fn the_scenario() {
     drop(w);
     drop(manager);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let manager = stage.backend(&cli, &answers).await;
+    let manager = stage.backend(&cli, &answers, path).await;
     let reopened = manager
         .resume_session(&nid, &format!("{}: go on", kn.k("RESUMED")), Some(&claims))
         .await;
@@ -3480,7 +3605,7 @@ async fn the_scenario() {
              model: {unduly:?} (closed list: images without vision; an unknown context window)"
         );
     }
-    gate(&cc, &na);
+    (cc, na)
 }
 
 // ============================================================================
@@ -3501,13 +3626,20 @@ fn as_declared(engine: Engine) -> Measures {
     m
 }
 
+/// A run of the three columns, in table order.
+fn three<'a>(cc: &'a Measures, cca: &'a Measures, na: &'a Measures) -> [(Engine, &'a Measures); 3] {
+    [
+        (Engine::ClaudeCode, cc),
+        (Engine::ClaudeCodeAgent, cca),
+        (Engine::Native, na),
+    ]
+}
+
 #[test]
 fn the_declared_matrix_audits_clean() {
-    let problems = audit(
-        &as_declared(Engine::ClaudeCode),
-        &as_declared(Engine::Native),
-        &expected,
-    );
+    let measures: Vec<(Engine, Measures)> = ENGINES.iter().map(|&e| (e, as_declared(e))).collect();
+    let run: Vec<(Engine, &Measures)> = measures.iter().map(|(e, m)| (*e, m)).collect();
+    let problems = audit(&run, &expected);
     assert!(problems.is_empty(), "{problems:?}");
 }
 
@@ -3520,14 +3652,15 @@ fn an_undeclared_gap_turns_the_matrix_red() {
         .find(|(f, _, _)| *f == "nats.send")
         .unwrap()
         .1 = Verdict::Gap(Cause::Harness);
-    let problems = audit(&cc, &na, &expected);
+    let cca = as_declared(Engine::ClaudeCodeAgent);
+    let problems = audit(&three(&cc, &cca, &na), &expected);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("UNDECLARED gap"), "{problems:?}");
 }
 
 #[test]
 fn a_declared_gap_fixed_silently_turns_the_matrix_red() {
-    // A gap declared (synthetic: none is left in EXPECTED) and measured ok.
+    // A gap declared (synthetic, on a cell EXPECTED leaves ok) and measured ok.
     let declared = |engine: Engine, function: &str| {
         if engine == Engine::Native && function == "permissions.always" {
             return Some(Expect::Gap {
@@ -3540,7 +3673,8 @@ fn a_declared_gap_fixed_silently_turns_the_matrix_red() {
     };
     let cc = as_declared(Engine::ClaudeCode);
     let na = as_declared(Engine::Native);
-    let problems = audit(&cc, &na, &declared);
+    let cca = as_declared(Engine::ClaudeCodeAgent);
+    let problems = audit(&three(&cc, &cca, &na), &declared);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("no longer measured"), "{problems:?}");
 }
@@ -3554,7 +3688,8 @@ fn a_gap_of_another_cause_than_declared_turns_the_matrix_red() {
         .find(|(f, _, _)| *f == "images")
         .unwrap()
         .1 = Verdict::Gap(Cause::Model);
-    let problems = audit(&cc, &na, &expected);
+    let cca = as_declared(Engine::ClaudeCodeAgent);
+    let problems = audit(&three(&cc, &cca, &na), &expected);
     assert_eq!(problems.len(), 1, "{problems:?}");
 }
 
@@ -3572,7 +3707,10 @@ fn every_declared_cell_names_a_function_of_the_matrix_once() {
             "{function} declared twice for {engine:?}"
         );
         if let Expect::Gap { task, .. } = x {
-            assert!(task.starts_with('P'), "a PO task of plan 5ad54c48: {task}");
+            assert!(
+                task.starts_with('P') || task.starts_with('M'),
+                "a PO task of plan 5ad54c48 (P…) or e87abcc2 (M…): {task}"
+            );
         }
     }
 }

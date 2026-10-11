@@ -246,30 +246,41 @@ pub const PERMISSION_RULES_DIR_VAR: &str = "CHAT_PERMISSION_RULES_DIR";
 
 /// Engine that drives Claude Code sessions (decision A18 / task B38).
 ///
-/// Routing is HYBRID: every third-party provider is served by the agent engine
-/// whatever this says; Claude Code stays on the historical engine by default, and
-/// `Agent` puts it on the agent engine too. That engine ports hooks, message queue,
-/// auto-continue, retry, compaction and NATS (`agent_runtime::degraded_features`):
-/// what a session still lacks is in its `system_init.degraded_features`, and the
-/// server logs it for a Claude Code session (`manager::forced_engine_warning`).
+/// Routing is HYBRID only in what can be chosen: every third-party provider is served
+/// by the agent engine whatever this says, and Claude Code follows this. The default is
+/// `Agent` since M2 (plan "Claude Code devient optionnel"): the agent engine ports hooks,
+/// message queue, auto-continue, retry, compaction and NATS, measured on the same
+/// `fake_claude` transcript (`docs/parity/engines.md`, column "Claude Code (moteur
+/// agent)"). What a session still lacks is in its `system_init.degraded_features`, and
+/// the server logs it for a Claude Code session (`manager::forced_engine_warning`).
+/// `CHAT_PROVIDER_PATH=legacy` keeps Claude Code on the historical engine. The engine
+/// is frozen at opening: a session resumes on the engine it was opened on, whatever
+/// this says now (`ChatManager::ready_for_resume`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProviderPath {
     /// The historical path: `InteractiveClient` straight on the Claude CLI.
-    #[default]
     Legacy,
     /// The provider-neutral path: an `AgentSession` from the nexus registry.
+    #[default]
     Agent,
 }
 
 impl ProviderPath {
-    /// `legacy` or `agent` (case-insensitive). Anything else, or nothing, is
-    /// `legacy`: a typo must never switch the engine.
+    /// `legacy` or `agent` (case-insensitive). Nothing (or blank) is the default (`agent`).
+    /// Anything else is `legacy`, with a warning: a value was set, so the operator meant to
+    /// choose, and a typo in the opt-out (`legasy`) must not land on the newer engine
+    /// (review of #726, point 4).
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             Some("agent") => Self::Agent,
-            Some("legacy") | None => Self::Legacy,
+            Some("legacy") => Self::Legacy,
+            None | Some("") => Self::default(),
             Some(other) => {
-                tracing::warn!(value = other, "unknown CHAT_PROVIDER_PATH, using legacy");
+                tracing::warn!(
+                    value = other,
+                    "unknown CHAT_PROVIDER_PATH (agent or legacy): Claude Code stays on the \
+                     historical engine (legacy)"
+                );
                 Self::Legacy
             }
         }
@@ -470,13 +481,18 @@ impl Default for ChatConfig {
 mod tests {
     use super::*;
 
+    /// M2: the agent engine is the default; legacy stays selectable; a value set but not
+    /// understood (a typo in the opt-out) is legacy (review of #726, point 4).
     #[test]
-    fn provider_path_defaults_to_legacy_and_a_typo_never_switches() {
-        assert_eq!(ProviderPath::parse(None), ProviderPath::Legacy);
-        assert_eq!(ProviderPath::parse(Some("legacy")), ProviderPath::Legacy);
-        assert_eq!(ProviderPath::parse(Some(" AGENT ")), ProviderPath::Agent);
+    fn provider_path_defaults_to_agent_and_an_unknown_value_is_legacy() {
+        assert_eq!(ProviderPath::parse(None), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some("  ")), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some(" LEGACY ")), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::parse(Some("agent")), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some("legasy")), ProviderPath::Legacy);
         assert_eq!(ProviderPath::parse(Some("agnet")), ProviderPath::Legacy);
-        assert_eq!(ProviderPath::default().as_str(), "legacy");
+        assert_eq!(ProviderPath::default().as_str(), "agent");
+        assert_eq!(ChatConfig::default().provider_path, ProviderPath::Agent);
     }
 
     #[test]

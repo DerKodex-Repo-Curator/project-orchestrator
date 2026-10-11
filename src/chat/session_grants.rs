@@ -892,6 +892,11 @@ pub async fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -
                 rule: grant.describe(),
             });
         }
+        // A lasting rule, written or being written, never covers a command once the shell
+        // may have moved (review of #726: checked before the pending ones too).
+        if grants.cwd_bound(call) {
+            return None;
+        }
         if !grants.pending_lasting.is_empty() {
             if let Some(grant) = lasting_grant_with(call, &grants.read_only_mcp) {
                 if grants.pending_lasting.contains(&grant) {
@@ -901,9 +906,6 @@ pub async fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -
                     });
                 }
             }
-        }
-        if grants.cwd_bound(call) {
-            return None;
         }
         (grants.lasting.clone()?, grants.read_only_mcp.clone())
     };
@@ -1039,6 +1041,11 @@ pub struct SessionGrants {
     /// the requests that arrive meanwhile (the CLI may ask the identical call again
     /// before the write ends), then leave ([`Self::end_lasting`]).
     pending_lasting: Vec<SessionGrant>,
+    /// Session grants approved whose answer is being handed to the provider: they cover the
+    /// requests that arrive meanwhile — a CLI asks the identical call again as soon as it
+    /// has the first answer, before `answer_permission` returns here (measured on CI, M2) —
+    /// then are kept or dropped ([`Self::end_pending`]).
+    pending: Vec<SessionGrant>,
     /// The session's shell may have left the directory it started in: a command tool ran a
     /// line that is not one plain read-only command (a `cd`, a script, a chain...). From
     /// then on no lasting rule covers a command in this session (they are bound to the
@@ -1062,6 +1069,7 @@ impl SessionGrants {
             read_only_mcp,
             lasting: None,
             pending_lasting: Vec::new(),
+            pending: Vec::new(),
             shell_moved: false,
             on_move: None,
         }
@@ -1187,8 +1195,8 @@ impl SessionGrants {
         self.shell_moved
     }
 
-    /// A lasting grant the provider just took: covers the requests that arrive while its
-    /// rule is written.
+    /// A lasting grant being answered: covers the requests that arrive while the provider
+    /// takes the answer and its rule is written.
     pub fn begin_lasting(&mut self, grant: SessionGrant) {
         self.pending_lasting.push(grant);
     }
@@ -1196,10 +1204,32 @@ impl SessionGrants {
     /// The rule of a lasting grant is written (`kept`) or not: from now on the store
     /// covers it, or (not kept) it holds for this session only.
     pub fn end_lasting(&mut self, grant: &SessionGrant, kept: bool) {
+        self.abort_lasting(grant);
+        if !kept {
+            self.add(grant.clone());
+        }
+    }
+
+    /// A lasting grant whose answer the provider refused: it covers nothing any more.
+    pub fn abort_lasting(&mut self, grant: &SessionGrant) {
         if let Some(i) = self.pending_lasting.iter().position(|g| g == grant) {
             self.pending_lasting.remove(i);
         }
-        if !kept {
+    }
+
+    /// A session grant whose answer is being handed to the provider: it covers the requests
+    /// that arrive meanwhile.
+    pub fn begin_pending(&mut self, grant: SessionGrant) {
+        self.pending.push(grant);
+    }
+
+    /// The answer of a pending session grant was delivered (kept for the rest of the
+    /// session) or refused by the provider (dropped).
+    pub fn end_pending(&mut self, grant: &SessionGrant, delivered: bool) {
+        if let Some(i) = self.pending.iter().position(|g| g == grant) {
+            self.pending.remove(i);
+        }
+        if delivered {
             self.add(grant.clone());
         }
     }
@@ -1221,7 +1251,10 @@ impl SessionGrants {
     /// [`Self::grant_for`] applies again to the later call).
     pub fn covering(&self, call: &AskedCall) -> Option<&SessionGrant> {
         let grant = self.grant_for(call)?;
-        self.grants.iter().find(|g| **g == grant)
+        self.grants
+            .iter()
+            .chain(self.pending.iter())
+            .find(|g| **g == grant)
     }
 }
 
