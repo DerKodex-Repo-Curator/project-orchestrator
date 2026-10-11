@@ -211,6 +211,10 @@ pub(crate) fn spawn_oob_listener(
 
         info!(session_id = %session_id, "OOB listener started");
 
+        // The session's tool clock: the calls of a sub-agent outlive the turn that
+        // launched it, the ones that end between turns are timed here.
+        let tool_clock = super::tool_clock::ToolClock::for_session(&session_id);
+
         // Tool-use ids of sub-agent launches (`Agent` / `Task`). Everything a
         // sub-agent does is streamed with `parent_tool_use_id` = that id, and
         // none of it is an external event the main agent must react to.
@@ -239,6 +243,9 @@ pub(crate) fn spawn_oob_listener(
                                 tokio::time::sleep(lag).await;
                             }
                             let message = ChatManager::mask_cli_message(message);
+                            // When the message arrived: the end of a call it ends, before its
+                            // output is persisted and published (`clock_oob_message`).
+                            let arrived_at = Utc::now();
                             // A message before a `result` that a turn already read belongs
                             // to a finished turn, whatever `is_streaming` says now
                             // (`ResultCursor`): never background output.
@@ -295,6 +302,19 @@ pub(crate) fn spawn_oob_listener(
                                 should_trigger_turn(&message, &subagent_parents),
                             )
                             .await;
+                            // A call of a background sub-agent that ends between two
+                            // turns: no turn times it, this listener does (`tool_clock`).
+                            for timing in clock_oob_message(&tool_clock, &message, arrived_at) {
+                                emit_oob_timing(
+                                    &session_id,
+                                    session_uuid,
+                                    &events_tx,
+                                    &next_seq,
+                                    &deps,
+                                    timing,
+                                )
+                                .await;
+                            }
                         }
                         Some(Err(e)) => {
                             warn!(
@@ -319,6 +339,62 @@ pub(crate) fn spawn_oob_listener(
             }
         }
     });
+}
+
+/// What an out-of-band message says to the tool clock: its `tool_use` and
+/// `tool_result` blocks are observed (a sub-agent's call announced or ended between
+/// turns), and the timings of the calls they end are returned. A result whose call
+/// the clock no longer holds (a background Bash or Monitor of an ended turn) gives
+/// none. `at`: when the message arrived, the end of the calls it ends (taken before
+/// its output is persisted and published).
+fn clock_oob_message(
+    clock: &super::tool_clock::ToolClock,
+    message: &Message,
+    at: chrono::DateTime<Utc>,
+) -> Vec<ChatEvent> {
+    ChatManager::message_to_events(message)
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ChatEvent::ToolUse { .. } | ChatEvent::ToolResult { .. }
+            )
+        })
+        .filter_map(|event| clock.observe(event, at))
+        .collect()
+}
+
+/// Persists and broadcasts a `tool_timing` found by [`clock_oob_message`], after the
+/// background output of the result it times.
+async fn emit_oob_timing(
+    session_id: &str,
+    session_uuid: Option<Uuid>,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    next_seq: &Arc<AtomicI64>,
+    deps: &OobListenerDeps,
+    timing: ChatEvent,
+) {
+    if let Some(uuid) = session_uuid {
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: timing.event_type().to_string(),
+            data: serde_json::to_string(&timing).unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(e) = deps.graph.store_chat_events(uuid, vec![record]).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "OOB listener: failed to persist a tool_timing (non-fatal)"
+            );
+        }
+    }
+    let _ = events_tx.send(timing.clone());
+    if let Some(ref nats) = deps.nats {
+        nats.publish_chat_event(session_id, timing);
+    }
 }
 
 /// Handle a single OOB Message: persist, broadcast, push to queue, and
@@ -1349,6 +1425,88 @@ mod tests {
         .await
         .expect("BackgroundOutput must arrive within 500 ms");
         (event, start.elapsed())
+    }
+
+    /// A background sub-agent's call, announced during the turn that launched it,
+    /// ends between two turns: the listener times it (persisted and broadcast after
+    /// its background output), its end taken when the result arrived, not after a
+    /// slow persistence of its output.
+    #[tokio::test]
+    async fn a_sub_agent_call_that_ends_between_turns_is_timed() {
+        let (mut events_rx, graph, handle, cancel, sid) =
+            spawn_listener_with_mock_transport().await;
+        graph.stall_chat_events("background_output");
+        let clock = crate::chat::tool_clock::ToolClock::for_session(&sid.to_string());
+        let started = Utc::now();
+        clock.observe(
+            &ChatEvent::ToolUse {
+                id: "sub-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "cargo test"}),
+                parent_tool_use_id: Some("task-1".into()),
+                category: None,
+                canonical: None,
+            },
+            started,
+        );
+        clock.taken_up("sub-1", started);
+        // The turn that launched the sub-agent ends; its call is kept.
+        clock.observe(
+            &serde_json::from_value::<ChatEvent>(json!({
+                "type": "result", "session_id": "s", "duration_ms": 0,
+                "subtype": "success", "is_error": false
+            }))
+            .unwrap(),
+            started,
+        );
+
+        handle
+            .inbound_message_tx
+            .send(Message::User {
+                message: UserMessage {
+                    content: String::new(),
+                    content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                        tool_use_id: "sub-1".into(),
+                        content: Some(ContentValue::Text("ok".into())),
+                        is_error: Some(false),
+                    })]),
+                },
+                parent_tool_use_id: Some("task-1".into()),
+            })
+            .expect("inject the sub-agent's result");
+        let sent_at = Utc::now();
+        // The output's persistence is slow; the timing waits behind it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        graph.release_chat_events("background_output");
+
+        let ended_at = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match events_rx.recv().await {
+                    Ok(ChatEvent::ToolTiming { id, ended_at, .. }) => {
+                        assert_eq!(id, "sub-1");
+                        return ended_at;
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => panic!("closed"),
+                }
+            }
+        })
+        .await
+        .expect("a tool_timing between turns");
+        let sent = crate::api::ws_chat_handler::wire_seconds(sent_at);
+        assert!(
+            ended_at < sent + 0.2,
+            "the end is when the result arrived ({ended_at}), not after the persistence (sent {sent})"
+        );
+
+        let stored = graph.get_chat_events(sid, 0, 50).await.unwrap();
+        let types: Vec<&str> = stored.iter().map(|r| r.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["background_output", "tool_timing"],
+            "the timing after the output it times"
+        );
+        cancel.cancel();
     }
 
     /// E2E — Monitor scenario. Inject a Monitor `match_found` Message

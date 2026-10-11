@@ -19,7 +19,8 @@
 //!   Claude Code CLI, or the agent engine through `GraphSessionHooks::before_tool`).
 //!   On both engines it runs BEFORE the permission is asked;
 //! - the **chat events**, observed where the engine emits them (the legacy stream
-//!   loop and its interrupt cleanup, `AgentSessionHandle::emit`): `tool_use`
+//!   loop and its interrupt cleanup, the legacy out-of-band listener for the calls
+//!   a background sub-agent makes and ends between two turns, `AgentSessionHandle::emit`): `tool_use`
 //!   (announced), `permission_request` (matched to its call by `tool_use_id`) and
 //!   `ask_user_question` (the engine waits for the user), `tool_result` /
 //!   `tool_cancelled` (the call is over);
@@ -28,7 +29,11 @@
 //!   it), and taken back by [`ToolClock::undecided`] when the hand-over fails —
 //!   only the mark that answer placed ([`DecisionMark`]): a second answer to the
 //!   same request (a double click, two tabs) that the engine refuses does not
-//!   erase the first.
+//!   erase the first. The answers to one request are handed over one at a time
+//!   ([`ToolClock::answering`], held from `decided` to the end of the hand-over):
+//!   the answer the clock keeps is the one the engine got first, never an allow
+//!   on the clock while a deny that overtook it reached the engine. The backend's
+//!   own answers (a request a session grant covers) go the same way.
 //!
 //! When the call is over, the clock answers one [`ChatEvent::ToolTiming`], which
 //! the engine stores and relays right after the result, in the same order.
@@ -41,7 +46,8 @@
 //! result itself), an engine that runs no host hook (remote cwd, Codex, ACP
 //! sessions of the agent engine). `incomplete` says the clock may have missed a
 //! wait (a permission request that named no call): such a call has no
-//! `run_started_at` either, its take-up may hold the user's wait.
+//! `run_started_at` when it would come from its take-up, which may hold the user's
+//! wait; the answer to its own permission, when it had one, still counts.
 //!
 //! The turn's `result` forgets the calls left open, except the calls of a
 //! sub-agent (`parent_tool_use_id`): a background `Task` outlives the turn that
@@ -93,6 +99,30 @@ pub(crate) struct DecisionMark(u64);
 #[derive(Default)]
 pub(crate) struct ToolClock {
     state: Mutex<State>,
+    /// Request id → the lock its answers take while they are handed over
+    /// ([`ToolClock::answering`]); the entry goes with the last holder.
+    answers: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// One answer to a request being handed over ([`ToolClock::answering`]): the other
+/// answers to that request wait until it is dropped.
+pub(crate) struct Answering<'a> {
+    clock: &'a ToolClock,
+    request_id: String,
+    _turn: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        let mut answers = self.clock.answers.lock().unwrap_or_else(|e| e.into_inner());
+        // The map and this guard hold it: no other answer waits, the entry goes.
+        if answers
+            .get(&self.request_id)
+            .is_some_and(|lock| Arc::strong_count(lock) <= 2)
+        {
+            answers.remove(&self.request_id);
+        }
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Weak<ToolClock>>> {
@@ -126,6 +156,25 @@ impl ToolClock {
             .or_default()
             .started_at
             .get_or_insert(at);
+    }
+
+    /// Waits until no other answer to `request_id` is being handed over; held from
+    /// [`ToolClock::decided`] to the end of the hand-over (and [`ToolClock::undecided`]
+    /// when it fails), the answers to one request reach the engine in the order the
+    /// clock saw them. Two requests never wait for each other.
+    pub(crate) async fn answering(&self, request_id: &str) -> Answering<'_> {
+        let lock = {
+            let mut answers = self.answers.lock().unwrap_or_else(|e| e.into_inner());
+            // An entry only the map holds is held and awaited by no one: left by an
+            // answer dropped while it waited (a client that went away), it goes here.
+            answers.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(answers.entry(request_id.to_string()).or_default())
+        };
+        Answering {
+            clock: self,
+            request_id: request_id.to_string(),
+            _turn: lock.lock_owned().await,
+        }
     }
 
     /// The user answered `request_id`, at `at`; call it BEFORE the answer is handed
@@ -259,11 +308,14 @@ fn end(
     state.requests.retain(|_, call_id| call_id != id);
     let asked = call.permission_requested_at.is_some();
     let run_started_at = match (asked, call.question, call.permission_resolved) {
-        // A wait the clock may have missed: no time it can vouch for.
-        _ if call.incomplete => None,
         (_, true, _) => None,
+        // The answer to its own permission: a time the engine saw, whatever other
+        // request the clock could not place.
         (true, false, Some((resolved, true))) => Some(resolved),
         (true, false, _) => None,
+        // The take-up of a call that may have waited for a request naming no call:
+        // no time the clock can vouch for.
+        (false, false, _) if call.incomplete => None,
         (false, false, _) => call.started_at,
     };
     Some(ChatEvent::ToolTiming {
@@ -490,6 +542,74 @@ mod tests {
         assert_eq!(a["started_at"], 1.05);
         // The take-up may hold the user's wait: absent rather than estimated.
         assert!(a.get("run_started_at").is_none(), "{a}");
+    }
+
+    /// A request naming no call does not erase what the clock knows of a parallel
+    /// call: the answer to that call's own permission is when it started running.
+    #[test]
+    fn a_request_naming_no_call_keeps_the_run_start_of_an_answered_call() {
+        let clock = ToolClock::default();
+        clock.observe(&tool_use("a"), at(1_000));
+        clock.taken_up("a", at(1_050));
+        clock.observe(&asks("req-a", Some("a")), at(1_100));
+        clock.decided("req-a", true, at(2_000));
+        clock.observe(&tool_use("b"), at(2_100));
+        clock.taken_up("b", at(2_150));
+        clock.observe(&asks("r", None), at(2_200));
+        let a = fields(clock.observe(&result("a"), at(3_000)).unwrap());
+        assert_eq!(a["incomplete"], true, "{a}");
+        assert_eq!(a["run_started_at"], 2.0, "{a}");
+        let b = fields(clock.observe(&result("b"), at(3_100)).unwrap());
+        assert_eq!(b["incomplete"], true, "{b}");
+        assert!(b.get("run_started_at").is_none(), "{b}");
+    }
+
+    /// The answers to one request are handed over one at a time; another request
+    /// does not wait; the lock leaves no entry behind.
+    #[tokio::test]
+    async fn the_answers_to_one_request_are_handed_over_one_at_a_time() {
+        let clock = Arc::new(ToolClock::default());
+        let first = clock.answering("req-1").await;
+        let second = {
+            let clock = Arc::clone(&clock);
+            tokio::spawn(async move {
+                let _second = clock.answering("req-1").await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "the second answer waits for the first"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), clock.answering("req-2"))
+            .await
+            .expect("another request does not wait");
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("the second answer goes once the first is handed over")
+            .unwrap();
+        assert!(clock.answers.lock().unwrap().is_empty(), "no entry left");
+    }
+
+    /// An answer dropped while it waited (its client went away) leaves no entry behind
+    /// once another answer comes.
+    #[tokio::test]
+    async fn an_answer_dropped_while_it_waits_leaves_no_entry() {
+        let clock = Arc::new(ToolClock::default());
+        let first = clock.answering("r").await;
+        let waiting = {
+            let clock = Arc::clone(&clock);
+            tokio::spawn(async move {
+                let _second = clock.answering("r").await;
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(first);
+        waiting.abort();
+        let _ = waiting.await;
+        drop(clock.answering("x").await);
+        assert!(clock.answers.lock().unwrap().is_empty(), "no entry left");
     }
 
     #[test]
