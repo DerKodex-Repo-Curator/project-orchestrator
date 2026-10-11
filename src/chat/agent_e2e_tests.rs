@@ -2690,6 +2690,47 @@ mod provider_switch {
         panic!("the expected events were never stored for {session_id}");
     }
 
+    /// P18 / A17: a child session that moves stays a child (its `spawned_by` goes with it), so
+    /// the moved session cannot delegate and keeps its third-party lineage.
+    #[tokio::test]
+    async fn a_child_session_stays_a_child_when_it_moves() {
+        let w = world().await;
+        let parent = Uuid::new_v4();
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: Some("ca1".into()),
+            }
+            .to_json_string(),
+        );
+        let created = w.manager.create_session(&req).await.unwrap();
+        let mut rx = w.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        stored_until(&w, &created.session_id, |events| {
+            events.iter().any(|e| e.event_type == "assistant_text")
+        })
+        .await;
+        let moved = w
+            .manager
+            .switch_session_provider(&created.session_id, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&moved.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = node
+            .spawned_by
+            .as_deref()
+            .and_then(crate::chat::manager::parse_spawned_by)
+            .expect("the moved child keeps its spawned_by");
+        assert_eq!(ctx.parent_session_id, Some(parent.to_string()));
+        assert!(!w.manager.spawned_by_nothing(&moved.session_id).await);
+    }
+
     #[tokio::test]
     async fn a_conversation_moves_to_another_provider_with_its_history_relayed() {
         let w = world().await;
@@ -9954,5 +9995,271 @@ mod openclaw_delegation {
             })
             .count();
         assert_eq!(notices, 1, "the refusal is told once, at the first opening");
+    }
+}
+
+// ============================================================================
+// Sub-agents of a native session (P18): the child's ceiling, the cap of live children
+// under parallel calls, the child closed whatever the end. Scripted provider, no fakes.
+// ============================================================================
+mod native_subagents {
+    use super::parity::{caps, Tapped};
+    use super::*;
+    use nexus_claude::agent::{
+        AgentEvent, AgentProvider, AgentSession, Capabilities, ModelInfo, ProviderError,
+        ProviderHealth, ProviderKind, ResumeToken, SessionSpec, StopReason, SubagentRequest,
+    };
+    use nexus_claude::testkit::{steps, Script, ScriptedProvider, Step};
+
+    /// The scripted provider, each opening taking `open_ms`: the window between the count of
+    /// the live children and the registration of a new one that a real endpoint opens too.
+    #[derive(Clone)]
+    struct SlowOpen {
+        inner: Tapped,
+        open_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProvider for SlowOpen {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn kind(&self) -> ProviderKind {
+            self.inner.kind()
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.inner.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.inner.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            tokio::time::sleep(Duration::from_millis(self.open_ms)).await;
+            self.inner.open(spec).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.resume(spec, token).await
+        }
+    }
+
+    impl crate::chat::agent_runtime::ProviderSource for SlowOpen {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    struct Rig {
+        manager: Arc<ChatManager>,
+        graph: Arc<MockGraphStore>,
+        parent: String,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A native parent session opened in `mode`; every child plays `child_turn`.
+    async fn rig(child_turn: Vec<Step>, mode: &str) -> Rig {
+        rig_slow(child_turn, mode, 0).await
+    }
+
+    async fn rig_slow(child_turn: Vec<Step>, mode: &str, open_ms: u64) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 20,
+            ..Default::default()
+        };
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new(
+                "claude-code",
+                Script::builder()
+                    .capabilities(caps())
+                    .turn(child_turn)
+                    .build(),
+            )),
+            kind: ProviderKind::Native,
+            answers: Arc::default(),
+        };
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, config).with_provider_source(
+                Arc::new(SlowOpen {
+                    inner: provider,
+                    open_ms,
+                }),
+            ),
+        );
+        manager.enable_subagents();
+        let mut req = request(None, Some(&project.slug), mode);
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        Rig {
+            manager,
+            graph,
+            parent,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        async fn children(&self) -> Vec<crate::neo4j::models::ChatSessionNode> {
+            self.graph
+                .get_session_children(Uuid::parse_str(&self.parent).unwrap())
+                .await
+                .unwrap_or_default()
+        }
+
+        async fn none_alive(&self) -> bool {
+            for child in self.children().await {
+                if self.manager.agent_runtime.owns(&child.id.to_string()).await {
+                    return false;
+                }
+            }
+            true
+        }
+
+        async fn run(&self, call: &str) -> Result<String, String> {
+            self.manager
+                .clone()
+                .run_subagent(&self.parent, None, &SubagentRequest::new(call, "do it"))
+                .await
+        }
+    }
+
+    fn answer(text: &str) -> Vec<Step> {
+        vec![steps::text("working"), steps::done_with_text(&caps(), text)]
+    }
+
+    /// B1: a native parent opened in bypassPermissions then put in plan: its child is capped
+    /// at plan (the CURRENT mode), not at the opening one. Red before the agent engine's mode
+    /// was kept live and persisted.
+    #[tokio::test]
+    async fn a_child_is_capped_at_the_parents_current_mode() {
+        let r = rig(answer("CHILD-ANSWER"), "bypassPermissions").await;
+        r.manager
+            .set_session_permission_mode(&r.parent, "plan")
+            .await
+            .unwrap();
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].permission_mode.as_deref(), Some("plan"));
+        // Persisted too: the envelope after a restart reads the same.
+        let parent = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&r.parent).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.permission_mode.as_deref(), Some("plan"));
+        // The child is closed once it answered.
+        assert!(r.none_alive().await);
+    }
+
+    /// B2: six parallel calls on one parent: at most four children, the others refused with a
+    /// clear error; dropping the running calls (the parent's turn interrupted) closes their
+    /// children and gives the slots back.
+    #[tokio::test]
+    async fn parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child() {
+        let r = Arc::new(rig_slow(vec![Step::AwaitInterrupt], "default", 300).await);
+        let calls: Vec<_> = (0..6)
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move { r.run(&format!("c{i}")).await })
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let finished = calls.iter().filter(|h| h.is_finished()).count();
+            if r.children().await.len() >= 4 && finished >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children={}, finished={finished}",
+                r.children().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            r.children().await.len(),
+            4,
+            "the cap holds under parallel calls"
+        );
+        let mut refused = 0;
+        let mut running = Vec::new();
+        for handle in calls {
+            if handle.is_finished() {
+                let out = handle.await.unwrap();
+                assert!(
+                    out.as_ref()
+                        .is_err_and(|e| e.contains("envelope_too_many_children")),
+                    "{out:?}"
+                );
+                refused += 1;
+            } else {
+                running.push(handle);
+            }
+        }
+        assert_eq!(refused, 2);
+        assert!(!r.none_alive().await, "the four children run");
+        for handle in running {
+            handle.abort();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !r.none_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a dropped call must close its child"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_none());
+    }
+
+    /// A child that fails: an error result for the parent, the child closed.
+    #[tokio::test]
+    async fn a_failed_child_is_an_error_and_is_closed() {
+        let failed = AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            subtype: Some("error_during_execution".into()),
+            is_error: true,
+            result_text: Some("boom".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        let r = rig(vec![Step::Emit(failed)], "default").await;
+        let out = r.run("ca1").await;
+        assert!(out.as_ref().is_err_and(|e| e.contains("failed")), "{out:?}");
+        assert!(r.none_alive().await);
     }
 }

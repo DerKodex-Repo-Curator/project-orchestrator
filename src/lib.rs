@@ -1616,6 +1616,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_reasoning_engine(re.clone());
         }
         let cm = Arc::new(cm);
+        // Native sessions run their `Agent` calls as child sessions through the manager (P18).
+        cm.enable_subagents();
         // The learning side: the per-turn router, the runner's routing handle, and the
         // store the routing routes (settings, decisions, shadow report) read.
         chat::provider::cognitive::wiring::wire_learning(&cm);
@@ -1844,15 +1846,32 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
     // Boot trigger providers (Schedule + Event) for automatic plan execution
     boot.start("triggers");
-    if chat_manager.is_some() {
+    if let Some(cm) = chat_manager.as_ref() {
         use runner::TriggerProvider; // for setup() method
         let graph = orchestrator.neo4j_arc();
         let engine = Arc::new(runner::TriggerEngine::new(graph.clone()));
+        // A trigger that fires starts its plan's run, through the same runner
+        // factory as POST /api/plans/{id}/run.
+        let dispatcher = Arc::new(
+            runner::TriggerDispatcher::new(
+                graph.clone(),
+                engine,
+                Arc::new(runner::PlanRunnerFactory::new(
+                    cm.clone(),
+                    graph.clone(),
+                    orchestrator.context_builder().clone(),
+                    orchestrator.runner_config(),
+                    Some(event_bus.clone() as Arc<dyn events::EventEmitter>),
+                )),
+            )
+            // Authors the access policy no longer lets in start no run.
+            .with_access_policy(config.auth_config.clone()),
+        );
 
         // Schedule provider — evaluates cron triggers every 60s
         let schedule_provider = runner::providers::schedule::ScheduleProvider::new(
             graph.clone(),
-            engine.clone(),
+            dispatcher.clone(),
             None, // default 60s
         );
         let mut trigger_failure: Option<String> = None;
@@ -1868,7 +1887,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // Event provider — reacts to CrudEvents for plan chaining
         let event_rx = event_bus.subscribe();
         let event_provider =
-            runner::providers::event::EventProvider::new(graph.clone(), engine.clone(), event_rx);
+            runner::providers::event::EventProvider::new(graph.clone(), dispatcher, event_rx);
         if let Err(e) = event_provider.setup().await {
             tracing::warn!("EventProvider setup failed (non-fatal): {}", e);
             trigger_failure = Some(format!("event: {e}"));

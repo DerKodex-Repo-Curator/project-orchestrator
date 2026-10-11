@@ -772,6 +772,17 @@ pub struct ChatManager {
     /// One small entry per session opened since the start (its held context is
     /// empty once delivered).
     pub(crate) held_slots: std::sync::Mutex<HashMap<String, Arc<HeldSlot>>>,
+    /// The manager itself, once in its `Arc` ([`Self::enable_subagents`]): what the sub-agents
+    /// of native sessions open their child sessions through (P18, `subagents.rs`).
+    pub(crate) self_ref: std::sync::OnceLock<std::sync::Weak<ChatManager>>,
+    /// The permission mode of each live session of the agent engine, as last set
+    /// (`set_session_permission_mode`): what a child's ceiling reads (A17), the agent engine
+    /// keeping its mode in the harness where `live_session_permission_mode` cannot see it.
+    pub(crate) agent_modes: std::sync::Mutex<HashMap<String, String>>,
+    /// The sub-agents running for each parent session (P18): a slot is taken before the
+    /// envelope counts the live children and held until the sub-agent ends, so parallel `Agent`
+    /// calls cannot all count the same children and pass the cap together.
+    pub(crate) subagent_slots: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 // ============================================================================
@@ -1313,6 +1324,9 @@ pub(crate) struct ManagerTurnServices {
     step_budget: Duration,
     /// A step made to never answer (tests only, `None` in production).
     stall_step: Option<&'static str>,
+    /// Where routing decisions are stored (`CognitiveRouting::store`): a change of model a
+    /// turn could not make is written back on its decision. `None`: nowhere.
+    routing_store: Option<Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
 }
 
 /// What a session of the agent engine keeps for the end of its turns: the fields of
@@ -1706,6 +1720,23 @@ impl HeldContext {
 /// Largest share of the model's window the held context may take.
 pub(crate) const HELD_CONTEXT_WINDOW_SHARE: f64 = 0.05;
 
+/// The decision of a model change that could not be made says so: not applied, and why
+/// (`not_changed: <code>`). Nothing to write without a store.
+async fn record_not_changed(
+    store: Option<&Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
+    mut decision: super::provider::cognitive::decision::CognitiveDecision,
+    code: &str,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    decision.applied = false;
+    decision.reason = format!("{}; not_changed: {code}", decision.reason);
+    if let Err(error) = store.put_decision(&decision).await {
+        warn!(decision_id = %decision.id, %error, "the refused change was not recorded on its decision");
+    }
+}
+
 impl ManagerTurnServices {
     /// One end-of-turn step under its own budget ([`run_step`]); `stall_step` makes
     /// the named one never answer (tests only: proves the budgets are per step).
@@ -1817,9 +1848,25 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // instance), right before it is sent — what the user typed, not the
         // `<po-refs>`/`<po-attachments>` blocks around it.
         if let Some(router) = self.turn_routing.get(session_id) {
-            router.set_last_message(&crate::refs::turn::visible_text(shown));
+            router.set_turn_input(shown);
         }
         prepared
+    }
+
+    async fn model_for_images(&self, session_id: &str) -> Option<String> {
+        let router = self.turn_routing.get(session_id)?;
+        super::agent_hooks::model_for_images(&router).await
+    }
+
+    async fn image_model_not_applied(&self, session_id: &str, _model: &str) {
+        let Some(router) = self.turn_routing.get(session_id) else {
+            return;
+        };
+        // The decision said the image model was applied; it was not (as the legacy
+        // `set_model` that fails, `apply_turn_directive`).
+        if let Some(decision) = router.forget_image_change() {
+            record_not_changed(self.routing_store.as_ref(), decision, "set_model_failed").await;
+        }
     }
 
     async fn continuation(&self, session_id: &str) -> String {
@@ -2756,6 +2803,9 @@ impl ChatManager {
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
+            self_ref: Default::default(),
+            agent_modes: Default::default(),
+            subagent_slots: Default::default(),
         }
     }
 
@@ -2843,6 +2893,9 @@ impl ChatManager {
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
+            self_ref: Default::default(),
+            agent_modes: Default::default(),
+            subagent_slots: Default::default(),
         }
     }
 
@@ -3039,10 +3092,11 @@ impl ChatManager {
         let Some(router) = self.turn_routing.get(session_id) else {
             return;
         };
-        // The routing reads what the user typed, not the blocks around it.
+        // The routing reads what the user typed, not the blocks around it, and whether an
+        // image goes with it.
+        router.set_turn_input(message);
         let typed = crate::refs::turn::visible_text(message);
         let message = typed.as_str();
-        router.set_last_message(message);
         let ctx = router.next_turn_context(message.chars().count());
         let before = ctx.current_model.clone();
         let directive = super::agent_hooks::directive_for_turn(&router, &ctx).await;
@@ -3060,6 +3114,25 @@ impl ChatManager {
                 }
             }
         }
+    }
+
+    /// What the conversation can really do for its next turn, given its routing (F-R4,
+    /// decision 11cefdb2): `snapshot_images` is what the capabilities snapshot of its
+    /// opening model says (`None`: no snapshot stored). The live router answers
+    /// (`agent_hooks::effective_images`); without one (the session is not open here, or no
+    /// cognitive router is configured) the snapshot stands, said so (`no_router`). `None`:
+    /// nothing to say (no snapshot, no router).
+    pub(crate) async fn effective_capabilities(
+        &self,
+        session_id: &str,
+        snapshot_images: Option<bool>,
+    ) -> Option<super::types::EffectiveCapabilities> {
+        use super::types::{EffectiveCapabilities, EffectiveCapability, EffectiveCause};
+        let images = match self.turn_routing.get(session_id) {
+            Some(router) => super::agent_hooks::effective_images(&router, snapshot_images).await?,
+            None => EffectiveCapability::snapshot(snapshot_images?, EffectiveCause::NoRouter),
+        };
+        Some(EffectiveCapabilities { images })
     }
 
     /// Mode `full`, before a turn starts, on both engines: when the router's decision names
@@ -3084,8 +3157,9 @@ impl ChatManager {
         if streaming {
             return false;
         }
-        // The routing reads what the user typed, not the blocks around it.
-        router.set_last_message(&crate::refs::turn::visible_text(message));
+        // The routing reads what the user typed, not the blocks around it, and whether an
+        // image goes with it.
+        router.set_turn_input(message);
         let super::agent_hooks::ProviderPlan::Move { pick, decision } =
             super::agent_hooks::plan_provider_move(&router).await
         else {
@@ -3159,21 +3233,14 @@ impl ChatManager {
     /// The decision of a model change that could not be sent says so: not applied, and why.
     async fn record_refused_change(
         &self,
-        mut decision: super::provider::cognitive::decision::CognitiveDecision,
+        decision: super::provider::cognitive::decision::CognitiveDecision,
         code: &str,
     ) {
-        let Some(store) = self
+        let store = self
             .cognitive_routing
             .as_ref()
-            .and_then(|routing| routing.store.clone())
-        else {
-            return;
-        };
-        decision.applied = false;
-        decision.reason = format!("{}; not_changed: {code}", decision.reason);
-        if let Err(error) = store.put_decision(&decision).await {
-            warn!(decision_id = %decision.id, %error, "the refused change was not recorded on its decision");
-        }
+            .and_then(|routing| routing.store.clone());
+        record_not_changed(store.as_ref(), decision, code).await;
     }
 
     /// Emit the light `attention_changed` signal for a session (no-op without
@@ -4764,11 +4831,24 @@ impl ChatManager {
     /// The live permission mode of an active session (`None` when the session
     /// is not active or runs on the global default).
     pub async fn live_session_permission_mode(&self, session_id: &str) -> Option<String> {
-        self.active_sessions
+        if let Some(mode) = self
+            .active_sessions
             .read()
             .await
             .get(session_id)
             .and_then(|s| s.permission_mode.clone())
+        {
+            return Some(mode);
+        }
+        // A session of the agent engine (native, Codex, ACP): the mode last set on it.
+        if !self.agent_runtime.owns(session_id).await {
+            return None;
+        }
+        self.agent_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
     }
 
     /// The permission mode a session gets when its request names none.
@@ -4874,6 +4954,42 @@ impl ChatManager {
             }
             _ => SpawnParent::ThirdParty,
         }
+    }
+
+    /// Whether the session `session_id` is recorded and was spawned by nothing (no
+    /// `spawned_by`): a conversation a person opened. Only such a session may run sub-agents
+    /// (P18, depth 1). An unknown or unreadable record answers `false`.
+    pub(crate) async fn spawned_by_nothing(&self, session_id: &str) -> bool {
+        let Ok(sid) = Uuid::parse_str(session_id) else {
+            return false;
+        };
+        matches!(
+            self.graph.get_chat_session(sid).await,
+            Ok(Some(node)) if node.spawned_by.as_deref().is_none_or(|s| s.trim().is_empty())
+        )
+    }
+
+    /// The lineage of a session something spawned (its record has a `spawned_by`): depth 1
+    /// under its parent session, or under whatever spawned it when it names none. `None` for a
+    /// session a person opened, or an unknown record.
+    pub(crate) async fn spawned_lineage(
+        &self,
+        session_id: &str,
+    ) -> Option<nexus_claude::agent::Lineage> {
+        let sid = Uuid::parse_str(session_id).ok()?;
+        let node = self.graph.get_chat_session(sid).await.ok()??;
+        let spawned_by = node.spawned_by.filter(|s| !s.trim().is_empty())?;
+        let ctx = parse_spawned_by(&spawned_by);
+        let parent = ctx
+            .as_ref()
+            .and_then(|c| c.parent_session_id.clone())
+            .unwrap_or_default();
+        Some(nexus_claude::agent::Lineage {
+            root_session_id: parent.clone(),
+            parent_session_id: parent,
+            depth: 1,
+            spawned_by: ctx.map_or_else(|| "unknown".to_string(), |c| c.spawn_type),
+        })
     }
 
     /// Where a session comes from, for its tool profile (H6).
@@ -9168,6 +9284,21 @@ impl ChatManager {
                 session_id,
                 pair.neutral != nexus_claude::agent::PolicyMode::Trust,
             );
+            // What a child's ceiling reads (A17, P18): kept live, and persisted so a resume and
+            // the envelope after a restart see the mode the session is in, not its opening one.
+            self.agent_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.to_string(), pair.legacy.to_string());
+            if let Ok(uuid) = Uuid::parse_str(session_id) {
+                if let Err(e) = self
+                    .graph
+                    .update_chat_session_permission_mode(uuid, pair.legacy)
+                    .await
+                {
+                    warn!(session_id = %session_id, error = %e, "Failed to persist the permission mode of an agent session (non-fatal)");
+                }
+            }
             return Ok(());
         }
         // Validate mode: the Claude strings or the neutral names (A43). The CLI
@@ -9380,7 +9511,12 @@ impl ChatManager {
             add_dirs: node.add_dirs.clone(),
             workspace_slug: node.workspace_slug.clone(),
             user_claims: claims,
-            spawned_by: None,
+            // A child of a session stays one when it moves: its lineage (depth 1, P18 / A17)
+            // and its third-party parent (H6) go with it.
+            spawned_by: node
+                .spawned_by
+                .clone()
+                .filter(|s| parse_spawned_by(s).is_some_and(|ctx| ctx.parent_session_id.is_some())),
             task_context: None,
             scaffolding_override: None,
             // A switch never widens: the new session keeps the access of the old one.
@@ -13244,6 +13380,31 @@ impl ChatManager {
                 .with_turn_router(self.turn_routing.get(session_id)),
             ));
         }
+        // The `Agent` tool of the native harness (P18): its calls run as child sessions of this
+        // one (A18). Only for a local session nothing spawned (depth 1, A17), once the manager
+        // can hand itself over (`enable_subagents`).
+        if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
+            // A spawned native session: the harness's own depth guard applies (`lineage`), and
+            // it asks no question nobody would see (its user is a parent session, not a person).
+            if let Some(lineage) = self.spawned_lineage(session_id).await {
+                spec.lineage = Some(lineage);
+                spec.policy
+                    .deny
+                    .push(nexus_claude::agent::ToolPattern::tool(
+                        nexus_claude::providers::native::builtin::ASK_USER_QUESTION_TOOL,
+                    ));
+            }
+            if let Some(manager) = self.weak_self() {
+                if self.spawned_by_nothing(session_id).await {
+                    spec.hooks = Some(Arc::new(super::subagents::SubagentHooks::new(
+                        spec.hooks.take(),
+                        manager,
+                        session_id,
+                        user_claims.cloned(),
+                    )));
+                }
+            }
+        }
         // The consent of the project and the revocation of the token are checked before ANY
         // other hook, and whether or not the session has the knowledge-graph hooks.
         if let Some(search_origins) = gate {
@@ -13472,6 +13633,10 @@ impl ChatManager {
             context_injector: self.context_injector.clone(),
             step_budget: super::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: self
+                .cognitive_routing
+                .as_ref()
+                .and_then(|routing| routing.store.clone()),
         })
     }
 
@@ -14048,6 +14213,10 @@ impl ChatManager {
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
         if self.agent_runtime.owns(session_id).await {
+            self.agent_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(session_id);
             crate::auth::agent_tokens::revoke_session(session_id);
             // Every instance learns the session is gone, as on the legacy path: the
             // `session_closed` the runtime emits is published like every event.
@@ -16612,6 +16781,103 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// P18: a native session a person opened runs sub-agents (the harness then offers
+    /// `Agent`); a session something spawned — the sub-agent's own child session included —
+    /// never does (depth 1, A17); nor does a manager that cannot hand itself over.
+    #[tokio::test]
+    async fn only_a_native_session_nothing_spawned_runs_subagents() {
+        use nexus_claude::agent::ProviderKind;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(graph.clone());
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            config,
+        ));
+        let (top, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut node = crate::test_helpers::test_chat_session(Some("proj"));
+        node.id = top;
+        graph.create_chat_session(&node).await.unwrap();
+        node.id = child;
+        node.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: top,
+                tool_use_id: Some("ca1".into()),
+            }
+            .to_json_string(),
+        );
+        graph.create_chat_session(&node).await.unwrap();
+        let claims = crate::auth::jwt::Claims::service_account("p18");
+        let runs = |sid: String, kind: ProviderKind| {
+            let manager = manager.clone();
+            let claims = claims.clone();
+            async move {
+                let spec = manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/work/app",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(&claims),
+                        session_id: &sid,
+                        third_party: true,
+                        max_tokens: None,
+                        kind,
+                        remote_cwd: None,
+                        per_session_mcp: true,
+                        hooks: Some(AgentHookScope {
+                            project_slug: Some("proj".into()),
+                            task_id: None,
+                            runner: false,
+                        }),
+                    })
+                    .await
+                    .unwrap();
+                crate::auth::agent_tokens::revoke_session(&sid);
+                let asks = !spec
+                    .policy
+                    .deny
+                    .iter()
+                    .any(|p| p.matches("AskUserQuestion", None));
+                (
+                    spec.hooks.is_some_and(|h| h.runs_subagents()),
+                    spec.lineage.map(|l| l.depth),
+                    asks,
+                )
+            }
+        };
+        assert!(
+            !runs(top.to_string(), ProviderKind::Native).await.0,
+            "without enable_subagents the manager cannot open a child"
+        );
+        manager.enable_subagents();
+        // A session a person opened: the host, no lineage, the question.
+        assert_eq!(
+            runs(top.to_string(), ProviderKind::Native).await,
+            (true, None, true)
+        );
+        // A spawned session: no host, the harness's depth guard armed (lineage depth 1), no
+        // question nobody would see.
+        assert_eq!(
+            runs(child.to_string(), ProviderKind::Native).await,
+            (false, Some(1), false),
+            "a spawned session cannot delegate again nor ask"
+        );
+        assert!(
+            !runs(Uuid::new_v4().to_string(), ProviderKind::Native)
+                .await
+                .0,
+            "an unknown record is not trusted"
+        );
+        assert!(
+            !runs(top.to_string(), ProviderKind::ClaudeCode).await.0,
+            "Claude Code brings its own Task"
+        );
     }
 
     #[tokio::test]
@@ -27091,6 +27357,7 @@ mod refs_turn_services_tests {
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: None,
         };
 
         let note = Uuid::new_v4();
@@ -27182,6 +27449,7 @@ mod held_context_tests {
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: None,
         }
     }
 
@@ -27617,5 +27885,167 @@ mod held_context_tests {
             "the objective step still ran after the stuck one"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+/// F-R4: the host's own order — `prepare` hands the router the turn's input (its images
+/// included), so `model_for_images`, asked right after, routes an image turn to a model that
+/// reads it. Played with the REAL services and the real decision.
+#[cfg(test)]
+mod image_turn_services_tests {
+    use super::*;
+    use crate::chat::agent_hooks::{PoolSource, TurnRouter, TurnRouterSpec, TurnRouting};
+    use crate::chat::agent_runtime::TurnServices;
+    use crate::chat::message_attachments::{self, MessageAttachment};
+    use crate::chat::provider::cognitive::candidates::ModelFacts;
+    use crate::chat::provider::cognitive::decider::decide_with;
+    use crate::chat::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider};
+    use crate::chat::provider::cognitive::scorer::PriorHints;
+    use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+
+    struct Real;
+
+    #[async_trait::async_trait]
+    impl Decider for Real {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            Ok(decide_with(
+                Uuid::new_v4(),
+                chrono::Utc::now(),
+                request,
+                &[],
+                &PriorHints::new(),
+            ))
+        }
+    }
+
+    struct Pool;
+
+    #[async_trait::async_trait]
+    impl PoolSource for Pool {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            self.project_pool(None)
+                .await
+                .into_iter()
+                .filter(|f| f.provider_id == provider_id)
+                .collect()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            ["flash", "vision"]
+                .into_iter()
+                .map(|model| ModelFacts {
+                    provider_id: "deepseek".into(),
+                    model: model.into(),
+                    supports_tools: true,
+                    supports_images: model == "vision",
+                    context_window: Some(1_000_000),
+                    window_unknown: None,
+                    price: None,
+                    cost_basis: nexus_claude::agent::CostBasis::Unknown,
+                    healthy: Some(true),
+                    allowed_for_project: true,
+                    sandboxed: false,
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_hands_the_router_the_images_so_the_turn_is_routed_before_it_is_sent() {
+        use crate::chat::provider::cognitive::store::{
+            DecisionFilter, InMemoryRoutingStore, RoutingArmStore,
+        };
+        let store = Arc::new(InMemoryRoutingStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            ChatConfig {
+                max_sessions: 10,
+                ..Default::default()
+            },
+        );
+        let session = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id.to_string();
+        let router = Arc::new(TurnRouter::new(TurnRouterSpec {
+            decider: Arc::new(Real),
+            pool: Arc::new(Pool),
+            routing: RoutingSettings {
+                mode: ProviderRoutingMode::Full,
+                stage: LearningStage::Auto,
+                exploration_epsilon: 0.0,
+                ..RoutingSettings::default()
+            },
+            provider_id: "deepseek".into(),
+            session_id: Some(session.id),
+            project_slug: None,
+            trust: false,
+            explicit_model: false,
+            provider_imposed: false,
+            allowed_models: None,
+            routing_pool: None,
+            conversation_routes: false,
+            current_model: "flash".into(),
+            next_turn: 0,
+            moved_in: false,
+        }));
+        router.set_model_live(true);
+        let routing = Arc::new(TurnRouting::default());
+        routing.insert(&sid, Arc::clone(&router));
+        let services = ManagerTurnServices {
+            graph: graph.clone(),
+            enrichment_pipeline: manager.enrichment_pipeline.clone(),
+            turn_routing: routing,
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
+            nats: None,
+            anchor: Default::default(),
+            session: AgentTurnState::default(),
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
+            routing_store: Some(store.clone()),
+        };
+        // Before any turn input, nothing says an image comes.
+        assert_eq!(services.model_for_images(&sid).await, None);
+        let stored = message_attachments::encode(
+            "what is on this screenshot?",
+            &[MessageAttachment {
+                id: Uuid::new_v4(),
+                filename: "shot.png".into(),
+                mime_type: "image/png".into(),
+                size_bytes: 4,
+            }],
+        );
+        let turn = crate::refs::turn::expand_user_turn_if(&graph, &stored, false).await;
+        services.prepare(&sid, &stored, &stored, &turn).await;
+        assert_eq!(
+            services.model_for_images(&sid).await.as_deref(),
+            Some("vision")
+        );
+        // The host could not apply it: the router is put back as it was.
+        services.image_model_not_applied(&sid, "vision").await;
+        assert_eq!(router.next_turn_context(0).current_model, "flash");
+        // ...and the decision, which said `applied: true`, is stored as what happened: not
+        // applied, and why (as a legacy `set_model` that fails, or a refused move).
+        let stored = store.decisions(&DecisionFilter::default()).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the image decision is written back: {stored:#?}"
+        );
+        assert!(!stored[0].applied, "{:#?}", stored[0]);
+        assert_eq!(
+            stored[0].chosen.as_ref().map(|p| p.model.as_str()),
+            Some("vision")
+        );
+        assert!(
+            stored[0]
+                .reason
+                .ends_with("; not_changed: set_model_failed"),
+            "{}",
+            stored[0].reason
+        );
     }
 }
