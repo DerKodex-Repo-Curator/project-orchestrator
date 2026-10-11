@@ -8775,6 +8775,401 @@ mod permission_scopes {
         manager.close_session(&sid).await.unwrap();
     }
 
+    /// One CLI process of a legacy session: asks `asks` for `Bash cat README.md` (and
+    /// waits for its answer), then, when `then_runs` is given, runs that command (a
+    /// `tool_use` of `Bash`), and ends its turn.
+    fn legacy_resume_transcript(asks: &str, then_runs: Option<&str>) -> Vec<Value> {
+        let mut t = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            emit(
+                json!({"type": "control_request", "request_id": asks, "request": {
+                "subtype": "can_use_tool", "tool_name": "Bash",
+                "input": {"command": "cat README.md"}, "tool_use_id": asks}}),
+            ),
+            json!({"op": "await_stdin", "contains": asks, "timeout_ms": 15000}),
+        ];
+        if let Some(command) = then_runs {
+            t.push(emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_run", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "toolu_run", "name": "Bash",
+                    "input": {"command": command}}]}})));
+        }
+        t.extend(vec![
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_end", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "turn done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "turn done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]);
+        t
+    }
+
+    /// A legacy session of alice on `proj` whose first CLI process approves
+    /// `cat README.md` for good then runs `first_command`; the session is closed and
+    /// resumed (`claude --resume`, a new process, whose answers are read from
+    /// `<dir>/resumed/stdin.jsonl`), and its CLI asks `cat README.md` again (`req-r1`).
+    /// Returns the manager, the session, the project directory and the rules directory.
+    async fn legacy_resumed_after(
+        first_command: &str,
+    ) -> (
+        ChatManager,
+        Arc<MockGraphStore>,
+        String,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("resumed")).unwrap();
+        let write = |name: &str, lines: Vec<Value>| {
+            let path = dir.path().join(name);
+            let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let first = write(
+            "first.jsonl",
+            legacy_resume_transcript("req-f1", Some(first_command)),
+        );
+        let second = write("second.jsonl", legacy_resume_transcript("req-r1", None));
+        let cli = {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\ncase \" $* \" in\n  *\" --resume \"*) T='{second}'; S='{resumed}';;\n  \
+                     *) T='{first}'; S='{stdin}';;\nesac\n\
+                     FAKE_CLAUDE_TRANSCRIPT=\"$T\" FAKE_CLAUDE_STDIN_OUT=\"$S\" \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{bin}' \"$@\"\n",
+                    second = second.display(),
+                    first = first.display(),
+                    resumed = dir.path().join("resumed").join("stdin.jsonl").display(),
+                    stdin = dir.path().join("stdin.jsonl").display(),
+                    bin = fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wrapper.display().to_string()
+        };
+        let rules = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        project_at(&graph, dir.path()).await;
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                lasting_rules_dir: Some(rules.path().join("rules")),
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, Some("proj"), "default");
+        req.message = "first turn".into();
+        req.cwd = dir.path().display().to_string();
+        req.user_claims = Some(person("alice"));
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        waits(&manager, &sid, "req-f1").await;
+        manager
+            .route_permission_response(&sid, "req-f1", true, PermissionAnswerScope::Always, true)
+            .await
+            .unwrap();
+        assert_eq!(answer_read(dir.path(), "req-f1").await["behavior"], "allow");
+        // The first turn ends (its `tool_use` was seen), then the CLI process goes.
+        decisions(&graph, &sid, 1).await;
+        let id = Uuid::parse_str(&sid).unwrap();
+        for _ in 0..400 {
+            let events = graph.get_chat_events(id, 0, 500).await.unwrap();
+            if events.iter().any(|e| e.event_type == "result") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        manager.close_session(&sid).await.unwrap();
+
+        manager
+            .resume_session(&sid, "second turn", Some(&person("alice")))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        (manager, graph, sid, dir, rules)
+    }
+
+    /// Step 55f02275 (P11b follow-up, nit D of the follow-up review of #714): a resumed
+    /// legacy session starts a new CLI (`--resume`), and whether that CLI restores the Bash
+    /// tool's last `cd` is not proven. After a `cd`, the session's shell is taken as moved
+    /// across the resume: the lasting `cat README.md` rule no longer answers, the request
+    /// waits for the person.
+    #[tokio::test]
+    async fn a_session_resumed_after_a_cd_is_asked_again_for_a_command_approved_for_good() {
+        let (manager, graph, sid, dir, _rules) = legacy_resumed_after("cd sub").await;
+        let id = Uuid::parse_str(&sid).unwrap();
+        assert_eq!(
+            graph.get_chat_session_shell_moved(id).await.unwrap(),
+            Some(true),
+            "the move is kept with the session"
+        );
+        waits(&manager, &sid, "req-r1").await;
+        let resumed = dir.path().join("resumed");
+        let answered = std::fs::read_to_string(resumed.join("stdin.jsonl")).unwrap_or_default();
+        assert!(
+            !answered.contains("\"control_response\""),
+            "nothing answered for the person: {answered}"
+        );
+        manager
+            .route_permission_response(&sid, "req-r1", true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert_eq!(answer_read(&resumed, "req-r1").await["behavior"], "allow");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The other side: a session whose shell never moved keeps its lasting rules across a
+    /// resume (the flag is written `false` at creation; only a session recorded before the
+    /// flag existed is taken as moved).
+    #[tokio::test]
+    async fn a_session_resumed_without_a_move_keeps_its_lasting_rules() {
+        let (manager, graph, sid, dir, _rules) = legacy_resumed_after("ls").await;
+        let id = Uuid::parse_str(&sid).unwrap();
+        assert_eq!(
+            graph.get_chat_session_shell_moved(id).await.unwrap(),
+            Some(false)
+        );
+        let answer = answer_read(&dir.path().join("resumed"), "req-r1").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        let seen: Vec<String> = decisions(&graph, &sid, 2)
+            .await
+            .iter()
+            .map(|(scope, _)| scope.to_string())
+            .collect();
+        assert_eq!(seen, vec!["\"always\"", "\"always\""]);
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Review of #716, S1: the stored `shell_moved: false` is only an optimisation. A
+    /// resume replays the session's stored tool calls, so a move whose flag write was lost
+    /// (a failed write, a crash, a resume overtaking it) still counts; an event that
+    /// cannot be read back counts as a move; an absent flag (a session recorded before it
+    /// existed) too.
+    #[tokio::test]
+    async fn a_resume_finds_a_move_in_the_events_whatever_the_stored_flag_says() {
+        use crate::chat::session_grants::Asker;
+        use crate::neo4j::models::{ChatEventRecord, ChatSessionNode};
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            ChatManager::new_without_memory(
+                dyn_graph,
+                mock_app_state().meili,
+                super::super::config::ChatConfig::default(),
+            )
+        };
+        let session = |id: Uuid| ChatSessionNode {
+            id,
+            cli_session_id: None,
+            project_slug: None,
+            workspace_slug: None,
+            cwd: "/tmp".into(),
+            title: None,
+            model: "m".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            message_count: 0,
+            total_cost_usd: None,
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: None,
+            spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            routing_mode: None,
+            routing_pool: None,
+            capabilities: None,
+            resume_token: None,
+            execution_place: Default::default(),
+            access: Default::default(),
+            owner: None,
+        };
+        let record = |id: Uuid, seq: i64, event_type: &str, data: String| ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: id,
+            seq,
+            event_type: event_type.into(),
+            data,
+            created_at: Utc::now(),
+        };
+        let bash = |command: &str| {
+            serde_json::to_string(&ChatEvent::ToolUse {
+                id: "t".into(),
+                tool: "Bash".into(),
+                input: json!({ "command": command }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .unwrap()
+        };
+        let resumed = |id: Uuid| {
+            let manager = &manager;
+            async move {
+                manager
+                    .session_grants_for(&id.to_string(), None, None, true, Asker::ClaudeCode)
+                    .await
+                    .shell_moved()
+            }
+        };
+        let fresh = |id: Uuid| {
+            let manager = &manager;
+            async move {
+                manager
+                    .session_grants_for(&id.to_string(), None, None, false, Asker::ClaudeCode)
+                    .await
+                    .shell_moved()
+            }
+        };
+
+        // Stored `false`, only plain read-only commands: not moved.
+        let quiet = Uuid::new_v4();
+        graph.create_chat_session(&session(quiet)).await.unwrap();
+        let mut events: Vec<_> = (1..=600)
+            .map(|seq| record(quiet, seq, "assistant_text", "{}".into()))
+            .collect();
+        events.push(record(quiet, 601, "tool_use", bash("ls")));
+        graph.store_chat_events(quiet, events).await.unwrap();
+        assert!(!resumed(quiet).await);
+
+        // Stored `false` (the write of `true` was lost), a `cd` past the first page: moved.
+        let lost = Uuid::new_v4();
+        graph.create_chat_session(&session(lost)).await.unwrap();
+        let mut events: Vec<_> = (1..=600)
+            .map(|seq| record(lost, seq, "assistant_text", "{}".into()))
+            .collect();
+        events.push(record(lost, 601, "tool_use", bash("cd sub")));
+        graph.store_chat_events(lost, events).await.unwrap();
+        assert_eq!(
+            graph.get_chat_session_shell_moved(lost).await.unwrap(),
+            Some(false)
+        );
+        assert!(resumed(lost).await, "the move is in the events");
+        assert!(!fresh(lost).await, "an opening starts at home");
+
+        // A stored tool call that cannot be read back: moved.
+        let garbled = Uuid::new_v4();
+        graph.create_chat_session(&session(garbled)).await.unwrap();
+        graph
+            .store_chat_events(garbled, vec![record(garbled, 1, "tool_use", "{".into())])
+            .await
+            .unwrap();
+        assert!(resumed(garbled).await);
+
+        // No flag at all (recorded before it existed): moved, once.
+        let old = Uuid::new_v4();
+        graph.chat_sessions.write().await.insert(old, session(old));
+        assert!(resumed(old).await);
+    }
+
+    /// Review of #716, S2: the agent engine too. A native session of alice runs `cd sub`
+    /// (asked, approved once); it is closed and resumed; `cat README.md`, approved for good
+    /// in the project, is asked again in the resumed session instead of being answered by
+    /// the rule. Red when the resume of the agent engine builds its grants as an opening.
+    #[tokio::test]
+    async fn a_native_session_resumed_after_a_cd_is_asked_again_for_a_command_approved_for_good() {
+        let bash = |key: &str, id: &str, command: &str| {
+            calls(key, id, "mcp__nexus__Bash", json!({ "command": command }))
+        };
+        let mut routes = vec![
+            bash("RESUMED-AFTER", "r2", "cat README.md"),
+            says("RESUMED-AFTER", "done after"),
+            bash("BEFORE-RESUME", "r1", "cd sub"),
+            says("BEFORE-RESUME", "done before"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("README.md"), "readme").unwrap();
+        std::fs::create_dir(cwd.path().join("sub")).unwrap();
+        project_at(&graph, cwd.path()).await;
+        let rules = tempfile::tempdir().unwrap();
+        let manager = {
+            let mut m = native_manager(graph.clone()).await;
+            m.config.lasting_rules_dir = Some(rules.path().join("rules"));
+            m
+        };
+        // `cat README.md` approved for good by alice in this project.
+        let place = manager
+            .lasting_scope(
+                Some("alice"),
+                Some("proj"),
+                &cwd.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input: json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        place.keep(&call, &grant, "seed").unwrap();
+
+        let sid = open_as(&manager, cwd.path(), "alice").await;
+        manager.send_message(&sid, "BEFORE-RESUME").await.unwrap();
+        let cd = asked(&graph, &sid, "cd sub", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the cd");
+        manager
+            .route_permission_response(&sid, &cd, true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "BEFORE-RESUME").await, "the cd ran");
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(handle.shell_moved());
+        manager.close_session(&sid).await.unwrap();
+
+        manager
+            .resume_session(&sid, "RESUMED-AFTER", Some(&person("alice")))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(handle.shell_moved(), "the resumed session starts moved");
+        let again = asked(&graph, &sid, "cat README.md", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the command");
+        let seen = decisions(&graph, &sid, 2).await;
+        assert!(
+            seen.iter().all(|(scope, _)| scope != &json!("always")),
+            "no lasting rule answered in the resumed session: {seen:?}"
+        );
+        manager
+            .route_permission_response(&sid, &again, true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "RESUMED-AFTER").await);
+        manager.close_session(&sid).await.unwrap();
+    }
+
     // ---------------------------------------------------------------- native
 
     fn calls(key: &str, id: &str, tool: &str, arguments: Value) -> Value {
