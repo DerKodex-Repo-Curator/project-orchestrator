@@ -12130,6 +12130,8 @@ mod native_subagents {
         manager: Arc<ChatManager>,
         graph: Arc<MockGraphStore>,
         parent: String,
+        /// The CRUD bus the manager emits on (session lists).
+        bus: Arc<crate::events::EventBus>,
         _dir: tempfile::TempDir,
         _rules: tempfile::TempDir,
     }
@@ -12203,15 +12205,16 @@ mod native_subagents {
             kind: ProviderKind::Native,
             answers: Arc::default(),
         };
+        let bus = Arc::new(crate::events::EventBus::new(1024));
         let manager = Arc::new(
-            ChatManager::new_without_memory(dyn_graph, state.meili, config).with_provider_source(
-                Arc::new(SlowOpen {
+            ChatManager::new_without_memory(dyn_graph, state.meili, config)
+                .with_provider_source(Arc::new(SlowOpen {
                     inner: provider,
                     open_ms,
                     turn_ms,
                     answer_ms,
-                }),
-            ),
+                }))
+                .with_event_emitter(bus.clone()),
         );
         manager.enable_subagents();
         let mut req = request(None, Some(&project.slug), mode);
@@ -12223,6 +12226,7 @@ mod native_subagents {
             manager,
             graph,
             parent,
+            bus,
             _dir: dir,
             _rules: rules,
         }
@@ -12287,6 +12291,45 @@ mod native_subagents {
 
     fn answer(text: &str) -> Vec<Step> {
         vec![steps::text("working"), steps::done_with_text(&caps(), text)]
+    }
+
+    /// Lot review of #721, finding 1 (decision ed628dad): a child opened by the `Agent` tool
+    /// emits exactly ONE CRUD `created`, whose payload names its parent — the client then
+    /// refetches its `/children`, where the record's `tool_use_id` joins it to the call. Red
+    /// before: none at all (the agent engine's opening returned before the only emission,
+    /// and `run_subagent` is no HTTP handler), so the card never appeared live.
+    #[tokio::test]
+    async fn an_agent_child_emits_one_created_event_carrying_its_spawned_by() {
+        let r = rig(answer("CHILD-ANSWER"), "bypassPermissions").await;
+        let mut crud = r.bus.subscribe();
+        assert_eq!(r.run("toolu_live").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        let child = children[0].id.to_string();
+        let mut created = Vec::new();
+        while let Ok(event) = crud.try_recv() {
+            if event.entity_type == crate::events::EntityType::ChatSession
+                && event.action == crate::events::CrudAction::Created
+            {
+                created.push(event);
+            }
+        }
+        assert_eq!(created.len(), 1, "exactly one, for the child: {created:?}");
+        assert_eq!(created[0].entity_id, child);
+        // Exactly the project and the parent (review nexus-41 of #727, finding 1): the
+        // `tool_use_id` join is read from the filtered `/children`, which holds the record.
+        let project_slug = created[0].payload["project_slug"].clone();
+        assert_eq!(
+            created[0].payload,
+            serde_json::json!({
+                "project_slug": project_slug,
+                "spawned_by": { "type": "conversation", "parent_session_id": r.parent.as_str() },
+            })
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(children[0].spawned_by.as_deref().unwrap()).unwrap();
+        assert_eq!(stored["tool_use_id"], "toolu_live");
+        assert!(r.none_alive().await);
     }
 
     /// B1: a native parent opened in bypassPermissions then put in plan: its child is capped

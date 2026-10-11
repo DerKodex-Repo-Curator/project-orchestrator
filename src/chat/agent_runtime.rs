@@ -522,6 +522,33 @@ pub trait ProviderSource: Send + Sync {
     fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>>;
 }
 
+/// How many answered request ids a session keeps ([`AgentSessionHandle::answers_itself`]).
+const ANSWERED_KEPT: usize = 1024;
+
+/// A bounded set of request ids, the oldest forgotten first.
+#[derive(Default)]
+struct AnsweredIds {
+    ids: std::collections::HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl AnsweredIds {
+    fn insert(&mut self, id: &str) {
+        if self.ids.insert(id.to_owned()) {
+            self.order.push_back(id.to_owned());
+            while self.order.len() > ANSWERED_KEPT {
+                if let Some(old) = self.order.pop_front() {
+                    self.ids.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+}
+
 /// One live session of the agent path.
 pub struct AgentSessionHandle {
     /// Identifier of the session (the Neo4j `ChatSession` id).
@@ -590,6 +617,13 @@ pub struct AgentSessionHandle {
     /// parent: P18b, review of #724). A request whose automatic answer failed leaves the
     /// set (the user is asked).
     self_answered: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The permission requests THIS handle saw asked and whose answer the provider took
+    /// (the user's, or the automatic one), marked the moment the provider took it —
+    /// before a lasting rule is written or the decision is stored. What
+    /// [`Self::answers_itself`] calls answered: an id this handle never saw (one asked
+    /// before a resume under the same id) is not (review of #727, finding 3). Bounded
+    /// (`ANSWERED_KEPT`, oldest forgotten first).
+    answered: std::sync::Mutex<AnsweredIds>,
     /// Who asks this session's permission requests (its provider kind): whether a
     /// request carries the whole call (`session_grants::Asker`).
     asker: super::session_grants::Asker,
@@ -649,7 +683,16 @@ impl AgentSessionHandle {
         drop(answering);
         match answered {
             Ok(()) => {
+                self.mark_answered(&covered);
+                // Answered: it waits no more, and the set of the requests the backend
+                // answers itself forgets it — it used to keep every one for the session's
+                // whole life (lot review of #721, finding 2c). `answers_itself` still says
+                // `true` for it: a request no longer waiting needs nobody.
                 self.asked_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&covered);
+                self.self_answered
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&covered);
@@ -1455,14 +1498,49 @@ impl AgentSessionHandle {
             .collect()
     }
 
-    /// Whether the backend answers the permission request `request_id` itself (a grant
-    /// or a lasting rule covers it): known as soon as the request is broadcast, before
-    /// its automatic answer went out. `false` once that answer failed.
+    /// Whether nobody needs to answer the permission request `request_id`: the backend
+    /// answers it itself (a grant or a lasting rule covers it — known as soon as the
+    /// request is broadcast, before its automatic answer went out), or this handle saw it
+    /// asked and its answer was taken (the decision may not be stored yet). `false` for a
+    /// request this session still waits on that no grant answers (one whose automatic
+    /// answer failed included) AND for an id this handle never saw asked — one of a
+    /// session resumed under the same id (review of #727, finding 3): nobody here will
+    /// answer it.
+    ///
+    /// The "answered" half keeps a parent reading the request before the decision that
+    /// follows it seeing it answered, never asked (lot review of #721).
     pub fn answers_itself(&self, request_id: &str) -> bool {
         self.self_answered
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(request_id)
+            || self.was_answered(request_id)
+    }
+
+    /// Whether this handle saw `request_id` asked and the provider took its answer.
+    pub fn was_answered(&self, request_id: &str) -> bool {
+        self.answered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(request_id)
+    }
+
+    /// Marks `request_id` answered (the provider took an answer to it).
+    pub(crate) fn mark_answered(&self, request_id: &str) {
+        self.answered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(request_id);
+    }
+
+    /// How many requests this session holds as answered by itself: zero once their
+    /// automatic answers went through.
+    #[cfg(test)]
+    pub(crate) fn self_answered_len(&self) -> usize {
+        self.self_answered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// Answers a permission request for this call only.
@@ -1603,6 +1681,10 @@ impl AgentSessionHandle {
         if let Err(e) = self.session.answer_permission(request_id, decision).await {
             self.tool_clock.undecided(request_id, mark);
             return Err(PermissionDeliveryError::Failed(anyhow::Error::new(e)));
+        }
+        // Taken: answered from now on, though its decision is stored only below.
+        if asked.is_some() {
+            self.mark_answered(request_id);
         }
         drop(answering);
         // Kept only now that the provider took the answer.
@@ -1918,6 +2000,16 @@ impl AgentRuntime {
         self.sessions.read().await.get(session_id).cloned()
     }
 
+    /// [`Self::get`] without waiting, for a caller that cannot `await` (a synchronous
+    /// predicate): `None` while the map is being written at this very instant, else the
+    /// live session (or its absence).
+    pub fn try_get(&self, session_id: &str) -> Option<Option<Arc<AgentSessionHandle>>> {
+        self.sessions
+            .try_read()
+            .ok()
+            .map(|sessions| sessions.get(session_id).cloned())
+    }
+
     /// Whether this runtime owns a live session of that id.
     pub async fn owns(&self, session_id: &str) -> bool {
         self.sessions.read().await.contains_key(session_id)
@@ -2049,6 +2141,7 @@ impl AgentRuntime {
             session_grants: std::sync::Mutex::new(grants),
             asked_calls: std::sync::Mutex::new(HashMap::new()),
             self_answered: std::sync::Mutex::new(std::collections::HashSet::new()),
+            answered: std::sync::Mutex::new(AnsweredIds::default()),
             asker: super::session_grants::Asker::from_provider_kind(provider_kind),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
@@ -2995,6 +3088,133 @@ mod adopt_tests {
                 "write-2".into()
             ]
         );
+    }
+
+    /// Lot review of #721 (finding 2c): a request a session grant covers is answered by the
+    /// backend, and then forgotten — the set of the requests it answers itself used to keep
+    /// every one for the session's whole life. Each stays "needs nobody" for a parent that
+    /// reads it late; a request still waiting for the user does not. Red before: 20 covered
+    /// requests left 20 ids in the set.
+    #[tokio::test]
+    async fn a_request_answered_by_a_grant_does_not_stay_in_the_self_answered_set() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let native = runtime
+            .adopt(
+                "native-forgets",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        native.emit(write("write-0")).await;
+        assert!(!native.answers_itself("write-0"), "waits for the user");
+        native
+            .answer_permission_scoped("write-0", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        for i in 1..=20 {
+            native.emit(write(&format!("write-{i}"))).await;
+        }
+        assert_eq!(provider.state.permission_answers.lock().unwrap().len(), 21);
+        assert_eq!(native.self_answered_len(), 0, "answered, so forgotten");
+        assert!(native.waiting_permission_ids().is_empty());
+        assert!(
+            native.answers_itself("write-20"),
+            "answered: nobody needs to answer it"
+        );
+        // A call no grant covers still waits for the user: not answered by the backend.
+        native
+            .emit(ChatEvent::PermissionRequest {
+                id: "bash-1".into(),
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": "rm -rf build" }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: Some("Bash".into()),
+                tool_use_id: None,
+                always: None,
+            })
+            .await;
+        assert!(!native.answers_itself("bash-1"));
+    }
+
+    /// Review of #727 (second review, finding 3): "answered" is what THIS handle saw asked
+    /// and had answered — never an id it did not see. After a resume under the same id,
+    /// a request of the earlier session is unknown to the new handle: nobody here will
+    /// answer it, so it is not answered (a parent fails fast on it). Red before: any id
+    /// absent from the waiting requests counted as answered.
+    #[tokio::test]
+    async fn an_id_the_handle_never_saw_is_not_answered() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let adopt = || {
+            runtime.adopt(
+                "resumed",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+        };
+        let bash = |id: &str| ChatEvent::PermissionRequest {
+            id: id.into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "make" }),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: Some("Bash".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        let first = adopt().await;
+        first.emit(bash("old-1")).await;
+        assert!(!first.answers_itself("old-1"), "waits on its user");
+        let second = adopt().await;
+        assert!(
+            !second.answers_itself("old-1"),
+            "never seen here: not answered"
+        );
+        assert!(!second.answers_itself("never-asked"));
+        second.emit(bash("new-1")).await;
+        assert!(!second.answers_itself("new-1"), "waits on its user");
+        second
+            .answer_permission_scoped("new-1", true, PermissionAnswerScope::Once)
+            .await
+            .unwrap();
+        assert!(second.answers_itself("new-1"), "seen asked, then answered");
+        // An answer the provider refuses marks nothing.
+        second.emit(bash("new-2")).await;
+        provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .push(("new-2".into(), PermissionDecision::allow_once()));
+        assert!(second
+            .answer_permission_scoped("new-2", false, PermissionAnswerScope::Once)
+            .await
+            .is_err());
+        assert!(!second.answers_itself("new-2"));
     }
 }
 

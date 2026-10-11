@@ -149,6 +149,22 @@ fn count_resumes(tail: &[ChatEventRecord]) -> usize {
 /// `SpawnedBy::Trigger` is not owned either: external triggers do not re-fire after a
 /// restart.
 fn is_orchestrator_child(spawned_by: &str) -> bool {
+    is_agent_tool_child(spawned_by) || is_owned_by_a_run(spawned_by)
+}
+
+/// A sub-agent of the `Agent` tool: a `SpawnedBy::Conversation` carrying a `tool_use_id`.
+fn is_agent_tool_child(spawned_by: &str) -> bool {
+    matches!(
+        crate::chat::types::SpawnedBy::from_json_str(spawned_by),
+        Some(crate::chat::types::SpawnedBy::Conversation {
+            tool_use_id: Some(_),
+            ..
+        })
+    )
+}
+
+/// A session a run drives: runner, pipeline, gate retry, delegation.
+fn is_owned_by_a_run(spawned_by: &str) -> bool {
     use crate::chat::types::SpawnedBy;
     matches!(
         SpawnedBy::from_json_str(spawned_by),
@@ -157,10 +173,6 @@ fn is_orchestrator_child(spawned_by: &str) -> bool {
                 | SpawnedBy::Pipeline { .. }
                 | SpawnedBy::Gate { .. }
                 | SpawnedBy::Delegation { .. }
-                | SpawnedBy::Conversation {
-                    tool_use_id: Some(_),
-                    ..
-                }
         )
     )
 }
@@ -498,14 +510,14 @@ impl ChatManager {
             match judge(&tail) {
                 Verdict::Settled => {}
                 Verdict::Close(reason) => {
-                    self.close_cut_turn(node.id, reason).await;
+                    self.close_cut_session(&node, reason).await;
                     report.closed += 1;
                 }
                 Verdict::Resume { dangling_tool } => {
                     let closed_because =
                         left_alone.or((last_event_at < since).then_some(CLOSED_STALE));
                     if let Some(reason) = closed_because {
-                        self.close_cut_turn(node.id, reason).await;
+                        self.close_cut_session(&node, reason).await;
                         report.closed += 1;
                         continue;
                     }
@@ -520,6 +532,19 @@ impl ChatManager {
             }
         }
         Ok((pending, report))
+    }
+
+    /// [`Self::close_cut_turn`] for the session `node`. A sub-agent of an `Agent` call first
+    /// refuses the permission requests its thread leaves undecided, through the helper the
+    /// live path runs before closing a child (`deny_waiting_permissions`): nobody will ever
+    /// answer them (its parent re-issues the call in a new child), and since round 3 the
+    /// child has an owner, in whose attention they would stay pending for 30 days (lot
+    /// review of #721, finding 4).
+    async fn close_cut_session(&self, node: &ChatSessionNode, reason: &str) {
+        if node.spawned_by.as_deref().is_some_and(is_agent_tool_child) {
+            self.deny_waiting_permissions(&node.id.to_string()).await;
+        }
+        self.close_cut_turn(node.id, reason).await;
     }
 
     /// Ends a cut turn on the thread, so it shows and is not judged again. The event goes
