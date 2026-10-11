@@ -11827,6 +11827,9 @@ mod native_subagents {
     struct SlowFirstTurn {
         inner: Arc<dyn AgentSession>,
         ms: u64,
+        /// How long the provider takes to take a permission answer (the automatic answer
+        /// of a covered request included).
+        answer_ms: u64,
         first: std::sync::atomic::AtomicBool,
     }
 
@@ -11849,6 +11852,7 @@ mod native_subagents {
             request_id: &str,
             decision: PermissionDecision,
         ) -> Result<(), ProviderError> {
+            tokio::time::sleep(Duration::from_millis(self.answer_ms)).await;
             self.inner.answer_permission(request_id, decision).await
         }
         async fn answer_question(
@@ -11893,6 +11897,7 @@ mod native_subagents {
         inner: Tapped,
         open_ms: u64,
         turn_ms: u64,
+        answer_ms: u64,
     }
 
     #[async_trait::async_trait]
@@ -11915,12 +11920,13 @@ mod native_subagents {
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
             tokio::time::sleep(Duration::from_millis(self.open_ms)).await;
             let session = self.inner.open(spec).await?;
-            if self.turn_ms == 0 {
+            if self.turn_ms == 0 && self.answer_ms == 0 {
                 return Ok(session);
             }
             Ok(Arc::new(SlowFirstTurn {
                 inner: session,
                 ms: self.turn_ms,
+                answer_ms: self.answer_ms,
                 first: std::sync::atomic::AtomicBool::new(true),
             }))
         }
@@ -11944,33 +11950,38 @@ mod native_subagents {
         graph: Arc<MockGraphStore>,
         parent: String,
         _dir: tempfile::TempDir,
+        _rules: tempfile::TempDir,
     }
 
     /// A native parent session opened in `mode`; every child plays `child_turn`.
     async fn rig(child_turn: Vec<Step>, mode: &str) -> Rig {
-        rig_with(child_turn, mode, 0, 0, None).await
+        rig_with(child_turn, mode, 0, 0, None, 0).await
     }
 
     async fn rig_slow(child_turn: Vec<Step>, mode: &str, open_ms: u64) -> Rig {
-        rig_with(child_turn, mode, open_ms, 0, None).await
+        rig_with(child_turn, mode, open_ms, 0, None, 0).await
     }
 
     /// [`rig`], the parent opened inside the workspace `ws` (its only project is the
     /// parent's own, so its resolved `add_dirs` starts out empty — P18b, fix 1).
     async fn rig_in_workspace(child_turn: Vec<Step>, mode: &str, ws: &str) -> Rig {
-        rig_with(child_turn, mode, 0, 0, Some(ws)).await
+        rig_with(child_turn, mode, 0, 0, Some(ws), 0).await
     }
 
-    /// [`rig`], the provider taking `open_ms` to open a session and `turn_ms` to accept its
-    /// first turn, and the parent opened inside `workspace` when given.
+    /// [`rig`], the provider taking `open_ms` to open a session, `turn_ms` to accept its
+    /// first turn and `answer_ms` to take each permission answer, and the parent opened
+    /// inside `workspace` when given. Lasting rules are kept (a person's session keeps
+    /// them; the parent has no owner unless a test gives it one).
     async fn rig_with(
         child_turn: Vec<Step>,
         mode: &str,
         open_ms: u64,
         turn_ms: u64,
         workspace: Option<&str>,
+        answer_ms: u64,
     ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
+        let rules = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let mut project = crate::test_helpers::test_project();
         project.root_path = dir.path().display().to_string();
@@ -11993,13 +12004,18 @@ mod native_subagents {
             provider_path: ProviderPath::Agent,
             mcp_server_path: PathBuf::from("/nonexistent/mcp"),
             max_sessions: 20,
+            lasting_rules_dir: Some(rules.path().join("rules")),
             ..Default::default()
         };
+        // A native harness asks its permissions of the user (and takes their answers).
+        let mut child_caps = caps();
+        child_caps.interactive_permissions = true;
+        child_caps.permission_scopes = vec![nexus_claude::agent::PermissionScope::Once];
         let provider = Tapped {
             inner: Arc::new(ScriptedProvider::new(
                 "claude-code",
                 Script::builder()
-                    .capabilities(caps())
+                    .capabilities(child_caps)
                     .turn(child_turn)
                     .build(),
             )),
@@ -12012,6 +12028,7 @@ mod native_subagents {
                     inner: provider,
                     open_ms,
                     turn_ms,
+                    answer_ms,
                 }),
             ),
         );
@@ -12026,6 +12043,7 @@ mod native_subagents {
             graph,
             parent,
             _dir: dir,
+            _rules: rules,
         }
     }
 
@@ -12217,7 +12235,7 @@ mod native_subagents {
     /// child ran on for ever.
     #[tokio::test]
     async fn a_call_cancelled_while_the_child_opens_still_closes_it() {
-        let r = Arc::new(rig_with(vec![Step::AwaitInterrupt], "default", 0, 2_000, None).await);
+        let r = Arc::new(rig_with(vec![Step::AwaitInterrupt], "default", 0, 2_000, None, 0).await);
         let call = {
             let r = r.clone();
             tokio::spawn(async move { r.run("c0").await })
@@ -12410,7 +12428,7 @@ mod native_subagents {
         let waiting = {
             let manager = r.manager.clone();
             let sid = sid.clone();
-            tokio::spawn(async move { manager.answer_from(&sid, rx).await })
+            tokio::spawn(async move { manager.answer_from(&sid, rx, &|_| false).await })
         };
         // The reader took "working", found no `result` on the thread, and now waits.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -12476,6 +12494,19 @@ mod native_subagents {
         assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
         let children = r.children().await;
         assert_eq!(children.len(), 1);
+        // Not vacuous (P18b round 3, fix D): the Agent child DOES carry the parent's
+        // workspace (`ParentEnvelope::apply` inherits it, #720 fix 1), and its own `add_dirs`
+        // is `None` like the parent's, so `resolve_add_dirs` takes its workspace branch —
+        // the one that re-reads the CURRENT membership and would hand it project B.
+        assert_eq!(
+            children[0].workspace_slug.as_deref(),
+            Some("ws-widen"),
+            "the Agent child inherits the parent's workspace"
+        );
+        assert_eq!(
+            children[0].workspace_slug,
+            r.parent_node().await.workspace_slug
+        );
         let agent_child_dirs = children[0].add_dirs.clone().unwrap_or_default();
         assert!(
             !agent_child_dirs.iter().any(|d| d.contains("project-b")),
@@ -12505,6 +12536,244 @@ mod native_subagents {
             "a chat(send_message) child must not see project B either: {plain_dirs:?}"
         );
         let _ = r.manager.close_session(&plain_child).await;
+    }
+
+    /// P18b round 3, fix A: after a restart the parent is reopened WITHOUT its owner's
+    /// claims (the recovery keeps none), so its `Agent` calls reach `run_subagent` with no
+    /// claims — exactly what `Rig::run` passes. The child still belongs to the parent's
+    /// person. Red before the fix: `session_owner(None)` gave the child no owner at all.
+    #[tokio::test]
+    async fn a_child_opened_without_claims_belongs_to_its_parents_owner() {
+        let r = rig(answer("CHILD-ANSWER"), "default").await;
+        let mut parent = r.parent_node().await;
+        parent.owner = Some("person-behind-the-parent".into());
+        r.graph.create_chat_session(&parent).await.unwrap();
+
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].owner.as_deref(),
+            Some("person-behind-the-parent")
+        );
+    }
+
+    /// P18b round 3, fix B: a child that asks for a permission — nobody watches its
+    /// session — fails the parent's call within seconds, not at the parent's 30-minute turn
+    /// timeout, and the child ends closed. Red before the fix: the call waited only for a
+    /// `result` or a `session_closed`, neither of which ever came.
+    #[tokio::test]
+    async fn a_child_that_asks_for_a_permission_fails_the_call_fast_and_is_closed() {
+        let r = rig(
+            vec![
+                steps::permission_ask("perm-1", "Bash", None, &[]),
+                steps::await_permission("perm-1", answer("ALLOWED"), answer("DENIED")),
+            ],
+            "default",
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(Duration::from_secs(60), r.run("ca1"))
+            .await
+            .expect("a child's permission request must not hold the parent");
+        assert!(
+            out.as_ref()
+                .is_err_and(|e| e.contains("permission") && e.contains("Bash")),
+            "{out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert!(r.none_alive().await, "the child is closed");
+        let child = children[0].id.to_string();
+        let kinds: Vec<String> = r
+            .events_of(&child)
+            .await
+            .iter()
+            .map(|e| e.event_type.clone())
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "permission_request"),
+            "the child did ask: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "session_closed"),
+            "the close is on the child's thread: {kinds:?}"
+        );
+        // Review of #724, point 1: the request is answered `deny` before the close, so it
+        // is no orphan in the cockpit of the child's owner. Red before the fix: no
+        // `permission_decision`, and the attention derivation kept `perm-1` for 30 days.
+        let events = r.events_of(&child).await;
+        assert_eq!(
+            crate::chat::attention::permission_status(&events, "perm-1"),
+            crate::chat::attention::PermissionStatus::Decided,
+            "the child's request is answered: {kinds:?}"
+        );
+        let denied = events.iter().any(|e| {
+            matches!(
+                serde_json::from_str::<ChatEvent>(&e.data),
+                Ok(ChatEvent::PermissionDecision { ref id, allow: false, .. }) if id == "perm-1"
+            )
+        });
+        assert!(denied, "answered with a deny: {kinds:?}");
+        let attention = crate::chat::attention::derive_session_attention(
+            &crate::chat::attention::SessionAttentionInput {
+                session_id: children[0].id,
+                workspace: "w".into(),
+                thread_id: None,
+                alive: false,
+                pending_in_memory: Default::default(),
+            },
+            &events,
+            chrono::Utc::now(),
+        );
+        assert!(
+            attention.waiting.is_empty() && attention.orphans.is_empty(),
+            "nothing of the child is left in its owner's attention: {attention:?}"
+        );
+    }
+
+    /// Review of #724 (second review): a request of the child a lasting rule of its owner
+    /// covers never fails the call, even when its automatic answer reaches the provider
+    /// well after the old 3 s grace (here 4 s: the provider is slow to take it); the child
+    /// runs the call and answers. Red before: the call failed at 3 s and closed the child.
+    #[tokio::test]
+    async fn a_childs_request_a_lasting_rule_covers_never_fails_the_call_even_when_answered_late() {
+        let input = json!({"command": "cat README.md"});
+        let r = rig_with(
+            vec![
+                Step::Emit(AgentEvent::PermissionAsk {
+                    request_id: "perm-1".into(),
+                    tool_name: "mcp__nexus__Bash".into(),
+                    input: input.clone(),
+                    category: Default::default(),
+                    canonical: Some("Bash".into()),
+                    tool_call_id: None,
+                    scopes: Vec::new(),
+                    parent: None,
+                }),
+                steps::await_permission("perm-1", answer("ALLOWED"), answer("DENIED")),
+            ],
+            "default",
+            0,
+            0,
+            None,
+            4_000,
+        )
+        .await;
+        // The parent (so the child, fix A) belongs to alice, who approved this call for
+        // good on this project.
+        let mut parent = r.parent_node().await;
+        parent.owner = Some("alice".into());
+        r.graph.create_chat_session(&parent).await.unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input,
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        r.manager
+            .lasting_scope(Some("alice"), parent.project_slug.as_deref(), &parent.cwd)
+            .await
+            .expect("alice keeps lasting rules on this project")
+            .keep(&call, &grant, "seed")
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(Duration::from_secs(60), r.run("ca1"))
+            .await
+            .expect("the call ends");
+        assert_eq!(out, Ok("ALLOWED".to_string()));
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "the answer was late: {:?}",
+            started.elapsed()
+        );
+        let child = r.children().await[0].id.to_string();
+        let events = r.events_of(&child).await;
+        let allowed = events.iter().any(|e| {
+            matches!(
+                serde_json::from_str::<ChatEvent>(&e.data),
+                Ok(ChatEvent::PermissionDecision { ref id, allow: true, .. }) if id == "perm-1"
+            )
+        });
+        assert!(allowed, "the backend answered it itself");
+    }
+
+    /// The other side, at once: a request no grant and no rule covers fails the call
+    /// immediately — no grace (review of #724, second review). Red before: the call failed
+    /// only after 3 s.
+    #[tokio::test]
+    async fn a_childs_request_nothing_covers_fails_the_call_at_once() {
+        let r = rig(
+            vec![
+                steps::permission_ask("perm-1", "Bash", None, &[]),
+                steps::await_permission("perm-1", answer("ALLOWED"), answer("DENIED")),
+            ],
+            "default",
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(Duration::from_secs(60), r.run("ca1"))
+            .await
+            .expect("the call ends");
+        assert!(out.is_err_and(|e| e.contains("Bash")));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "no grace: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// P18b round 3, fix E: a panic in `open_wait_close` between the child's answer and its
+    /// explicit close — the point where the guard used to be already disarmed — still
+    /// closes the child, and the slot is given back only AFTER that close (the guard owns
+    /// it). The injection runs in the real task: this proves the guard is wired in, not
+    /// just that the struct works. Red before the fix: the guard was disarmed there, so the
+    /// child stayed live and the slot was freed at once by the unwind.
+    #[tokio::test]
+    async fn a_panic_before_the_close_still_closes_the_child_then_frees_the_slot() {
+        let r = rig(answer("CHILD-ANSWER"), "default").await;
+        crate::chat::subagents::panic_injection::before_close(&r.parent);
+        let out = r.run("ca1").await;
+        assert!(
+            out.as_ref().is_err_and(|e| e.contains("opening ended")),
+            "the panic reaches the caller as an error: {out:?}"
+        );
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        let child = children[0].id.to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_some()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot was never freed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !r.manager.agent_runtime.owns(&child).await,
+            "the slot is freed only once the child is closed"
+        );
+        assert!(
+            r.events_of(&child)
+                .await
+                .iter()
+                .any(|e| e.event_type == "session_closed"),
+            "the backstop closed the child"
+        );
     }
 }
 

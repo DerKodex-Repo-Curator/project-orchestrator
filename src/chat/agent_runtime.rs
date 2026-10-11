@@ -551,6 +551,12 @@ pub struct AgentSessionHandle {
     /// The call each permission request still waiting asks for (request id -> call):
     /// what a `session` grant is derived from.
     asked_calls: std::sync::Mutex<HashMap<String, super::session_grants::AskedCall>>,
+    /// The permission requests a grant of this session or a lasting rule of its person
+    /// covers: decided in [`Self::emit_one`] BEFORE the request is broadcast, so whoever
+    /// sees the request can know at once that the backend answers it itself (a sub-agent's
+    /// parent: P18b, review of #724). A request whose automatic answer failed leaves the
+    /// set (the user is asked).
+    self_answered: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Who asks this session's permission requests (its provider kind): whether a
     /// request carries the whole call (`session_grants::Asker`).
     asker: super::session_grants::Asker,
@@ -629,6 +635,10 @@ impl AgentSessionHandle {
             }
             // Left waiting: the user answers it.
             Err(e) => {
+                self.self_answered
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&covered);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %e,
@@ -698,6 +708,12 @@ impl AgentSessionHandle {
             covered = Box::pin(super::session_grants::cover(&self.session_grants, &call))
                 .await
                 .map(|cover| (id.clone(), cover));
+            if covered.is_some() {
+                self.self_answered
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id.clone());
+            }
             self.asked_calls
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1395,6 +1411,27 @@ impl AgentSessionHandle {
         true
     }
 
+    /// The ids of the permission requests this session still waits on (asked, not yet
+    /// answered by the user or by one of its grants).
+    pub fn waiting_permission_ids(&self) -> Vec<String> {
+        self.asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the backend answers the permission request `request_id` itself (a grant
+    /// or a lasting rule covers it): known as soon as the request is broadcast, before
+    /// its automatic answer went out. `false` once that answer failed.
+    pub fn answers_itself(&self, request_id: &str) -> bool {
+        self.self_answered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(request_id)
+    }
+
     /// Answers a permission request for this call only.
     pub async fn answer_permission(&self, request_id: &str, allow: bool) -> Result<()> {
         self.answer_permission_scoped(request_id, allow, PermissionAnswerScope::Once)
@@ -1978,6 +2015,7 @@ impl AgentRuntime {
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             session_grants: std::sync::Mutex::new(grants),
             asked_calls: std::sync::Mutex::new(HashMap::new()),
+            self_answered: std::sync::Mutex::new(std::collections::HashSet::new()),
             asker: super::session_grants::Asker::from_provider_kind(provider_kind),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
