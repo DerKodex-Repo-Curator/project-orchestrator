@@ -374,7 +374,8 @@ pub enum DeliveryRoute {
 }
 
 /// The approval scopes the Claude Code engine (legacy path) offers: `once`, and `session`
-/// kept by the backend (`chat::session_grants`). Never `always` in this lot (P11b).
+/// kept by the backend (`chat::session_grants`). `always` (P11b) is added per session, by a
+/// session that keeps lasting rules (`offer_lasting_scope`).
 /// Declared in its `system_init.capabilities` and checked by
 /// [`ChatManager::deliver_permission_answer`]: what is accepted is what is declared.
 pub const LEGACY_PERMISSION_SCOPES: &[super::types::PermissionAnswerScope] = &[
@@ -9068,9 +9069,12 @@ impl ChatManager {
     ///
     /// `session`: the CLI gets a plain allow (never `updatedPermissions`: no rule is handed
     /// to the CLI); the grant (`session_grants::grant_for`) is kept in the session and the
-    /// backend answers the later requests it covers. `always`, or a `session` the call cannot
-    /// be granted for: refused ([`PermissionDeliveryError::ScopeUnsupported`]), the request
-    /// stays waiting.
+    /// backend answers the later requests it covers. `always` (P11b): a plain allow too, none
+    /// of the CLI's `permission_suggestions` applied; the lasting grant
+    /// (`session_grants::lasting_grant_for`) is written for the session's person and project
+    /// once the CLI has the answer. An `always` or a `session` the call cannot be granted for
+    /// (or a session that keeps no lasting rule): refused
+    /// ([`PermissionDeliveryError::ScopeUnsupported`]), the request stays waiting.
     async fn deliver_permission_answer(
         ctx: PermissionAnswer<'_>,
         session_id: &str,
@@ -9137,7 +9141,7 @@ impl ChatManager {
             }
         };
         // How long the approval lasts is the backend's business: `session` is a grant kept
-        // here, `always` does not exist in this lot (P11b). Never a narrower or wider answer.
+        // here, `always` a lasting rule of the backend (P11b). Never a narrower or wider answer.
         let grant = match (allow, scope) {
             (false, _) | (true, super::types::PermissionAnswerScope::Once) => None,
             (true, super::types::PermissionAnswerScope::Session) => {

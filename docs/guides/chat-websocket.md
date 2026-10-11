@@ -206,7 +206,34 @@ engine keeps an environment change from one call to the next).
 
 Only requests the provider asked reach the backend, after its own policy (read-only access,
 denies, trust) and the project's consent. Another session, or the same one after a restart, asks
-again. `always` is part of the contract but refused on every engine for now (P11b). A scope that
+again.
+
+**`always` (P11b)** is kept by the backend too, never by a provider: nexus's `allow` list and
+the Claude Code CLI's settings (`localSettings`, `updatedPermissions`) never receive a lasting
+rule, and none of the CLI's `permission_suggestions` (`setMode`, `addDirectories`, a
+whole-program rule) is ever applied. The CLI's `.claude/settings.local.json` lives in the
+project, where a model allowed to edit files could grant itself rules: the backend neither
+writes nor reads it. What `always` covers is decided by the same comparator, stricter
+(`session_grants::lasting_grant_for`): the **identical** call only (never a prefix), no file
+tool (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`), and for a command ONE simple command of the
+allowlist above with no operator (`;`, `&`, `|`, `(`, `)`, a new line), no redirection and no
+glob outside quotes; only on the Claude Code CLI and the native engine. A rule belongs to a
+**person and a project** (the session's owner and project slug): `always` is offered
+(`capabilities.permission_scopes` of `system_init`) only to a session that has both and when
+the server keeps lasting rules (`CHAT_PERMISSION_RULES_DIR`, default `<config>/project-orchestrator/permission-rules`,
+unix only). The rule is written after the provider took the answer, in a `0700` directory, one
+file per person (written to a fresh `O_EXCL` temporary file renamed over it, under an
+inter-process lock); a file or a directory another user could write, or a symbolic link, is
+ignored, and every stored rule goes through the comparator again (a rule edited by hand into
+`Bash(*)` holds nothing). The backend answers the later requests a rule covers, in any session
+of that person on that project, with `permission_decision {scope: "always", rule}`; a rule
+that cannot be written leaves the call granted for the session and the decision says
+`session`. The rules are read at each request: `GET /api/chat/permission-rules[?project=<slug>]`
+lists the caller's rules and `DELETE /api/chat/permission-rules/{id}` revokes one, effective at
+the next request (human routes: an agent's or an MCP token gets 403). Rules live on the
+machine of the instance that owns the session.
+
+A scope that
 cannot be kept is refused with an `error` frame `{"code": "permission_scope_unsupported",
 "reason": "<scope>", "request_id": "<id>"}` (`request_id`: the `id` of the refused answer, so a
 client with several requests waiting marks the right one); nothing is answered and the request

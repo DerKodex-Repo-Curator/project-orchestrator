@@ -7943,7 +7943,8 @@ mod legacy_oob_lag {
 /// P11a: an approval lasts `once` or for the `session`, on both engines, and the backend
 /// decides what a session grant covers (`chat::session_grants`): the identical call (any
 /// call of a read-only tool), answered by the backend in THIS session only, never handed
-/// to the provider as a rule. `always` is refused, typed, on every engine (P11b).
+/// to the provider as a rule. `always` (P11b): kept by the backend for a person and a project,
+/// never by the provider; refused, typed, elsewhere.
 mod permission_scopes {
     use super::*;
     use crate::chat::manager::PermissionDeliveryError;
@@ -8588,7 +8589,7 @@ mod permission_scopes {
         let manager = native_manager(graph.clone()).await;
         let sid = open(&manager, cwd.path(), None).await;
 
-        // No engine offers `always` in this lot.
+        // A session without an owner keeps no lasting rule: `always` is not offered.
         let handle = manager.agent_runtime.get(&sid).await.unwrap();
         let scopes = handle.offered_capabilities().permission_scopes;
         assert!(

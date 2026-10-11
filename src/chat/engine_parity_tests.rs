@@ -2217,7 +2217,7 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
     cc.check("tool_timing", timed, Cause::Harness, seen);
     // `session`: a plain allow for the CLI (never a rule handed to it); the identical
-    // call again is answered by the backend. `always`: refused on every engine (P11b).
+    // call again is answered by the backend. `always`: kept by the backend (P11b), measured below.
     // Boxed: the scenario's future is already large (a stack overflow otherwise).
     let (routed_s, line_s) = Box::pin(cc_scoped(
         &manager,
