@@ -20,9 +20,24 @@
 //! closed (it stays resumable and visible). A dropped call (the parent's turn interrupted or
 //! the call cancelled) closes the child too.
 //!
-//! Depth is held twice: the backend gives [`SubagentHooks`] only to a native session whose
-//! record has no `spawned_by` (`ChatManager::build_agent_spec_with_access`), and the envelope
-//! refuses a parent that has a parent.
+//! Depth is held three times: the backend gives [`SubagentHooks`] only to a native session
+//! whose record has no `spawned_by` (`ChatManager::build_agent_spec_with_access`); a spawned
+//! native session is opened with `SessionSpec::lineage` at depth 1, so the harness itself
+//! refuses it the tool; and the envelope refuses a parent that has a parent. A child keeps its
+//! `spawned_by` when it moves to another provider (relay).
+//!
+//! The cap of live children holds under parallel calls (the harness runs the calls of one step
+//! concurrently): a slot of the parent is taken BEFORE the envelope counts its children and is
+//! held until the sub-agent ends ([`MAX_LIVE_CHILDREN`](super::envelope::MAX_LIVE_CHILDREN)
+//! slots per parent). The ceiling is the parent's CURRENT mode: a native session's mode changes
+//! are kept live and persisted (`set_session_permission_mode`).
+//!
+//! What a child may not do: ask the user (`AskUserQuestion` is denied to a spawned native
+//! session; a question seen anyway fails the call); return more than [`MAX_ANSWER_CHARS`]
+//! characters (the rest is cut, and said). The call waits as long as the child works, bounded
+//! by the parent's turn timeout; a child in a mode that asks for permissions shows its request
+//! in its own session, where nobody may be watching: it then waits until that timeout. Budget
+//! and cost of the children are not counted in the parent's (task B36).
 
 use std::sync::{Arc, Weak};
 
@@ -126,8 +141,80 @@ impl Drop for CloseOnDrop {
     }
 }
 
-/// The answer of a sub-agent from its `result`: the result text, else what it said.
+/// One running sub-agent of a parent (module documentation): taken before the envelope
+/// counts the parent's live children, given back when the sub-agent ends or its call is dropped.
+pub(crate) struct SubagentSlot {
+    manager: Weak<ChatManager>,
+    parent: String,
+}
+
+impl SubagentSlot {
+    /// A slot of `parent`, or `None` when its [`MAX_LIVE_CHILDREN`] slots are taken.
+    ///
+    /// [`MAX_LIVE_CHILDREN`]: super::envelope::MAX_LIVE_CHILDREN
+    pub(crate) fn take(manager: &Arc<ChatManager>, parent: &str) -> Option<Self> {
+        let mut slots = manager
+            .subagent_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = slots.entry(parent.to_string()).or_insert(0);
+        if *taken >= super::envelope::MAX_LIVE_CHILDREN {
+            return None;
+        }
+        *taken += 1;
+        Some(Self {
+            manager: Arc::downgrade(manager),
+            parent: parent.to_string(),
+        })
+    }
+}
+
+impl Drop for SubagentSlot {
+    fn drop(&mut self) {
+        let Some(manager) = self.manager.upgrade() else {
+            return;
+        };
+        let mut slots = manager
+            .subagent_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(taken) = slots.get_mut(&self.parent) {
+            *taken = taken.saturating_sub(1);
+            if *taken == 0 {
+                slots.remove(&self.parent);
+            }
+        }
+    }
+}
+
+/// Longest answer of a sub-agent given back to its parent, in characters: a sub-agent that
+/// copies a whole file must not fill the parent's context.
+pub(crate) const MAX_ANSWER_CHARS: usize = 64 * 1024;
+
+/// `text` cut to [`MAX_ANSWER_CHARS`], saying how much was left out.
+fn bounded(text: String) -> String {
+    let total = text.chars().count();
+    if total <= MAX_ANSWER_CHARS {
+        return text;
+    }
+    let kept: String = text.chars().take(MAX_ANSWER_CHARS).collect();
+    format!(
+        "{kept}\n[… {} characters of the sub-agent's answer left out]",
+        total - MAX_ANSWER_CHARS
+    )
+}
+
+/// The answer of a sub-agent from its `result`: the result text, else what it said. A
+/// sub-agent that asked the user a question fails the call: nobody sees a child's question.
 fn answer_of(events: &[ChatEvent]) -> Option<Result<String, String>> {
+    if events
+        .iter()
+        .any(|e| matches!(e, ChatEvent::AskUserQuestion { .. }))
+    {
+        return Some(Err(
+            "the sub-agent asked the user a question; a sub-agent cannot ask: give it what it needs in the prompt".to_owned(),
+        ));
+    }
     let (is_error, result_text, subtype) = events.iter().find_map(|e| match e {
         ChatEvent::Result {
             is_error,
@@ -161,7 +248,7 @@ fn answer_of(events: &[ChatEvent]) -> Option<Result<String, String>> {
             }
         ))
     } else {
-        Ok(text)
+        Ok(bounded(text))
     })
 }
 
@@ -195,6 +282,13 @@ impl ChatManager {
             .await
             .map_err(|e| refused(e.to_string()))?
             .ok_or_else(|| refused("the parent session is unknown".to_owned()))?;
+        // Held for the whole call: parallel calls cannot all pass the count below (A17).
+        let _slot = SubagentSlot::take(&self, parent_session_id).ok_or_else(|| {
+            refused(format!(
+                "envelope_too_many_children (at most {} sub-agents of one session run at once)",
+                envelope::MAX_LIVE_CHILDREN
+            ))
+        })?;
         let env =
             envelope::resolve_envelope(self.graph.as_ref(), self.as_ref(), parent_session_id, None)
                 .await
@@ -207,6 +301,8 @@ impl ChatManager {
             add_dirs: parent.add_dirs.clone(),
             user_claims,
             task_context: request.description.clone(),
+            // Never wider than the parent (a read-only parent has no `Agent`; defence in depth).
+            access: Some(parent.access),
             ..Default::default()
         };
         let default_mode = self.default_permission_mode().await;
@@ -325,5 +421,54 @@ mod tests {
             failed.contains("failed") && failed.contains("boom"),
             "{failed}"
         );
+    }
+
+    fn ok_result(text: &str) -> ChatEvent {
+        ChatEvent::Result {
+            session_id: "s".into(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: Some(text.to_owned()),
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        }
+    }
+
+    /// N3: a sub-agent that copies a whole file does not fill its parent's context.
+    #[test]
+    fn a_long_answer_is_cut_and_says_so() {
+        let long = "x".repeat(1024 * 1024);
+        let answer = answer_of(&[ok_result(&long)]).unwrap().unwrap();
+        assert!(
+            answer.chars().count() < MAX_ANSWER_CHARS + 100,
+            "{}",
+            answer.len()
+        );
+        assert!(answer.ends_with(&format!(
+            "[… {} characters of the sub-agent's answer left out]",
+            1024 * 1024 - MAX_ANSWER_CHARS
+        )));
+        let short = answer_of(&[ok_result("short")]).unwrap().unwrap();
+        assert_eq!(short, "short");
+    }
+
+    /// N2: a question a child asks reaches nobody: the call fails, saying why.
+    #[test]
+    fn a_child_that_asks_the_user_fails_the_call() {
+        let asked = ChatEvent::AskUserQuestion {
+            id: "q".into(),
+            tool_call_id: "cq".into(),
+            questions: serde_json::json!([{"question": "Which?"}]),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+            synthetic: Some(true),
+        };
+        let out = answer_of(&[asked, ok_result("asked")]).unwrap();
+        assert!(out.is_err_and(|e| e.contains("cannot ask")));
     }
 }

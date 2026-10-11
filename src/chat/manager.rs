@@ -711,6 +711,14 @@ pub struct ChatManager {
     /// The manager itself, once in its `Arc` ([`Self::enable_subagents`]): what the sub-agents
     /// of native sessions open their child sessions through (P18, `subagents.rs`).
     pub(crate) self_ref: std::sync::OnceLock<std::sync::Weak<ChatManager>>,
+    /// The permission mode of each live session of the agent engine, as last set
+    /// (`set_session_permission_mode`): what a child's ceiling reads (A17), the agent engine
+    /// keeping its mode in the harness where `live_session_permission_mode` cannot see it.
+    pub(crate) agent_modes: std::sync::Mutex<HashMap<String, String>>,
+    /// The sub-agents running for each parent session (P18): a slot is taken before the
+    /// envelope counts the live children and held until the sub-agent ends, so parallel `Agent`
+    /// calls cannot all count the same children and pass the cap together.
+    pub(crate) subagent_slots: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 // ============================================================================
@@ -2586,6 +2594,8 @@ impl ChatManager {
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
             self_ref: Default::default(),
+            agent_modes: Default::default(),
+            subagent_slots: Default::default(),
         }
     }
 
@@ -2671,6 +2681,8 @@ impl ChatManager {
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
             self_ref: Default::default(),
+            agent_modes: Default::default(),
+            subagent_slots: Default::default(),
         }
     }
 
@@ -4569,11 +4581,24 @@ impl ChatManager {
     /// The live permission mode of an active session (`None` when the session
     /// is not active or runs on the global default).
     pub async fn live_session_permission_mode(&self, session_id: &str) -> Option<String> {
-        self.active_sessions
+        if let Some(mode) = self
+            .active_sessions
             .read()
             .await
             .get(session_id)
             .and_then(|s| s.permission_mode.clone())
+        {
+            return Some(mode);
+        }
+        // A session of the agent engine (native, Codex, ACP): the mode last set on it.
+        if !self.agent_runtime.owns(session_id).await {
+            return None;
+        }
+        self.agent_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
     }
 
     /// The permission mode a session gets when its request names none.
@@ -4692,6 +4717,29 @@ impl ChatManager {
             self.graph.get_chat_session(sid).await,
             Ok(Some(node)) if node.spawned_by.as_deref().is_none_or(|s| s.trim().is_empty())
         )
+    }
+
+    /// The lineage of a session something spawned (its record has a `spawned_by`): depth 1
+    /// under its parent session, or under whatever spawned it when it names none. `None` for a
+    /// session a person opened, or an unknown record.
+    pub(crate) async fn spawned_lineage(
+        &self,
+        session_id: &str,
+    ) -> Option<nexus_claude::agent::Lineage> {
+        let sid = Uuid::parse_str(session_id).ok()?;
+        let node = self.graph.get_chat_session(sid).await.ok()??;
+        let spawned_by = node.spawned_by.filter(|s| !s.trim().is_empty())?;
+        let ctx = parse_spawned_by(&spawned_by);
+        let parent = ctx
+            .as_ref()
+            .and_then(|c| c.parent_session_id.clone())
+            .unwrap_or_default();
+        Some(nexus_claude::agent::Lineage {
+            root_session_id: parent.clone(),
+            parent_session_id: parent,
+            depth: 1,
+            spawned_by: ctx.map_or_else(|| "unknown".to_string(), |c| c.spawn_type),
+        })
     }
 
     /// Where a session comes from, for its tool profile (H6).
@@ -8801,6 +8849,21 @@ impl ChatManager {
                 session_id,
                 pair.neutral != nexus_claude::agent::PolicyMode::Trust,
             );
+            // What a child's ceiling reads (A17, P18): kept live, and persisted so a resume and
+            // the envelope after a restart see the mode the session is in, not its opening one.
+            self.agent_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.to_string(), pair.legacy.to_string());
+            if let Ok(uuid) = Uuid::parse_str(session_id) {
+                if let Err(e) = self
+                    .graph
+                    .update_chat_session_permission_mode(uuid, pair.legacy)
+                    .await
+                {
+                    warn!(session_id = %session_id, error = %e, "Failed to persist the permission mode of an agent session (non-fatal)");
+                }
+            }
             return Ok(());
         }
         // Validate mode: the Claude strings or the neutral names (A43). The CLI
@@ -9013,7 +9076,12 @@ impl ChatManager {
             add_dirs: node.add_dirs.clone(),
             workspace_slug: node.workspace_slug.clone(),
             user_claims: claims,
-            spawned_by: None,
+            // A child of a session stays one when it moves: its lineage (depth 1, P18 / A17)
+            // and its third-party parent (H6) go with it.
+            spawned_by: node
+                .spawned_by
+                .clone()
+                .filter(|s| parse_spawned_by(s).is_some_and(|ctx| ctx.parent_session_id.is_some())),
             task_context: None,
             scaffolding_override: None,
             // A switch never widens: the new session keeps the access of the old one.
@@ -12867,6 +12935,16 @@ impl ChatManager {
         // one (A18). Only for a local session nothing spawned (depth 1, A17), once the manager
         // can hand itself over (`enable_subagents`).
         if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
+            // A spawned native session: the harness's own depth guard applies (`lineage`), and
+            // it asks no question nobody would see (its user is a parent session, not a person).
+            if let Some(lineage) = self.spawned_lineage(session_id).await {
+                spec.lineage = Some(lineage);
+                spec.policy
+                    .deny
+                    .push(nexus_claude::agent::ToolPattern::tool(
+                        nexus_claude::providers::native::builtin::ASK_USER_QUESTION_TOOL,
+                    ));
+            }
             if let Some(manager) = self.weak_self() {
                 if self.spawned_by_nothing(session_id).await {
                     spec.hooks = Some(Arc::new(super::subagents::SubagentHooks::new(
@@ -13669,6 +13747,10 @@ impl ChatManager {
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
         if self.agent_runtime.owns(session_id).await {
+            self.agent_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(session_id);
             crate::auth::agent_tokens::revoke_session(session_id);
             // Every instance learns the session is gone, as on the legacy path: the
             // `session_closed` the runtime emits is published like every event.
@@ -16011,25 +16093,43 @@ mod tests {
                     .await
                     .unwrap();
                 crate::auth::agent_tokens::revoke_session(&sid);
-                spec.hooks.is_some_and(|h| h.runs_subagents())
+                let asks = !spec
+                    .policy
+                    .deny
+                    .iter()
+                    .any(|p| p.matches("AskUserQuestion", None));
+                (
+                    spec.hooks.is_some_and(|h| h.runs_subagents()),
+                    spec.lineage.map(|l| l.depth),
+                    asks,
+                )
             }
         };
         assert!(
-            !runs(top.to_string(), ProviderKind::Native).await,
+            !runs(top.to_string(), ProviderKind::Native).await.0,
             "without enable_subagents the manager cannot open a child"
         );
         manager.enable_subagents();
-        assert!(runs(top.to_string(), ProviderKind::Native).await);
-        assert!(
-            !runs(child.to_string(), ProviderKind::Native).await,
-            "a spawned session cannot delegate again"
+        // A session a person opened: the host, no lineage, the question.
+        assert_eq!(
+            runs(top.to_string(), ProviderKind::Native).await,
+            (true, None, true)
+        );
+        // A spawned session: no host, the harness's depth guard armed (lineage depth 1), no
+        // question nobody would see.
+        assert_eq!(
+            runs(child.to_string(), ProviderKind::Native).await,
+            (false, Some(1), false),
+            "a spawned session cannot delegate again nor ask"
         );
         assert!(
-            !runs(Uuid::new_v4().to_string(), ProviderKind::Native).await,
+            !runs(Uuid::new_v4().to_string(), ProviderKind::Native)
+                .await
+                .0,
             "an unknown record is not trusted"
         );
         assert!(
-            !runs(top.to_string(), ProviderKind::ClaudeCode).await,
+            !runs(top.to_string(), ProviderKind::ClaudeCode).await.0,
             "Claude Code brings its own Task"
         );
     }
