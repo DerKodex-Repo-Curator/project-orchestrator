@@ -411,6 +411,8 @@ impl ChatManager {
             code: Some("restart_interrupted".to_string()),
             reason: None,
             index: None,
+            // Not a permission refusal: it names no request (P11 field).
+            request_id: None,
         };
         let record = ChatEventRecord {
             id: Uuid::new_v4(),
