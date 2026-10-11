@@ -514,6 +514,8 @@ impl Neo4jClient {
             .param("id", id.to_string());
         let mut result = self.graph.execute(q).await?;
         match result.next().await? {
+            // A value of another type reads as `None` on purpose: the caller takes the
+            // shell as moved (fail safe).
             Some(row) => Ok(row.get::<Option<bool>>("moved").unwrap_or(None)),
             None => Ok(None),
         }

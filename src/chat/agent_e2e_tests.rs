@@ -8716,6 +8716,212 @@ mod permission_scopes {
         manager.close_session(&sid).await.unwrap();
     }
 
+    /// Review of #716, S1: the stored `shell_moved: false` is only an optimisation. A
+    /// resume replays the session's stored tool calls, so a move whose flag write was lost
+    /// (a failed write, a crash, a resume overtaking it) still counts; an event that
+    /// cannot be read back counts as a move; an absent flag (a session recorded before it
+    /// existed) too.
+    #[tokio::test]
+    async fn a_resume_finds_a_move_in_the_events_whatever_the_stored_flag_says() {
+        use crate::chat::session_grants::Asker;
+        use crate::neo4j::models::{ChatEventRecord, ChatSessionNode};
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            ChatManager::new_without_memory(
+                dyn_graph,
+                mock_app_state().meili,
+                super::super::config::ChatConfig::default(),
+            )
+        };
+        let session = |id: Uuid| ChatSessionNode {
+            id,
+            cli_session_id: None,
+            project_slug: None,
+            workspace_slug: None,
+            cwd: "/tmp".into(),
+            title: None,
+            model: "m".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            message_count: 0,
+            total_cost_usd: None,
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: None,
+            spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            routing_mode: None,
+            routing_pool: None,
+            capabilities: None,
+            resume_token: None,
+            execution_place: Default::default(),
+            access: Default::default(),
+            owner: None,
+        };
+        let record = |id: Uuid, seq: i64, event_type: &str, data: String| ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: id,
+            seq,
+            event_type: event_type.into(),
+            data,
+            created_at: Utc::now(),
+        };
+        let bash = |command: &str| {
+            serde_json::to_string(&ChatEvent::ToolUse {
+                id: "t".into(),
+                tool: "Bash".into(),
+                input: json!({ "command": command }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .unwrap()
+        };
+        let resumed = |id: Uuid| {
+            let manager = &manager;
+            async move {
+                manager
+                    .session_grants_for(&id.to_string(), None, None, true, Asker::ClaudeCode)
+                    .await
+                    .shell_moved()
+            }
+        };
+        let fresh = |id: Uuid| {
+            let manager = &manager;
+            async move {
+                manager
+                    .session_grants_for(&id.to_string(), None, None, false, Asker::ClaudeCode)
+                    .await
+                    .shell_moved()
+            }
+        };
+
+        // Stored `false`, only plain read-only commands: not moved.
+        let quiet = Uuid::new_v4();
+        graph.create_chat_session(&session(quiet)).await.unwrap();
+        let mut events: Vec<_> = (1..=600)
+            .map(|seq| record(quiet, seq, "assistant_text", "{}".into()))
+            .collect();
+        events.push(record(quiet, 601, "tool_use", bash("ls")));
+        graph.store_chat_events(quiet, events).await.unwrap();
+        assert!(!resumed(quiet).await);
+
+        // Stored `false` (the write of `true` was lost), a `cd` past the first page: moved.
+        let lost = Uuid::new_v4();
+        graph.create_chat_session(&session(lost)).await.unwrap();
+        let mut events: Vec<_> = (1..=600)
+            .map(|seq| record(lost, seq, "assistant_text", "{}".into()))
+            .collect();
+        events.push(record(lost, 601, "tool_use", bash("cd sub")));
+        graph.store_chat_events(lost, events).await.unwrap();
+        assert_eq!(
+            graph.get_chat_session_shell_moved(lost).await.unwrap(),
+            Some(false)
+        );
+        assert!(resumed(lost).await, "the move is in the events");
+        assert!(!fresh(lost).await, "an opening starts at home");
+
+        // A stored tool call that cannot be read back: moved.
+        let garbled = Uuid::new_v4();
+        graph.create_chat_session(&session(garbled)).await.unwrap();
+        graph
+            .store_chat_events(garbled, vec![record(garbled, 1, "tool_use", "{".into())])
+            .await
+            .unwrap();
+        assert!(resumed(garbled).await);
+
+        // No flag at all (recorded before it existed): moved, once.
+        let old = Uuid::new_v4();
+        graph.chat_sessions.write().await.insert(old, session(old));
+        assert!(resumed(old).await);
+    }
+
+    /// Review of #716, S2: the agent engine too. A native session of alice runs `cd sub`
+    /// (asked, approved once); it is closed and resumed; `cat README.md`, approved for good
+    /// in the project, is asked again in the resumed session instead of being answered by
+    /// the rule. Red when the resume of the agent engine builds its grants as an opening.
+    #[tokio::test]
+    async fn a_native_session_resumed_after_a_cd_is_asked_again_for_a_command_approved_for_good() {
+        let bash = |key: &str, id: &str, command: &str| {
+            calls(key, id, "mcp__nexus__Bash", json!({ "command": command }))
+        };
+        let mut routes = vec![
+            bash("RESUMED-AFTER", "r2", "cat README.md"),
+            says("RESUMED-AFTER", "done after"),
+            bash("BEFORE-RESUME", "r1", "cd sub"),
+            says("BEFORE-RESUME", "done before"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("README.md"), "readme").unwrap();
+        std::fs::create_dir(cwd.path().join("sub")).unwrap();
+        project_at(&graph, cwd.path()).await;
+        let rules = tempfile::tempdir().unwrap();
+        let manager = {
+            let mut m = native_manager(graph.clone()).await;
+            m.config.lasting_rules_dir = Some(rules.path().join("rules"));
+            m
+        };
+        // `cat README.md` approved for good by alice in this project.
+        let place = manager
+            .lasting_scope(
+                Some("alice"),
+                Some("proj"),
+                &cwd.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        let call = crate::chat::session_grants::AskedCall {
+            asker: crate::chat::session_grants::Asker::Native,
+            tool: "mcp__nexus__Bash".into(),
+            canonical: Some("Bash".into()),
+            input: json!({"command": "cat README.md"}),
+        };
+        let grant = crate::chat::session_grants::lasting_grant_for(&call).unwrap();
+        place.keep(&call, &grant, "seed").unwrap();
+
+        let sid = open_as(&manager, cwd.path(), "alice").await;
+        manager.send_message(&sid, "BEFORE-RESUME").await.unwrap();
+        let cd = asked(&graph, &sid, "cd sub", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the cd");
+        manager
+            .route_permission_response(&sid, &cd, true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "BEFORE-RESUME").await, "the cd ran");
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(handle.shell_moved());
+        manager.close_session(&sid).await.unwrap();
+
+        manager
+            .resume_session(&sid, "RESUMED-AFTER", Some(&person("alice")))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        assert!(handle.shell_moved(), "the resumed session starts moved");
+        let again = asked(&graph, &sid, "cat README.md", Duration::from_secs(10))
+            .await
+            .expect("nexus asks the command");
+        let seen = decisions(&graph, &sid, 2).await;
+        assert!(
+            seen.iter().all(|(scope, _)| scope != &json!("always")),
+            "no lasting rule answered in the resumed session: {seen:?}"
+        );
+        manager
+            .route_permission_response(&sid, &again, true, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        assert!(ran(&fake, "RESUMED-AFTER").await);
+        manager.close_session(&sid).await.unwrap();
+    }
+
     // ---------------------------------------------------------------- native
 
     fn calls(key: &str, id: &str, tool: &str, arguments: Value) -> Value {

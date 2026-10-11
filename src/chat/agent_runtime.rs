@@ -1414,6 +1414,15 @@ impl AgentSessionHandle {
             .add(grant);
     }
 
+    /// Whether this session's shell may have left its project root
+    /// (`SessionGrants::shell_moved`).
+    pub fn shell_moved(&self) -> bool {
+        self.session_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shell_moved()
+    }
+
     /// The capabilities this session offers: its provider's, `always` being the BACKEND's
     /// (P11b) whatever the provider declares: offered only when this session keeps
     /// lasting rules (a store, an owner, a project) for an engine that can

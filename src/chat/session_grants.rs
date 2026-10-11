@@ -846,6 +846,27 @@ pub fn observed_call(asker: Asker, event: &crate::chat::types::ChatEvent) -> Opt
     }
 }
 
+/// Whether these past events of a session, in order, may have moved its shell: the
+/// predicate of [`SessionGrants::observe_tool_use`] replayed over them (a `tool_use`,
+/// or its resolved input). What a resume decides from when the session's stored flag
+/// says the shell never moved: the events are the record of what the shell ran, so a
+/// lost write of that flag cannot hide a move.
+pub fn history_moved_the_shell<'a>(
+    asker: Asker,
+    events: impl IntoIterator<Item = &'a crate::chat::types::ChatEvent>,
+) -> bool {
+    let mut grants = SessionGrants::default();
+    for event in events {
+        if let Some(call) = observed_call(asker, event) {
+            grants.observe_tool_use(&call);
+            if grants.shell_moved {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// A permission request a grant covers, as answered by the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cover {
@@ -2630,5 +2651,38 @@ mod tests {
         assert!(resumed.shell_moved());
         assert!(resumed.cwd_bound(&bash("cat README.md")));
         assert!(!SessionGrants::default().cwd_bound(&bash("cat README.md")));
+    }
+
+    /// Review of #716, S1: the replay of a session's events finds the move whatever became
+    /// of the stored flag; plain read-only commands, an input not complete yet and other
+    /// events do not count.
+    #[test]
+    fn the_events_of_a_session_tell_whether_its_shell_may_have_moved() {
+        use crate::chat::types::ChatEvent;
+        let tool_use = |tool: &str, input: Value| ChatEvent::ToolUse {
+            id: "t".into(),
+            tool: tool.into(),
+            input,
+            parent_tool_use_id: None,
+            category: None,
+            canonical: None,
+        };
+        let quiet = vec![
+            tool_use("Bash", json!({})),
+            tool_use("Bash", json!({"command": "ls"})),
+            tool_use("Read", json!({"file_path": "/x"})),
+            tool_use("mcp__nexus__Bash", json!({"command": "cat README.md"})),
+        ];
+        assert!(!history_moved_the_shell(Asker::ClaudeCode, &quiet));
+        assert!(!history_moved_the_shell(Asker::Native, &quiet));
+        let mut moved = quiet.clone();
+        moved.push(ChatEvent::ToolUseInputResolved {
+            id: "t".into(),
+            input: json!({"command": "cd sub"}),
+            parent_tool_use_id: None,
+        });
+        assert!(history_moved_the_shell(Asker::ClaudeCode, &moved));
+        let native = vec![tool_use("mcp__nexus__Bash", json!({"command": "cd sub"}))];
+        assert!(history_moved_the_shell(Asker::Native, &native));
     }
 }
