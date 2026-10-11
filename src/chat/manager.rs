@@ -14712,6 +14712,13 @@ impl ChatManager {
                             session_id,
                             cwd: &spec.cwd,
                             extra_dirs: &spec.extra_dirs,
+                            // Trust (rock'n roll): the file scope anchors paths but no
+                            // longer confines them — worktrees made by another harness
+                            // stay reachable. Known limit: the flag is read at launch;
+                            // a mid-conversation switch to trust takes effect at the
+                            // next session build (resume), not on the live process.
+                            unscoped: spec.policy.mode
+                                == nexus_claude::agent::PolicyMode::Trust,
                             policy: &spec.policy,
                             ceiling: spec.policy_ceiling.as_ref(),
                             project: project_slug.as_deref(),

@@ -562,6 +562,10 @@ pub struct AttachInput<'a> {
     pub cwd: &'a Path,
     /// Extra directories of the file scope.
     pub extra_dirs: &'a [PathBuf],
+    /// Trust mode (`bypassPermissions`): the directories anchor relative paths but are
+    /// not enforced (`--unscoped`), so the session reaches worktrees created by another
+    /// harness. Never set for any other mode.
+    pub unscoped: bool,
     /// The session's neutral tool policy.
     pub policy: &'a ToolPolicy,
     /// The ceiling of its mode, when it has one.
@@ -710,6 +714,9 @@ pub async fn attach(
         args.push("--add-dir".to_owned());
         args.push(dir.display().to_string());
     }
+    if input.unscoped {
+        args.push("--unscoped".to_owned());
+    }
     args.push("--tools".to_owned());
     args.push(tools.join(","));
     args.extend(engine_args);
@@ -851,6 +858,7 @@ mod tests {
             session_id: session,
             cwd: Path::new("/work/app"),
             extra_dirs: &[],
+            unscoped: false,
             policy,
             ceiling: None,
             project,
@@ -1282,6 +1290,10 @@ mod tests {
             "a signed profile, not trust"
         );
         assert!(!args.contains(&"--unrestricted".to_owned()));
+        assert!(
+            !args.contains(&"--unscoped".to_owned()),
+            "an ask session keeps its file scope"
+        );
         let (key, token) = (&env["NEXUS_TOOLS_KEY"], &env["NEXUS_TOOLS_PROFILE"]);
         assert!(key.len() >= 32 && token.starts_with("v1."));
         for arg in &args {
@@ -1303,6 +1315,26 @@ mod tests {
         assert!(!printed.contains(token.as_str()) && !printed.contains(key.as_str()));
         crate::auth::agent_tokens::revoke_session("att-s1");
         assert!(!crate::auth::agent_tokens::tools_live("att-s1"));
+    }
+
+    /// Trust mode (rock'n roll): the launch carries `--unscoped`, so the session's file
+    /// tools may follow worktrees created by another harness outside its directories.
+    #[tokio::test]
+    async fn attach_in_trust_mode_launches_the_server_unscoped() {
+        let graph = Arc::new(MockGraphStore::new());
+        let consents = GraphConsents(graph);
+        let policy =
+            ToolPolicy::from_patterns(PolicyMode::Trust, &["Read", "Edit"], &[] as &[&str])
+                .unwrap();
+        let mut trusted = input("att-trust", &policy, Some("proj"));
+        trusted.unscoped = true;
+        let attachment = attach(&config(), &consents, None, trusted).await;
+        let (_, args, _) = stdio(&attachment, "nexus");
+        assert!(
+            args.contains(&"--unscoped".to_owned()),
+            "trust mode lifts the file scope: {args:?}"
+        );
+        crate::auth::agent_tokens::revoke_session("att-trust");
     }
 
     /// WebFetch is offered only to a project that consented to some origin: without one every
