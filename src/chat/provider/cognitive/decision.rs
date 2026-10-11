@@ -195,4 +195,11 @@ impl DecideRequest {
 pub trait Decider: Send + Sync {
     /// Decides, persists, returns.
     async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision>;
+
+    /// The decision `decide` would take, NOT persisted: what an opening that is refused
+    /// before it routes (Auto on a locked vault) offers instead, without leaving a decision
+    /// no session will ever close. The default decides (a test fake has no store).
+    async fn preview(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+        self.decide(request).await
+    }
 }

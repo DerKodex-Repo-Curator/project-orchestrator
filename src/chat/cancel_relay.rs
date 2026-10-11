@@ -256,6 +256,7 @@ impl CancelRelayError {
             action: None,
             retryable,
             retry_after_ms: None,
+            fallbacks: None,
         }
     }
 }

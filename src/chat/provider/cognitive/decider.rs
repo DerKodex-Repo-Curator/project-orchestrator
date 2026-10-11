@@ -298,15 +298,25 @@ impl CognitiveDecider {
 #[async_trait]
 impl Decider for CognitiveDecider {
     async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+        let decision = self.preview(request).await?;
+        // Persisted before it is returned, applied or not.
+        self.store.put_decision(&decision).await?;
+        Ok(decision)
+    }
+
+    async fn preview(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
         let arms = self
             .store
             .arms_of_class(&request.signature.arm_key())
             .await?;
         let hints = self.hints.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let decision = decide_with(Uuid::new_v4(), Utc::now(), request, &arms, &hints);
-        // Persisted before it is returned, applied or not.
-        self.store.put_decision(&decision).await?;
-        Ok(decision)
+        Ok(decide_with(
+            Uuid::new_v4(),
+            Utc::now(),
+            request,
+            &arms,
+            &hints,
+        ))
     }
 }
 
@@ -720,6 +730,43 @@ mod tests {
         let store = Arc::new(InMemoryRoutingStore::new());
         let decider = CognitiveDecider::new(store.clone());
         (decider.decide(request).await.unwrap(), store)
+    }
+
+    #[tokio::test]
+    async fn a_preview_decides_like_decide_and_stores_nothing() {
+        use crate::chat::provider::cognitive::store::DecisionFilter;
+        let req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        let store = Arc::new(InMemoryRoutingStore::new());
+        let decider = CognitiveDecider::new(store.clone());
+        let preview = decider.preview(&req).await.unwrap();
+        assert!(store
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
+        let decided = decider.decide(&req).await.unwrap();
+        // The draw is seeded by the decision id: the pick may differ, never what is
+        // eligible nor whether it applies.
+        let eligible = |d: &CognitiveDecision| {
+            let mut v: Vec<_> = d
+                .alternatives
+                .iter()
+                .map(|a| (a.pick.clone(), a.rejected.is_none()))
+                .collect();
+            v.sort_by(|a, b| (&a.0.provider_id, &a.0.model).cmp(&(&b.0.provider_id, &b.0.model)));
+            v
+        };
+        assert_eq!(eligible(&preview), eligible(&decided));
+        assert_eq!(preview.applied, decided.applied);
+        assert!(preview.chosen.is_some());
+        assert_eq!(
+            store
+                .decisions(&DecisionFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
