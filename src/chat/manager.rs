@@ -855,6 +855,9 @@ pub struct ChatManager {
     /// Open cognitive decisions of live chat sessions (session id -> decision id),
     /// closed with what happened when the session is closed.
     pub(crate) open_decisions: std::sync::Mutex<std::collections::HashMap<String, Uuid>>,
+    /// Whether the Claude Code CLI is on this server (B2): what the resolver knows of the
+    /// built-in instance's health. See [`super::cli_version::ClaudeCliProbe`].
+    claude_cli: super::cli_version::ClaudeCliProbe,
     /// Native providers built for stored instances, by instance id; an entry is
     /// reused while the stored record is unchanged.
     pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
@@ -2622,6 +2625,19 @@ pub(crate) fn host_degraded(
     missing
 }
 
+/// The warning the server logs when a Claude Code session runs on the agent engine and
+/// lacks something (`degraded`, what its `system_init` announces): `None` for another
+/// provider, and `None` when nothing is missing — the old warning listed nothing and
+/// still said "these features are NOT available" (M2, gap D1 of M0).
+pub(crate) fn forced_engine_warning(provider_id: &str, degraded: &[String]) -> Option<String> {
+    (provider_id == super::provider::resolver::CLAUDE_CODE && !degraded.is_empty()).then(|| {
+        format!(
+            "Claude Code is running on the agent engine without: {}",
+            degraded.join(", ")
+        )
+    })
+}
+
 /// Whether `spec` carries the project-orchestrator server WITHOUT a session token while
 /// the server signs its tokens (`signing`): that server shows its tools and authorises
 /// none ([`spec_tool_profile`]). A session opened without its caller's identity (the
@@ -3125,6 +3141,7 @@ impl ChatManager {
             provider_source,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            claude_cli: super::cli_version::ClaudeCliProbe::default(),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
@@ -3215,6 +3232,7 @@ impl ChatManager {
             provider_source,
             cognitive_routing: None,
             open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            claude_cli: super::cli_version::ClaudeCliProbe::default(),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
@@ -3909,7 +3927,37 @@ impl ChatManager {
 
     /// Update the explicit Claude CLI binary path.
     pub async fn update_claude_cli_path(&self, path: Option<String>) {
+        super::cli_version::set_configured_cli_path(path.clone());
         self.env_config.write().await.claude_cli_path = path;
+        self.claude_cli.forget();
+    }
+
+    /// Looks for the Claude Code CLI on the machine before a default chat is routed to it
+    /// (B2): without it, the built-in instance is unhealthy for the resolver. What the
+    /// server runs with; a manager built without it assumes the CLI is there.
+    pub fn detecting_claude_cli(mut self) -> Self {
+        self.claude_cli = super::cli_version::ClaudeCliProbe::detecting();
+        self
+    }
+
+    /// A fixed answer to "is the Claude Code CLI on this server?": tests that must not
+    /// depend on the machine they run on (CI has no `claude`).
+    #[cfg(test)]
+    pub(crate) fn with_claude_cli_present(mut self, present: bool) -> Self {
+        self.claude_cli = super::cli_version::ClaudeCliProbe::Fixed(present);
+        self
+    }
+
+    /// Whether the built-in Claude Code instance can open a session here: its CLI is on
+    /// the server (the configured path, else the usual places). Cached for a minute.
+    pub async fn claude_code_usable(&self) -> bool {
+        let configured = self.env_config.read().await.claude_cli_path.clone();
+        self.claude_cli.present(configured.as_deref())
+    }
+
+    /// The CLI was just installed or upgraded: look for it again at the next opening.
+    pub fn forget_claude_cli_detection(&self) {
+        self.claude_cli.forget();
     }
 
     /// Update the auto-update CLI toggle.
@@ -6293,6 +6341,27 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
+        let mut opened_on: Option<String> = None;
+        let result = self
+            .create_session_resolved(request, relay, session_id, &mut opened_on)
+            .await;
+        // A failure once the provider is resolved names THAT provider (B6), not the one the
+        // HTTP layer would assume.
+        result.map_err(|e| match opened_on {
+            Some(provider_id) => super::provider::errors::on_provider(&provider_id, e),
+            None => e,
+        })
+    }
+
+    /// [`Self::create_session_in_place`]; `opened_on` receives the provider as soon as it
+    /// is resolved.
+    async fn create_session_resolved(
+        &self,
+        request: &ChatRequest,
+        relay: Option<&super::relay::RelayedFrom>,
+        session_id: Uuid,
+        opened_on: &mut Option<String>,
+    ) -> Result<CreateSessionResponse> {
         // Who the session belongs to, settled before anything is opened: a refusal (no owner
         // can be named for a delegated session) leaves nothing behind.
         let owner = match self.session_owner(request.user_claims.as_ref()).await? {
@@ -6358,6 +6427,7 @@ impl ChatManager {
         let provider_choice = self
             .resolve_provider_choice_for(request, project_slug.as_deref(), Some(session_id))
             .await?;
+        *opened_on = Some(provider_choice.provider_id.clone());
         // A conversation routed among its pool opens on the model PO chose among it; the
         // pilot the menu names is only the fallback when no decision applied (R-S4).
         let decided_among_pool = request.routes_among_pool()
@@ -6605,9 +6675,10 @@ impl ChatManager {
 
         // The provider-neutral path takes over here: the session is persisted
         // and the system prompt built; what follows is the Claude CLI engine.
-        // Hybrid routing: Claude Code stays on the historical engine (hooks,
-        // queue, retry, compaction, NATS, images) unless the operator FORCES it
-        // onto the agent engine; every other provider is served by the agent engine.
+        // Hybrid routing: every provider but Claude Code is served by the agent engine;
+        // Claude Code stays on the historical engine unless `CHAT_PROVIDER_PATH=agent`
+        // (`engine_is_agent`). The agent engine ports hooks, queue, auto-continue,
+        // retry, compaction and NATS: what a session lacks is in its `system_init`.
         if self.engine_is_agent(&provider_choice.provider_id) {
             return self
                 .open_agent_session(AgentOpen {
@@ -10881,6 +10952,27 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         from: ResumeFrom,
     ) -> Result<()> {
+        let mut opened_on: Option<String> = None;
+        let result = self
+            .resume_session_on(session_id, message, user_claims, from, &mut opened_on)
+            .await;
+        // A failure once the session is read names ITS provider (B6).
+        result.map_err(|e| match opened_on {
+            Some(provider_id) => super::provider::errors::on_provider(&provider_id, e),
+            None => e,
+        })
+    }
+
+    /// [`Self::resume_session_from`]; `opened_on` receives the session's provider as soon
+    /// as the session is read.
+    async fn resume_session_on(
+        &self,
+        session_id: &str,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        from: ResumeFrom,
+        opened_on: &mut Option<String>,
+    ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
         let seen = from.0;
 
@@ -10891,6 +10983,13 @@ impl ChatManager {
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
+        *opened_on = Some(
+            session_node
+                .provider_id
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string()),
+        );
         self.ready_for_resume(&mut session_node).await?;
 
         // A session opened by the agent engine carries its capability snapshot:
@@ -13168,15 +13267,13 @@ impl ChatManager {
             || self.config.provider_path == super::config::ProviderPath::Agent
     }
 
-    /// The visible warning when Claude Code is FORCED onto the agent engine
-    /// (`CHAT_PROVIDER_PATH=agent`): the server logs what that session loses.
-    fn warn_if_forced(&self, provider_id: &str, session: &dyn nexus_claude::agent::AgentSession) {
-        if provider_id == super::provider::resolver::CLAUDE_CODE {
-            warn!(
-                features = ?super::agent_runtime::degraded_features(session.capabilities()),
-                "Claude Code is running on the AGENT engine (CHAT_PROVIDER_PATH=agent): \
-                 these features are NOT available for this session"
-            );
+    /// The server's warning when a Claude Code session on the agent engine lacks
+    /// something (`degraded`: the full list its `system_init` announces). Silent when it
+    /// lacks nothing: the engine ports hooks, queue, auto-continue, retry, compaction and
+    /// NATS, so a local Claude Code loses none of them ([`forced_engine_warning`]).
+    fn warn_if_forced(&self, provider_id: &str, degraded: &[String]) {
+        if let Some(message) = forced_engine_warning(provider_id, degraded) {
+            warn!(features = ?degraded, "{message}");
         }
     }
 
@@ -13232,10 +13329,9 @@ impl ChatManager {
     ) -> Result<super::provider::resolver::ProviderChoice> {
         use super::provider::{catalog, resolver, settings, store};
         let instances = store::instances(self.graph.as_ref()).await?;
-        let consents = match project_slug {
-            Some(slug) => store::consents(self.graph.as_ref(), slug).await?,
-            None => Vec::new(),
-        };
+        // The project's consents, or outside any project those given for the sessions
+        // without one (B3).
+        let consents = store::consents_for(self.graph.as_ref(), project_slug).await?;
         let global = store::roles(self.graph.as_ref(), settings::GLOBAL).await?;
         let project = match project_slug {
             Some(slug) => store::roles(self.graph.as_ref(), &settings::project_scope(slug)).await?,
@@ -13248,8 +13344,11 @@ impl ChatManager {
             resolver::Role::Pilot
         };
         let routing_instances = self.cognitive_routing.as_ref().map(|_| instances.clone());
-        let store_catalog =
-            catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
+        // Without its CLI on the server, the built-in instance is not a default (B2): a chat
+        // that names nothing goes to the only other usable instance, never to a 424. One
+        // that names claude-code still gets the typed 424 `cli_not_found` (install action).
+        let store_catalog = catalog::StoreCatalog::new(instances, &consents)
+            .with_claude_cli(self.claude_code_usable().await);
         let policy: settings::ModelPolicy = self
             .graph
             .get_llm_setting(settings::GLOBAL, settings::POLICY_KEY)
@@ -13391,9 +13490,10 @@ impl ChatManager {
                 input.project_rule = declared_project_rule;
                 input.request = pool_fallback.flatten();
                 auto_pick = None;
-                resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?
+                resolver::resolve(&input, &store_catalog)
+                    .map_err(|e| anyhow::Error::new(e.in_scope(project_slug)))?
             }
-            Err(refused) => return Err(anyhow::Error::new(refused)),
+            Err(refused) => return Err(anyhow::Error::new(refused.in_scope(project_slug))),
         };
         choice.decision_id = cognitive.as_ref().map(|d| d.id);
         if let Some(p) = &pick {
@@ -13467,14 +13567,10 @@ impl ChatManager {
         let Ok(instances) = store::instances(self.graph.as_ref()).await else {
             return Vec::new();
         };
-        let consents = match project_slug {
-            Some(slug) => store::consents(self.graph.as_ref(), slug)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let store_catalog =
-            catalog::StoreCatalog::new(instances.clone(), &consents, project_slug.is_some());
+        let consents = store::consents_for(self.graph.as_ref(), project_slug)
+            .await
+            .unwrap_or_default();
+        let store_catalog = catalog::StoreCatalog::new(instances.clone(), &consents);
         self.routing_pool(routing, &instances, &store_catalog, scope)
             .await
     }
@@ -14283,17 +14379,18 @@ impl ChatManager {
         let record = store::instance(self.graph.as_ref(), provider_id)
             .await?
             .ok_or_else(|| refuse(resolver::ResolveError::UnknownProvider(provider_id.into())))?;
-        let slug = project_slug
-            .ok_or_else(|| refuse(resolver::ResolveError::NotAllowed(provider_id.into())))?;
-        let consented = store::consents(self.graph.as_ref(), slug)
+        // The project's consent, or outside any project the one given for the sessions
+        // without one (B3) — never the other scope's.
+        let consented = store::consents_for(self.graph.as_ref(), project_slug)
             .await?
             .iter()
             .any(|c| super::provider::settings::consent_holds(c, &record));
         if !consented {
-            return Err(refuse(resolver::ResolveError::NotAllowed(
-                provider_id.into(),
-            )));
+            return Err(refuse(
+                resolver::ResolveError::NotAllowed(provider_id.into()).in_scope(project_slug),
+            ));
         }
+        let slug = project_slug;
         // A codex / acp instance is a local process: there is no endpoint to guard.
         let guard = if super::provider::settings::is_process_kind(&record.kind) {
             Ok(())
@@ -14311,7 +14408,7 @@ impl ChatManager {
                 code = refusal.code(),
                 "endpoint refused by the guard"
             );
-            return Err(refuse(resolver::ResolveError::NotAllowed(
+            return Err(refuse(resolver::ResolveError::EndpointRefused(
                 provider_id.into(),
             )));
         }
@@ -14972,13 +15069,26 @@ impl ChatManager {
         session: Arc<dyn nexus_claude::agent::AgentSession>,
         first_seq: i64,
         tool_policy: serde_json::Value,
-        host_missing: Vec<String>,
+        mut host_missing: Vec<String>,
         without_mcp: bool,
         project_dir: Option<std::path::PathBuf>,
         lasting: Option<super::lasting_rules::LastingScope>,
         resumed: bool,
     ) {
-        self.warn_if_forced(provider_id, session.as_ref());
+        // What the provider's kind tells beyond its capabilities (an unknown window on
+        // the native harness, no sub-agents and no fallback).
+        for feature in super::agent_runtime::kind_degraded(kind, session.capabilities()) {
+            if !host_missing.contains(&feature) {
+                host_missing.push(feature);
+            }
+        }
+        let mut announced = super::agent_runtime::degraded_features(session.capabilities());
+        for feature in &host_missing {
+            if !announced.contains(feature) {
+                announced.push(feature.clone());
+            }
+        }
+        self.warn_if_forced(provider_id, &announced);
         if let Some(router) = self.turn_routing.get(session_id) {
             router.set_model_live(session.capabilities().set_model_live);
         }
@@ -22099,7 +22209,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
             .with_provider_source(Arc::new(fake.clone()));
         // The Claude CLI is not there in tests: the call may fail, but it must
-        // NOT have gone through the agent engine (which has no hooks, queue, retry...).
+        // NOT have gone through the agent engine: the default keeps Claude Code legacy.
         let _ = manager.create_session(&agent_request("hello")).await;
         assert_eq!(manager.agent_runtime.len().await, 0);
         assert!(
@@ -22206,6 +22316,81 @@ mod tests {
         assert!(
             degraded.iter().any(|d| d == "images") && degraded.iter().any(|d| d == "compaction")
         );
+    }
+
+    /// M2, gaps D2 and D3 of M0: what the provider's KIND tells beyond its capabilities
+    /// reaches the `system_init`, not only a line in the server's log.
+    #[tokio::test]
+    async fn the_agent_system_init_says_compaction_and_subagents_where_nothing_provides_them() {
+        use nexus_claude::agent::{
+            ContextWindow, ContextWindowSource, ProviderKind, SubagentSupport,
+        };
+        let listed = |wire: &serde_json::Value, feature: &str| {
+            serde_json::from_value::<Vec<String>>(wire["degraded_features"].clone())
+                .unwrap_or_default()
+                .iter()
+                .any(|d| d == feature)
+        };
+        // A native model whose window nobody knows: it claims a compaction signal, and the
+        // harness never compacts (no window to compact against).
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = ProviderKind::Native;
+        fake.caps.lock().unwrap().compaction_signal = true;
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(listed(&wire, "compaction"), "{wire}");
+        assert!(
+            !listed(&wire, "subagents"),
+            "the host runs them as child sessions: {wire}"
+        );
+        // ...the same model with a known window compacts: nothing announced.
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = ProviderKind::Native;
+        {
+            let mut caps = fake.caps.lock().unwrap();
+            caps.compaction_signal = true;
+            caps.context_window = Some(ContextWindow {
+                value: 128_000,
+                source: ContextWindowSource::Probed,
+            });
+        }
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(!listed(&wire, "compaction"), "{wire}");
+        // An ACP agent: no sub-agents of its own, and no fallback for it.
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = ProviderKind::Acp;
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(listed(&wire, "subagents"), "{wire}");
+        // Claude Code reports its own (nested): nothing announced.
+        let (manager, _graph, fake) = agent_manager();
+        {
+            let mut caps = fake.caps.lock().unwrap();
+            caps.subagents = SubagentSupport::Nested;
+            caps.compaction_signal = true;
+        }
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(
+            !listed(&wire, "subagents") && !listed(&wire, "compaction"),
+            "{wire}"
+        );
+    }
+
+    /// M2, gap D1 of M0: the warning of a Claude Code session on the agent engine names
+    /// what it lacks, and is not logged when it lacks nothing.
+    #[test]
+    fn the_engine_warning_is_silent_when_a_claude_code_session_lacks_nothing() {
+        assert_eq!(
+            forced_engine_warning(crate::chat::provider::resolver::CLAUDE_CODE, &[]),
+            None
+        );
+        let warning = forced_engine_warning(
+            crate::chat::provider::resolver::CLAUDE_CODE,
+            &["hooks".to_string()],
+        )
+        .expect("something is missing");
+        assert!(warning.contains("hooks"), "{warning}");
+        // Another provider is always on the agent engine: no warning of its own.
+        assert_eq!(forced_engine_warning("local", &["hooks".to_string()]), None);
     }
 
     #[test]

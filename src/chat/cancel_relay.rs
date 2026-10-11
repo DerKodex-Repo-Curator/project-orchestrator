@@ -257,6 +257,8 @@ impl CancelRelayError {
             retryable,
             retry_after_ms: None,
             fallbacks: None,
+            consent_scope: None,
+            candidates: None,
         }
     }
 }

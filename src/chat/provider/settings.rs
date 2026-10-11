@@ -17,8 +17,13 @@ use super::resolver::CLAUDE_CODE;
 pub const GLOBAL: &str = "global";
 /// Key prefix of instance documents.
 pub const INSTANCE_PREFIX: &str = "instance:";
-/// Key prefix of consent documents (scope `project:<slug>`).
+/// Key prefix of consent documents (scope `project:<slug>`, or [`NO_PROJECT_SCOPE`]).
 pub const CONSENT_PREFIX: &str = "consent:";
+/// Scope of the consents that hold for the sessions outside any project (B3): given by a
+/// person through `PUT /api/chat/llm-consents/{provider_id}`, bound to the instance's origin
+/// and credential reference exactly like a project's consent (A28). A project never inherits
+/// them: a project consents for itself.
+pub const NO_PROJECT_SCOPE: &str = "no_project";
 /// Key of the role assignment document.
 pub const ROLES_KEY: &str = "roles";
 /// Key of the alias table.
@@ -29,6 +34,14 @@ pub const POLICY_KEY: &str = "model_policy";
 /// Scope of a project's documents.
 pub fn project_scope(slug: &str) -> String {
     format!("project:{slug}")
+}
+
+/// Scope of the consents that apply to a session: its project's, or the no-project scope.
+pub fn consent_scope(project_slug: Option<&str>) -> String {
+    match project_slug {
+        Some(slug) => project_scope(slug),
+        None => NO_PROJECT_SCOPE.to_string(),
+    }
 }
 
 /// Why a body was refused. Messages never echo a value the caller sent.

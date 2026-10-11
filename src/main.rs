@@ -231,6 +231,10 @@ fn run_setup_claude(config: &Config, port: u16) {
                 println!("  No changes made.");
             }
         }
+        // Only the boot skips (this command always configures, as asked).
+        Ok(setup_claude::SetupResult::SkippedCliAbsent) => {
+            println!("  Claude Code is not installed: nothing was configured.");
+        }
         Err(e) => {
             eprintln!("  Failed to configure Claude Code: {}", e);
             eprintln!();

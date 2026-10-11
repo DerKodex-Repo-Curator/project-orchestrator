@@ -1,7 +1,7 @@
 # Provider errors and codes
 
 Two shapes. A refused **opening** (create or resume a session) answers its own status with
-`{ "error", "code", "provider_id"?, "action"?, "retryable", "retry_after_ms"? }`. The settings routes
+`{ "error", "code", "provider_id"?, "action"?, "retryable", "retry_after_ms"?, "fallbacks"?, "consent_scope"?, "candidates"? }`. The settings routes
 answer `{ "error": "<code>: <message>" }` or a bare message. No message ever carries a path, a URL,
 an identifier or a secret.
 
@@ -26,10 +26,11 @@ an identifier or a secret.
 | 410 | `closed` | The session is closed. |
 | 404 | `provider_unknown` | No such instance. |
 | 409 | `provider_conflict` | A session never changes provider. |
-| 403 | `endpoint_not_allowed` | The project has not consented to this origin and credential, or the endpoint guard refused it. |
+| 403 | `endpoint_not_allowed` | No consent holds for this origin and credential here, or the endpoint guard refused it (then no `consent_scope`: change the URL, no consent helps). `consent_scope` says which consent is missing: `project` (a person allows it for the project: `PUT /api/projects/{slug}/llm-consents/{provider_id}` with `{origin}`) or `no_project` (a chat outside any project: `PUT /api/chat/llm-consents/{provider_id}` with `{origin}`, root account only). A project never inherits the no-project consent. |
 | 503 | `provider_unavailable` | The instance cannot open sessions now. |
 | 409 | `engine_unavailable` | The session was opened on the agent engine, now switched off (`CHAT_PROVIDER_PATH`). |
-| 409 | `no_provider` | Nothing usable is configured. |
+| 409 | `no_provider` | Nothing usable: no role or request names a provider, the Claude Code CLI is not on the server, and no other instance is allowed here. Install the CLI or configure (and allow) a provider. |
+| 409 | `provider_not_chosen` | Nothing names a provider, the Claude Code CLI is not on the server, and several instances are usable here: `candidates` lists them. Name one in the request, or set the pilot role (`PUT /api/chat/roles {"pilot":{"provider":"<id>"}}`). |
 | 502 | `provider_error` | The provider failed in a way this server version does not recognise (a provider newer than the backend). Show a generic failure with the status; retrying may help; report it with the provider id if it persists. |
 
 ## Settings routes (not in the typed table)
@@ -39,6 +40,7 @@ an identifier or a secret.
 | 409 | `security_gate_closed` | Creating a third-party instance needs authentication on. |
 | 409 | `origin_mismatch` | The origin you consented to is no longer the instance's. |
 | 403 | `provider settings can only be changed by a signed-in user` | An agent token tried a human-only route. |
+| 403 | `root_required` | A signed-in person other than the root account tried a server-wide routing setting: the global pilot role (`PUT /api/chat/roles`) or the consent for the chats outside any project (`PUT`/`DELETE /api/chat/llm-consents[/{provider_id}]`). |
 | 403 | `tool_not_in_profile` | The route is behind a tool the restricted profile withholds. |
 | 403 | `envelope_*` | A delegated session left its envelope (`unbound_token`, `parent_not_found`, `depth_exceeded`, `too_many_children`, `cwd_outside_parent`, `add_dir_outside_parent`, `project_mismatch`, `workspace_mismatch`, `not_a_child`). |
 | 400 | `credential_ref ...` | A malformed reference, a pasted secret, or an undeclared `env:` variable. |

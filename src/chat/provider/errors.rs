@@ -38,6 +38,51 @@ pub struct OpenFailure {
     /// named instance's locked credential by the field's presence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallbacks: Option<Vec<FallbackModel>>,
+    /// `endpoint_not_allowed` only: where the consent is missing, so the client knows
+    /// which consent a person gives — `project` (`PUT /api/projects/{slug}/llm-consents/
+    /// {provider_id}`) or `no_project` (`PUT /api/chat/llm-consents/{provider_id}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consent_scope: Option<&'static str>,
+    /// `provider_not_chosen` only: the instances the request (or the pilot role) can name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<String>>,
+}
+
+/// An error raised while opening (or resuming) a session ON a known provider instance:
+/// the HTTP layer reports THAT instance, never the one it would assume (B6: a locked vault
+/// or a missing executable of a third-party instance was shown as Claude Code's). Displays
+/// as the error it carries, whose causes stay in the chain.
+#[derive(Debug)]
+pub struct OnProvider {
+    /// The instance the opening was on.
+    pub provider_id: String,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for OnProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for OnProvider {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(AsRef::<dyn std::error::Error + Send + Sync>::as_ref(
+            &self.source,
+        ))
+    }
+}
+
+/// Tags `err` with the instance it was raised on. An error already tagged keeps its tag
+/// (the innermost opening knows best).
+pub fn on_provider(provider_id: &str, err: anyhow::Error) -> anyhow::Error {
+    if err.chain().any(|c| c.is::<OnProvider>()) {
+        return err;
+    }
+    anyhow::Error::new(OnProvider {
+        provider_id: provider_id.to_string(),
+        source: err,
+    })
 }
 
 /// A model offered instead when Auto cannot route with the vault locked.
@@ -97,6 +142,18 @@ impl OpenFailure {
             body.insert(
                 "fallbacks".to_string(),
                 serde_json::to_value(fallbacks).unwrap_or_default(),
+            );
+        }
+        if let Some(scope) = self.consent_scope {
+            body.insert(
+                "consent_scope".to_string(),
+                serde_json::Value::String(scope.to_string()),
+            );
+        }
+        if let Some(candidates) = &self.candidates {
+            body.insert(
+                "candidates".to_string(),
+                serde_json::to_value(candidates).unwrap_or_default(),
             );
         }
         serde_json::Value::Object(body)
@@ -234,6 +291,8 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
         retryable: err.retryable(),
         retry_after_ms,
         fallbacks: None,
+        consent_scope: None,
+        candidates: None,
     }
 }
 
@@ -267,6 +326,13 @@ pub fn sdk_open_error(context: &str, err: nexus_claude::SdkError) -> anyhow::Err
 /// `resume_session`, when the error chain carries a typed cause. `None` means
 /// "not an opening failure we can name" — the caller answers 500.
 pub fn classify_open_error(err: &anyhow::Error, provider_id: Option<&str>) -> Option<OpenFailure> {
+    // The instance the error was raised on, when the opening knew it, wins over the
+    // caller's guess (B6).
+    let tagged = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<OnProvider>())
+        .map(|tag| tag.provider_id.as_str());
+    let provider_id = tagged.or(provider_id);
     err.chain().find_map(|cause| {
         if let Some(locked) = cause.downcast_ref::<AutoVaultLocked>() {
             let mut failure = open_failure(&ProviderError::CredentialsLocked, None);
@@ -297,7 +363,26 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
         ),
         ResolveError::NotAllowed(id) => (
             403,
-            "This provider is not allowed for this project.".to_string(),
+            "This provider is not allowed for this project: a person allows it in the \
+             project's provider settings."
+                .to_string(),
+            Some(id.clone()),
+            false,
+        ),
+        ResolveError::EndpointRefused(id) => (
+            403,
+            "This provider's endpoint is refused by the server's endpoint guard (scheme, \
+             private address or unresolvable host): change the instance's URL; no consent \
+             changes that."
+                .to_string(),
+            Some(id.clone()),
+            false,
+        ),
+        ResolveError::NotAllowedOutsideProject(id) => (
+            403,
+            "This provider is not allowed for chats outside a project: a person allows it \
+             for those in the provider settings, or the chat opens in a project that allows it."
+                .to_string(),
             Some(id.clone()),
             false,
         ),
@@ -318,7 +403,18 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
         ),
         ResolveError::NoProvider => (
             409,
-            "No provider is configured. Configure one to start a session.".to_string(),
+            "No provider is usable: Claude Code is not installed on the server and no other \
+             provider is configured and allowed here. Install the Claude Code CLI, or \
+             configure a provider."
+                .to_string(),
+            None,
+            false,
+        ),
+        ResolveError::ProviderNotChosen { .. } => (
+            409,
+            "Claude Code is not installed on the server and several providers are usable \
+             here: choose one for this chat, or set the default (pilot) provider."
+                .to_string(),
             None,
             false,
         ),
@@ -332,6 +428,15 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
         retryable,
         retry_after_ms: None,
         fallbacks: None,
+        consent_scope: match err {
+            ResolveError::NotAllowed(_) => Some("project"),
+            ResolveError::NotAllowedOutsideProject(_) => Some("no_project"),
+            _ => None,
+        },
+        candidates: match err {
+            ResolveError::ProviderNotChosen { candidates } => Some(candidates.clone()),
+            _ => None,
+        },
     }
 }
 
@@ -660,6 +765,99 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_consent_says_which_consent_is_missing() {
+        let in_project = resolve_failure(&ResolveError::NotAllowed("local".into()));
+        assert_eq!(in_project.to_json()["consent_scope"], "project");
+        let outside = assert_resolved(
+            ResolveError::NotAllowedOutsideProject("local".into()),
+            403,
+            "endpoint_not_allowed",
+            Some("local"),
+        );
+        let body = outside.to_json();
+        assert_eq!(body["consent_scope"], "no_project");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("outside a project"));
+        // A refusal of the endpoint guard asks for no consent: none would fix it.
+        let guard = assert_resolved(
+            ResolveError::EndpointRefused("local".into()),
+            403,
+            "endpoint_not_allowed",
+            Some("local"),
+        );
+        assert_eq!(guard.consent_scope, None);
+        assert!(guard.to_json().get("consent_scope").is_none());
+        // Any other refusal carries neither field.
+        let other = resolve_failure(&ResolveError::NoProvider).to_json();
+        assert!(other.get("consent_scope").is_none() && other.get("candidates").is_none());
+    }
+
+    #[test]
+    fn several_usable_providers_without_claude_code_are_a_409_listing_them() {
+        let failure = assert_resolved(
+            ResolveError::ProviderNotChosen {
+                candidates: vec!["a-cloud".into(), "b-local".into()],
+            },
+            409,
+            "provider_not_chosen",
+            None,
+        );
+        assert_eq!(
+            failure.to_json()["candidates"],
+            serde_json::json!(["a-cloud", "b-local"])
+        );
+    }
+
+    #[test]
+    fn an_error_tagged_with_its_instance_reports_that_instance_not_the_callers_guess() {
+        // B6: the caller (the HTTP handler) assumed claude-code; the opening was on `local`.
+        let err = on_provider(
+            "local",
+            anyhow::Error::new(ProviderError::CredentialsLocked).context("opening"),
+        );
+        let failure = classify_open_error(&err, Some("claude-code")).unwrap();
+        assert_eq!((failure.status, failure.code), (423, "credentials_locked"));
+        assert_eq!(failure.provider_id.as_deref(), Some("local"));
+        // The tag changes neither the text nor what the chain carries.
+        assert_eq!(err.to_string(), "opening");
+        assert!(err.chain().any(|c| matches!(
+            c.downcast_ref::<ProviderError>(),
+            Some(ProviderError::CredentialsLocked)
+        )));
+        // The innermost tag wins; a resolver refusal keeps its own instance.
+        let twice = on_provider("outer", err);
+        assert_eq!(
+            classify_open_error(&twice, None)
+                .unwrap()
+                .provider_id
+                .as_deref(),
+            Some("local")
+        );
+        let refused = on_provider(
+            "local",
+            anyhow::Error::new(ResolveError::UnknownProvider("ghost".into())),
+        );
+        assert_eq!(
+            classify_open_error(&refused, None)
+                .unwrap()
+                .provider_id
+                .as_deref(),
+            Some("ghost")
+        );
+        // Untagged: the caller's guess, as before.
+        let plain = anyhow::Error::new(ProviderError::CredentialsLocked);
+        assert_eq!(
+            classify_open_error(&plain, Some("claude-code"))
+                .unwrap()
+                .provider_id
+                .as_deref(),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
     fn provider_unavailable_is_503_and_retryable() {
         let failure = assert_resolved(
             ResolveError::Unavailable {
@@ -744,6 +942,11 @@ mod tests {
                 role: Role::Pilot,
             },
             ResolveError::NoProvider,
+            ResolveError::NotAllowedOutsideProject("a".into()),
+            ResolveError::EndpointRefused("a".into()),
+            ResolveError::ProviderNotChosen {
+                candidates: vec!["a".into(), "b".into()],
+            },
             ResolveError::EngineUnavailable {
                 provider_id: "a".into(),
             },

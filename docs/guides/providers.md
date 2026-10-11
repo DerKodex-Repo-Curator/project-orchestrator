@@ -10,9 +10,20 @@ you register, allow per project, and (when it needs a key) grant a key to.
 | `claude-code` (built in) | the historical engine | hooks, message queue, auto-continue, retry, compaction, NATS and images all work |
 | a registered instance (OpenAI-compatible, Codex, ACP) | the **agent engine** | always, whatever `CHAT_PROVIDER_PATH` says |
 
-`CHAT_PROVIDER_PATH=agent` only **forces Claude Code onto the agent engine**, to try it. The
-server logs a warning and every `system_init` of that session carries `engine: "agent"` and
-`degraded_features` (the list of what the session does not do). Default is `legacy`.
+`CHAT_PROVIDER_PATH=agent` puts **Claude Code on the agent engine** too. Default is `legacy`.
+The agent engine ports hooks, message queue, auto-continue, retry, compaction and NATS.
+Every `system_init` of an agent session carries `engine: "agent"` and `degraded_features`,
+the list of what that session does not do, for instance:
+
+- `subagents`: an ACP agent has no sub-agents, and the backend runs `Agent` calls as child
+  sessions for the native harness only;
+- `compaction`: a native model whose context window is unknown (the endpoint's probe and
+  catalogue give none) is never compacted: the native harness compacts against that window;
+- `images`, `project_orchestrator_tools`, `nexus_tools`: what the model, the provider or the
+  installation lacks.
+
+For a Claude Code session the server logs a warning naming that list, and nothing when it is
+empty.
 A session opened on the agent engine cannot be resumed once that engine is switched off:
 the answer is `409 engine_unavailable`.
 
@@ -43,7 +54,14 @@ the answer is `409 engine_unavailable`.
    model lists, **can call a tool**, and how large its context window is.
 5. **Allow the project**: `PUT /api/projects/{slug}/llm-consent` with `{provider_id, origin}`, the origin
    you were shown. The consent is tied to the origin **and** the credential reference: change either
-   and it stops holding. A conversation with no project can only use Claude Code.
+   and it stops holding. A project never inherits another scope's consent.
+   For the conversations outside any project (the welcome chat, a chat with no `project_slug` and
+   no project cwd), the **root account** allows the instance for those: `PUT /api/chat/llm-consents/{provider_id}`
+   with `{origin}` (same rules; list with `GET /api/chat/llm-consents`, withdraw with `DELETE`; any
+   other person gets `403 root_required`, since it decides for every user's chats). The global pilot
+   role (`PUT /api/chat/roles`) is root-only for the same reason.
+   A refused opening says which consent is missing (`403 endpoint_not_allowed`, `consent_scope`:
+   `project` or `no_project`; none when the endpoint guard refused the URL).
 6. **Open a session** with `provider: "deepseek"`, or set a role (`/api/chat/roles`,
    `/api/projects/{slug}/llm-roles`) so the project uses it by default.
 
@@ -182,8 +200,11 @@ token gets `403`).
 ## Routing, roles, aliases, policy
 
 Resolution order: existing session (frozen) > explicit request > task alias > run > project role >
-global role (or an enforced policy rule) > default > Claude Code. The level that decided is stored as
-`routed_by` on the session and the execution. The model policy ships `off`; `shadow` records what it
+global role (or an enforced policy rule) > default > Claude Code **when its CLI is on the server** >
+the only other instance allowed here (`routed_by: sole_instance`; never a remote machine). Without the
+Claude Code CLI and with several instances allowed, the opening is refused (`409 provider_not_chosen`,
+`candidates`): name one, or set the pilot role. A request that names `claude-code` is never swapped.
+The level that decided is stored as `routed_by` on the session and the execution. The model policy ships `off`; `shadow` records what it
 would have chosen without applying it; `enforce` applies it.
 
 ## Cost

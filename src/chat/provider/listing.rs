@@ -144,7 +144,9 @@ pub struct ProviderEntry {
     pub builtin: bool,
     /// Is the configured default.
     pub is_default: bool,
-    /// Consent given for the asked project; `null` when no project was asked.
+    /// Consent given in the asked scope: the project, or with no project the chats outside
+    /// any project (`/api/chat/llm-consents`). Always set by the listing route; `None` only
+    /// for an entry built without a scope.
     pub allowed_for_project: Option<bool>,
     /// Origin (scheme, host, port) of the endpoint, never a path or a credential.
     pub endpoint_origin: Option<String>,
@@ -244,11 +246,16 @@ pub fn builtin_claude_code(
     }
 }
 
-/// Assembles the listing; the default is the first instance when none is
-/// configured (Claude Code, A16: "claude-code when healthy").
+/// Assembles the listing. With no configured default, the default is what a chat that
+/// names nothing opens (the resolver's last levels, A16 and B2): Claude Code when its CLI
+/// is on the server (`claude_cli`, what the resolver is told), else the only instance
+/// usable here (`usable_here`: the instances the asked scope — a project, or no project —
+/// has consented to), else none.
 pub fn assemble(
     mut providers: Vec<ProviderEntry>,
     configured_default: Option<&str>,
+    claude_cli: bool,
+    usable_here: &[String],
 ) -> ProviderListing {
     let default = configured_default
         .filter(|d| providers.iter().any(|p| p.id == *d))
@@ -256,8 +263,17 @@ pub fn assemble(
         .or_else(|| {
             providers
                 .iter()
-                .find(|p| p.id == CLAUDE_CODE)
+                .find(|p| p.id == CLAUDE_CODE && claude_cli)
                 .map(|p| p.id.clone())
+        })
+        .or_else(|| {
+            let mut sole = providers
+                .iter()
+                .filter(|p| !p.builtin && p.remote.is_none() && usable_here.contains(&p.id));
+            match (sole.next(), sole.next()) {
+                (Some(only), None) => Some(only.id.clone()),
+                _ => None,
+            }
         });
     for p in &mut providers {
         p.is_default = default.as_deref() == Some(p.id.as_str());
@@ -284,6 +300,8 @@ mod tests {
         let l = assemble(
             vec![builtin_claude_code(HealthEntry::unknown(), vec![], false)],
             None,
+            true,
+            &[],
         );
         assert_eq!(l.default_provider.as_deref(), Some("claude-code"));
         assert!(l.providers[0].is_default);
@@ -295,9 +313,59 @@ mod tests {
         let l = assemble(
             vec![builtin_claude_code(HealthEntry::unknown(), vec![], true)],
             Some("ghost"),
+            true,
+            &[],
         );
         assert_eq!(l.default_provider.as_deref(), Some("claude-code"));
         assert_eq!(l.providers[0].allowed_for_project, Some(true));
+    }
+
+    #[test]
+    fn a_missing_claude_cli_is_never_the_default_the_only_usable_instance_is() {
+        let missing =
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::CliNotFound {
+                program: "claude".into(),
+            }));
+        let other = |id: &str| ProviderEntry {
+            id: id.into(),
+            kind: "openai_compatible",
+            label: id.into(),
+            builtin: false,
+            ..builtin_claude_code(HealthEntry::unknown(), vec![], false)
+        };
+        // B2: the CLI is missing, one instance is usable here: it is the default.
+        let l = assemble(
+            vec![
+                builtin_claude_code(missing.clone(), vec![], false),
+                other("local"),
+                other("not-allowed"),
+            ],
+            None,
+            false,
+            &["local".to_string()],
+        );
+        assert_eq!(l.default_provider.as_deref(), Some("local"));
+        assert!(!l.providers[0].is_default && l.providers[1].is_default);
+        // Two usable, or none: no default rather than a missing CLI.
+        let l = assemble(
+            vec![
+                builtin_claude_code(missing.clone(), vec![], false),
+                other("a"),
+                other("b"),
+            ],
+            None,
+            false,
+            &["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(l.default_provider, None);
+        assert!(l.providers.iter().all(|p| !p.is_default));
+        let l = assemble(
+            vec![builtin_claude_code(missing, vec![], false)],
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(l.default_provider, None);
     }
 
     #[test]
@@ -345,7 +413,7 @@ mod tests {
             )],
             true,
         );
-        let v = serde_json::to_value(assemble(vec![entry], None)).unwrap();
+        let v = serde_json::to_value(assemble(vec![entry], None, true, &[])).unwrap();
         let p = &v["providers"][0];
         for k in [
             "id",
@@ -371,6 +439,8 @@ mod tests {
         let mut l = assemble(
             vec![builtin_claude_code(HealthEntry::unknown(), vec![], false)],
             None,
+            true,
+            &[],
         );
         let v = serde_json::to_value(&l).unwrap();
         assert!(v.get("routing").is_none(), "additive: absent until filled");
@@ -419,6 +489,7 @@ mod tests {
             RoutedBy::GlobalRule,
             RoutedBy::ConfiguredDefault,
             RoutedBy::BuiltinClaudeCode,
+            RoutedBy::SoleInstance,
             RoutedBy::Fallback,
             RoutedBy::Auto,
         ];
@@ -433,6 +504,7 @@ mod tests {
                 | RoutedBy::GlobalRule
                 | RoutedBy::ConfiguredDefault
                 | RoutedBy::BuiltinClaudeCode
+                | RoutedBy::SoleInstance
                 | RoutedBy::Fallback
                 | RoutedBy::Auto => {}
             }

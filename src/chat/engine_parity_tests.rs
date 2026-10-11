@@ -481,8 +481,8 @@ fn gate(cc: &Measures, native: &Measures) {
 
 /// What a `system_init` announces as missing that is NOT a limit of the model:
 /// empty when the announcement is honest. The closed list: `images` when the
-/// model has no vision. (An unknown `context_window` is a limit of the model
-/// too, and is not a missing feature: it is never a reason to fail.)
+/// model has no vision, and `compaction` when its `context_window` is unknown (the
+/// native harness compacts against the window: `agent_runtime::kind_degraded`).
 ///
 /// `nexus_tools` (a native session whose `nexus-tools` executable is not found,
 /// `manager::lacks_nexus_tools`) is a limit of the INSTALLATION, neither of the
@@ -503,11 +503,15 @@ fn not_model_limits(init: &ChatEvent) -> Vec<String> {
         .as_ref()
         .and_then(|c| c.get("images"))
         .and_then(Value::as_bool);
+    let window_unknown = capabilities
+        .as_ref()
+        .is_some_and(|c| c.get("context_window").is_none_or(Value::is_null));
     degraded_features
         .clone()
         .unwrap_or_default()
         .into_iter()
         .filter(|f| !(f == "images" && vision == Some(false)))
+        .filter(|f| !(f == "compaction" && window_unknown))
         .collect()
 }
 
@@ -3591,6 +3595,8 @@ fn only_a_limit_of_the_model_may_be_announced_missing() {
     assert!(not_model_limits(&init(&[], true)).is_empty());
     assert!(not_model_limits(&init(&["images"], false)).is_empty());
     assert_eq!(not_model_limits(&init(&["images"], true)), vec!["images"]);
+    // An unknown window is the model's (or its endpoint's): its compaction is not done.
+    assert!(not_model_limits(&init(&["compaction"], true)).is_empty());
     // An installation limit is not a limit of the model: the scenario always has nexus-tools.
     let nexus = super::agent_runtime::NEXUS_TOOLS_FEATURE;
     assert_eq!(
