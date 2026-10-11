@@ -2530,6 +2530,14 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn set_chat_session_shell_moved(&self, id: Uuid) -> anyhow::Result<()> {
+        self.set_chat_session_shell_moved(id).await
+    }
+
+    async fn get_chat_session_shell_moved(&self, id: Uuid) -> anyhow::Result<Option<bool>> {
+        self.get_chat_session_shell_moved(id).await
+    }
+
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> anyhow::Result<()> {
         self.set_session_auto_continue(id, enabled).await
     }

@@ -124,6 +124,8 @@ pub struct MockGraphStore {
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
     /// Per-session auto_continue flag (stored separately from ChatSessionNode)
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
+    /// The `shell_moved` flag of each chat session (absent: never written).
+    pub session_shell_moved: RwLock<HashMap<Uuid, bool>>,
     /// PlanRun states (Runner)
     pub plan_runs: RwLock<HashMap<Uuid, crate::runner::RunnerState>>,
     /// Test injection: when set, `list_active_plan_runs` returns this frozen
@@ -367,6 +369,7 @@ impl MockGraphStore {
             fail_reads: std::sync::Mutex::new(std::collections::HashSet::new()),
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
+            session_shell_moved: RwLock::new(HashMap::new()),
             plan_runs: RwLock::new(HashMap::new()),
             frozen_active_plan_runs: std::sync::Mutex::new(None),
             agent_executions: RwLock::new(HashMap::new()),
@@ -7709,6 +7712,11 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
+        // As the Neo4j store: a session is created with its shell at home.
+        self.session_shell_moved
+            .write()
+            .await
+            .insert(session.id, false);
         self.chat_sessions
             .write()
             .await
@@ -8109,6 +8117,17 @@ impl GraphStore for MockGraphStore {
             session.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
+        if self.chat_sessions.read().await.contains_key(&id) {
+            self.session_shell_moved.write().await.insert(id, true);
+        }
+        Ok(())
+    }
+
+    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>> {
+        Ok(self.session_shell_moved.read().await.get(&id).copied())
     }
 
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {

@@ -5281,6 +5281,54 @@ impl ChatManager {
         .flatten()
     }
 
+    /// The grants of a session opened (`resumed: false`) or resumed here, in `project_dir`
+    /// (its `.mcp.json` decides the read-only MCP declarations), keeping the lasting rules
+    /// of `lasting`. The session's shell moving is recorded with the session; a resumed
+    /// session starts moved when it moved before, or when that is not known (a session
+    /// recorded before the flag existed, a read that failed): whether `claude --resume`
+    /// restores the Bash tool's last directory is not proven, so a lasting rule bound to
+    /// the project's root must not cover a command there (step 55f02275, P11b follow-up).
+    pub(crate) async fn session_grants_for(
+        &self,
+        session_id: &str,
+        project_dir: Option<&std::path::Path>,
+        lasting: Option<super::lasting_rules::LastingScope>,
+        resumed: bool,
+    ) -> super::session_grants::SessionGrants {
+        let id = Uuid::parse_str(session_id).ok();
+        let moved = match (resumed, id) {
+            (false, _) => false,
+            (true, Some(id)) => !matches!(
+                self.graph.get_chat_session_shell_moved(id).await,
+                Ok(Some(false))
+            ),
+            (true, None) => true,
+        };
+        let recorder = id.map(|id| {
+            let graph = self.graph.clone();
+            super::session_grants::MoveRecorder::new(move || {
+                let graph = graph.clone();
+                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                    return;
+                };
+                runtime.spawn(async move {
+                    if let Err(e) = graph.set_chat_session_shell_moved(id).await {
+                        warn!(session_id = %id, error = %e, "Failed to record that the session's shell may have moved");
+                    }
+                });
+            })
+        });
+        super::session_grants::SessionGrants::declaring(
+            super::session_grants::declarations_for_project(
+                &self.config.read_only_mcp_tools,
+                project_dir,
+            ),
+        )
+        .with_lasting(lasting)
+        .with_shell_moved(moved)
+        .recording_moves(recorder)
+    }
+
     /// Environment of the project-orchestrator MCP server of one session: the
     /// server URL, the session-BOUND token (registered live, revoked by
     /// `close_session`), the vault token and the session id. Shared by the
@@ -6419,6 +6467,14 @@ impl ChatManager {
             &request.cwd,
         ))
         .await;
+        let session_grants = self
+            .session_grants_for(
+                &session_id.to_string(),
+                Some(std::path::Path::new(&crate::expand_tilde(&request.cwd))),
+                lasting,
+                false,
+            )
+            .await;
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -6473,15 +6529,7 @@ impl ChatManager {
                     objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
-                    session_grants: Arc::new(std::sync::Mutex::new(
-                        super::session_grants::SessionGrants::declaring(
-                            super::session_grants::declarations_for_project(
-                                &self.config.read_only_mcp_tools,
-                                Some(std::path::Path::new(&crate::expand_tilde(&request.cwd))),
-                            ),
-                        )
-                        .with_lasting(lasting),
-                    )),
+                    session_grants: Arc::new(std::sync::Mutex::new(session_grants)),
                     oob_trigger_cap,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
@@ -10747,6 +10795,17 @@ impl ChatManager {
             &session_node.cwd,
         ))
         .await;
+        // A resumed session starts moved unless it is known its shell never left the root.
+        let session_grants = self
+            .session_grants_for(
+                session_id,
+                Some(std::path::Path::new(&crate::expand_tilde(
+                    &session_node.cwd,
+                ))),
+                lasting,
+                true,
+            )
+            .await;
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -10808,17 +10867,7 @@ impl ChatManager {
                     // Resumed sessions = interactive: use the generous cap (50/5min).
                     // T7 of plan 9a1684b2.
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
-                    session_grants: Arc::new(std::sync::Mutex::new(
-                        super::session_grants::SessionGrants::declaring(
-                            super::session_grants::declarations_for_project(
-                                &self.config.read_only_mcp_tools,
-                                Some(std::path::Path::new(&crate::expand_tilde(
-                                    &session_node.cwd,
-                                ))),
-                            ),
-                        )
-                        .with_lasting(lasting),
-                    )),
+                    session_grants: Arc::new(std::sync::Mutex::new(session_grants)),
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
@@ -14294,6 +14343,7 @@ impl ChatManager {
             !per_session_mcp || without_mcp,
             project_dir,
             lasting,
+            false,
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -14434,6 +14484,8 @@ impl ChatManager {
     /// session), whose `.mcp.json` decides which read-only MCP declarations hold for it
     /// (`session_grants::declarations_for_project`). `lasting`: the person and project whose
     /// lasting approvals the session keeps and obeys (`None`: `always` is not offered).
+    /// `resumed`: a resumed session starts with its shell taken as moved unless it is known
+    /// it never moved ([`Self::session_grants_for`]).
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -14447,6 +14499,7 @@ impl ChatManager {
         without_mcp: bool,
         project_dir: Option<std::path::PathBuf>,
         lasting: Option<super::lasting_rules::LastingScope>,
+        resumed: bool,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
@@ -14485,13 +14538,8 @@ impl ChatManager {
                 tool_policy,
                 Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
                 host_missing,
-                super::session_grants::SessionGrants::declaring(
-                    super::session_grants::declarations_for_project(
-                        &self.config.read_only_mcp_tools,
-                        project_dir.as_deref(),
-                    ),
-                )
-                .with_lasting(lasting),
+                self.session_grants_for(session_id, project_dir.as_deref(), lasting, resumed)
+                    .await,
             )
             .await;
         // A failed turn is retried as the chat's configuration says, on both engines.
@@ -14933,6 +14981,7 @@ impl ChatManager {
             !per_session_mcp || without_mcp,
             project_dir,
             lasting,
+            true,
         )
         .await;
         let handle = self

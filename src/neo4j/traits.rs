@@ -2129,6 +2129,17 @@ pub trait GraphStore: Send + Sync {
         resume_token: Option<&str>,
     ) -> Result<()>;
 
+    /// Records that the session's shell may have left its project root (a command that is
+    /// not one plain read-only command ran: `chat::session_grants::SessionGrants::observe_tool_use`).
+    /// Never cleared: a resumed session keeps it, so its lasting rules still do not cover a
+    /// command there.
+    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()>;
+
+    /// Whether the session's shell may have left its project root: `Some(false)` for a
+    /// session created since the flag exists and whose shell never moved, `None` when the
+    /// flag was never written (a session created before it existed, or no such session).
+    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>>;
+
     /// Set the auto_continue flag on a chat session node
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()>;
 

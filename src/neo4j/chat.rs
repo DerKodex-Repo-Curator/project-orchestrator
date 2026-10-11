@@ -76,7 +76,8 @@ impl Neo4jClient {
                     resume_token: $resume_token,
                     execution_place: $execution_place,
                     access: $access,
-                    owner: $owner
+                    owner: $owner,
+                    shell_moved: false
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -113,7 +114,8 @@ impl Neo4jClient {
                     resume_token: $resume_token,
                     execution_place: $execution_place,
                     access: $access,
-                    owner: $owner
+                    owner: $owner,
+                    shell_moved: false
                 })
                 "#,
             )
@@ -496,6 +498,25 @@ impl Neo4jClient {
             .param("resume_token", resume_token.map(str::to_string));
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// See [`crate::neo4j::traits::GraphStore::set_chat_session_shell_moved`].
+    pub async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
+        let q = query("MATCH (s:ChatSession {id: $id}) SET s.shell_moved = true")
+            .param("id", id.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// See [`crate::neo4j::traits::GraphStore::get_chat_session_shell_moved`].
+    pub async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>> {
+        let q = query("MATCH (s:ChatSession {id: $id}) RETURN s.shell_moved AS moved")
+            .param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<Option<bool>>("moved").unwrap_or(None)),
+            None => Ok(None),
+        }
     }
 
     /// Set the auto_continue flag on a chat session node.

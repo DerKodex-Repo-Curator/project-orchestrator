@@ -985,6 +985,24 @@ pub fn declarations_for_project(
         .collect()
 }
 
+/// Told once when a session's shell may have left its directory
+/// ([`SessionGrants::observe_tool_use`]): the manager records it with the session, so a
+/// RESUMED session starts moved ([`SessionGrants::with_shell_moved`]).
+#[derive(Clone)]
+pub struct MoveRecorder(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl MoveRecorder {
+    pub fn new(record: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(record))
+    }
+}
+
+impl std::fmt::Debug for MoveRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MoveRecorder")
+    }
+}
+
 /// The grants of one session, and where its lasting rules are kept.
 #[derive(Debug, Default)]
 pub struct SessionGrants {
@@ -1004,7 +1022,14 @@ pub struct SessionGrants {
     /// line that is not one plain read-only command (a `cd`, a script, a chain...). From
     /// then on no lasting rule covers a command in this session (they are bound to the
     /// project's root, and the shell's directory cannot be checked from here).
+    ///
+    /// Kept with the session ([`Self::recording_moves`]) and restored when it is resumed
+    /// ([`Self::with_shell_moved`]): whether `claude --resume` restores the Bash tool's last
+    /// directory is not proven, so a resumed session is taken as moved when its shell ever
+    /// was, or when that is not known.
     shell_moved: bool,
+    /// Told when [`Self::shell_moved`] turns true.
+    on_move: Option<MoveRecorder>,
 }
 
 impl SessionGrants {
@@ -1017,7 +1042,22 @@ impl SessionGrants {
             lasting: None,
             pending_lasting: Vec::new(),
             shell_moved: false,
+            on_move: None,
         }
+    }
+
+    /// These grants, for a session whose shell may already have left its directory
+    /// (`moved`): a resumed session whose shell moved before, or whose past is not known.
+    pub fn with_shell_moved(mut self, moved: bool) -> Self {
+        self.shell_moved = moved;
+        self
+    }
+
+    /// These grants, telling `recorder` when the session's shell may have moved
+    /// ([`Self::observe_tool_use`]), so that a later resume knows it.
+    pub fn recording_moves(mut self, recorder: Option<MoveRecorder>) -> Self {
+        self.on_move = recorder;
+        self
     }
 
     /// These grants, the session keeping the lasting rules of `scope` (`None`: none).
@@ -1115,6 +1155,9 @@ impl SessionGrants {
         };
         if call.is_command() && !(command_is_lasting(call) && command_is_grantable(call)) {
             self.shell_moved = true;
+            if let Some(record) = &self.on_move {
+                (record.0)();
+            }
         }
     }
 
@@ -2564,5 +2607,28 @@ mod tests {
         assert!(!grants.shell_moved());
         grants.observe_tool_use(&native_bash("cd src && ls"));
         assert!(grants.shell_moved());
+    }
+
+    /// Step 55f02275 (P11b follow-up): the move is told once, so it is kept with the
+    /// session; a session resumed moved stays moved and covers no command for good.
+    #[test]
+    fn a_move_is_recorded_once_and_a_session_resumed_moved_stays_moved() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let told = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = told.clone();
+        let mut grants =
+            SessionGrants::default().recording_moves(Some(MoveRecorder::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })));
+        grants.observe_tool_use(&bash("ls"));
+        assert_eq!(told.load(Ordering::SeqCst), 0);
+        grants.observe_tool_use(&bash("cd sub"));
+        grants.observe_tool_use(&bash("cd .."));
+        assert_eq!(told.load(Ordering::SeqCst), 1);
+
+        let resumed = SessionGrants::default().with_shell_moved(true);
+        assert!(resumed.shell_moved());
+        assert!(resumed.cwd_bound(&bash("cat README.md")));
+        assert!(!SessionGrants::default().cwd_bound(&bash("cat README.md")));
     }
 }
