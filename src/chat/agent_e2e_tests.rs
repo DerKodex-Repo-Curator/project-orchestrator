@@ -2232,6 +2232,254 @@ mod cognitive_routing {
 }
 
 // ============================================================================
+// Auto on a locked vault (#689): the refusal, wired, and the unlock that follows.
+// ============================================================================
+
+/// Auto refused on a locked vault, through `resolve_provider_choice` with the router
+/// wired (review of #689, finding 5: the refusal had only pure-function tests).
+mod auto_on_a_locked_vault {
+    use super::*;
+    use crate::chat::agent_runtime::ProviderSource;
+    use crate::chat::model_catalog::ModelCatalogCache;
+    use crate::chat::provider::cognitive::candidates::RejectReason;
+    use crate::chat::provider::cognitive::decider::CognitiveRouting;
+    use crate::chat::provider::cognitive::decision::CognitiveDecision;
+    use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+    use crate::chat::provider::errors::{classify_open_error, AutoVaultLocked};
+    use crate::chat::provider::resolver::ProviderChoice;
+    use crate::neo4j::routing::Neo4jRoutingStore;
+
+    const PASS: &str = "correct horse battery staple";
+
+    struct NoBuiltin;
+
+    impl ProviderSource for NoBuiltin {
+        fn get(&self, _provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            None
+        }
+    }
+
+    struct Setup {
+        _fake: FakeOpenAi,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+        vault: Arc<VaultService>,
+    }
+
+    /// What the router is given.
+    struct Given {
+        /// Routing stage (mode `full`).
+        stage: &'static str,
+        /// `local`, keyed in the vault: stored, and consented by the project.
+        local: Option<bool>,
+        /// The Anthropic catalog the Claude Code candidates come from.
+        catalog: Option<Arc<ModelCatalogCache>>,
+    }
+
+    impl Default for Given {
+        fn default() -> Self {
+            Self {
+                stage: "auto",
+                local: Some(true),
+                catalog: None,
+            }
+        }
+    }
+
+    /// `free` (keyed nowhere) and, when asked, `local` (keyed in the vault under a
+    /// grant), both on one endpoint; then the vault is locked.
+    async fn setup(given: Given) -> Setup {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        if let Some(consented) = given.local {
+            store_instance(&graph, &instance(&fake, "vault:endpoint-key")).await;
+            if consented {
+                consent(&graph, "proj", "local", &fake.origin()).await;
+            }
+        }
+        let free = InstanceRecord {
+            id: "free".into(),
+            ..instance(&fake, "none")
+        };
+        store_instance(&graph, &free).await;
+        consent(&graph, "proj", "free", &fake.origin()).await;
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({"mode": "full", "stage": given.stage, "exploration_epsilon": 0.0})
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let vault = VaultService::ephemeral();
+        vault
+            .init(PASS.into(), ChronoDuration::hours(1))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        vault
+            .put("endpoint-key", "sk-e2e-value-4321", None, now)
+            .unwrap();
+        vault
+            .grant(
+                SecretSelector::Names(["endpoint-key".to_string()].into()),
+                GrantScope::Provider("local".to_string()),
+                ChronoDuration::hours(1),
+                None,
+                now,
+            )
+            .unwrap();
+        vault.lock_now();
+        let mut routing = CognitiveRouting::new(Arc::new(Neo4jRoutingStore::new(graph.clone())));
+        if let Some(catalog) = given.catalog {
+            routing = routing.with_claude_code_catalog(catalog);
+        }
+        let manager = manager(graph.clone(), true)
+            .with_provider_source(Arc::new(NoBuiltin))
+            .with_vault(Arc::clone(&vault))
+            .with_cognitive_routing(routing);
+        Setup {
+            _fake: fake,
+            graph,
+            manager,
+            vault,
+        }
+    }
+
+    async fn resolve(s: &Setup) -> anyhow::Result<ProviderChoice> {
+        s.manager
+            .resolve_provider_choice(&request(None, Some("proj"), "default"), Some("proj"))
+            .await
+    }
+
+    async fn decisions(s: &Setup) -> Vec<CognitiveDecision> {
+        Neo4jRoutingStore::new(s.graph.clone())
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+    }
+
+    fn refused(error: &anyhow::Error) -> Vec<(String, String)> {
+        let locked = error
+            .downcast_ref::<AutoVaultLocked>()
+            .unwrap_or_else(|| panic!("Auto refused on the locked vault, got: {error:#}"));
+        let failure = classify_open_error(error, None).expect("typed");
+        assert_eq!((failure.status, failure.code), (423, "credentials_locked"));
+        locked
+            .fallbacks
+            .iter()
+            .map(|f| (f.provider_id.clone(), f.model.clone()))
+            .collect()
+    }
+
+    /// Why `local/m` was not eligible in the latest decision, `None` = eligible.
+    async fn local_rejection(s: &Setup) -> Option<RejectReason> {
+        let latest = decisions(s).await.remove(0);
+        latest
+            .alternatives
+            .iter()
+            .find(|a| a.pick.provider_id == "local")
+            .unwrap_or_else(|| panic!("local is a candidate: {:?}", latest.alternatives))
+            .rejected
+            .clone()
+    }
+
+    async fn unlock(s: &Setup) {
+        s.vault
+            .unlock(PASS.into(), ChronoDuration::hours(1))
+            .await
+            .unwrap();
+    }
+
+    /// The refusal reaches the caller with the models that need no vault, and it is
+    /// decided BEFORE the decision is stored (review of #689, nit 6: each 423 left a
+    /// decision no session would ever close).
+    #[tokio::test]
+    async fn auto_is_refused_with_what_needs_no_vault_and_stores_no_decision() {
+        let s = setup(Given::default()).await;
+        let error = resolve(&s).await.unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+        assert!(decisions(&s).await.is_empty(), "{:?}", decisions(&s).await);
+    }
+
+    /// Review of #689, finding 1: the health measured while the vault was locked was
+    /// cached for 60 s, so the message sent again right after the unlock was routed
+    /// around the vault, in silence. Now the next opening routes with it.
+    #[tokio::test]
+    async fn right_after_the_unlock_auto_routes_with_the_vault() {
+        let s = setup(Given::default()).await;
+        resolve(&s).await.unwrap_err();
+        unlock(&s).await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("unlocked: opens, got {e:#}"));
+        assert_eq!(local_rejection(&s).await, None, "local is eligible again");
+    }
+
+    /// Review of #689, finding 1 (b): a "down" measured while the vault was locked but
+    /// cached anyway (a check that started before the lock) is forgotten by the unlock.
+    #[tokio::test]
+    async fn the_unlock_forgets_what_was_measured_before_it() {
+        let s = setup(Given::default()).await;
+        unlock(&s).await;
+        let routing = s.manager.cognitive_routing().unwrap();
+        routing
+            .health
+            .put("local", false, std::time::Instant::now());
+        s.manager.vault_unlocked().await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("unlocked: opens, got {e:#}"));
+        assert_eq!(local_rejection(&s).await, None);
+    }
+
+    /// Review of #689, finding 3: at the `shadow` stage the router's choice is never
+    /// applied (the declared rules open), so nothing is routed around the vault and
+    /// nothing is refused.
+    #[tokio::test]
+    async fn a_stage_that_does_not_apply_the_choice_never_refuses() {
+        let s = setup(Given {
+            stage: "shadow",
+            ..Given::default()
+        })
+        .await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("shadow: no refusal, got {e:#}"));
+    }
+
+    /// Review of #689, finding 3: an instance the project did not consent to never
+    /// enters the pool: unlocking would not make Auto take it, so it refuses nothing.
+    #[tokio::test]
+    async fn an_instance_the_project_did_not_consent_to_never_refuses() {
+        let s = setup(Given {
+            local: Some(false),
+            ..Given::default()
+        })
+        .await;
+        resolve(&s)
+            .await
+            .unwrap_or_else(|e| panic!("not consented: no refusal, got {e:#}"));
+    }
+
+    /// Review of #689, finding 2: no instance is keyed in the vault, but the Anthropic
+    /// catalog is offline because of it, so Claude Code is rejected ("catalog offline")
+    /// and Auto would fall back in silence: it refuses, and does not offer Claude Code.
+    #[tokio::test]
+    async fn claude_code_waiting_on_the_vault_refuses_too() {
+        let s = setup(Given {
+            local: None,
+            catalog: Some(ModelCatalogCache::offline_by_locked_vault()),
+            ..Given::default()
+        })
+        .await;
+        let error = resolve(&s).await.unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+    }
+}
+
+// ============================================================================
 // Per-turn model routing (`full` mode): `before_turn` on a scripted provider.
 // ============================================================================
 

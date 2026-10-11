@@ -56,22 +56,37 @@ const RESUME_GRACE: std::time::Duration = std::time::Duration::from_millis(1500)
 /// once, a dead one does not hold the session longer than this.
 const INTERRUPTED_TURN_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// OOB-triggered `stream_response` rate cap for interactive sessions.
-/// A misbehaving Monitor or background Bash that emits constantly could
-/// otherwise loop the session and inflate the LLM bill — this caps the
-/// number of OOB-driven LLM turns to 50 over a rolling 5-min window
-/// (T7 of plan 9a1684b2).
 /// Longest wait for one instance's health while building the Auto pool. A
 /// health check can start a process (ACP) or wait on a slow endpoint (a local
 /// server loading a model); past this the instance counts as unavailable for
 /// this decision instead of holding the opening of the conversation.
 pub(crate) const ROUTING_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for one instance's model catalog while building the Auto pool.
+/// The catalogs are fetched all at once, so this bounds the whole catalog phase.
+pub(crate) const ROUTING_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound of building the Auto pool, whatever the number of instances: the
+/// health checks run at once (`ROUTING_HEALTH_TIMEOUT`), then the catalogs at once
+/// (`ROUTING_CATALOG_TIMEOUT`), then the capability probes are waited for together
+/// (the standard probe policy's `wait`); one second of margin for the rest, which
+/// is local work.
+pub(crate) const ROUTING_POOL_BOUND: Duration = ROUTING_HEALTH_TIMEOUT
+    .saturating_add(ROUTING_CATALOG_TIMEOUT)
+    .saturating_add(super::provider::cognitive::decider::ProbePolicy::standard().wait)
+    .saturating_add(Duration::from_secs(1));
 /// Longest wait for the health check that precedes opening a non-Claude-Code
 /// session (A30).
 pub(crate) const OPEN_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest wait for `provider.open`. Below the 60 s HTTP request timeout so the
 /// person reads why the conversation did not open, not a bare HTTP 408.
 pub(crate) const PROVIDER_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+// An Auto opening (pool, preflight, open) ends before the 60 s HTTP request timeout.
+const _: () = assert!(
+    ROUTING_POOL_BOUND
+        .saturating_add(OPEN_PREFLIGHT_TIMEOUT)
+        .saturating_add(PROVIDER_OPEN_TIMEOUT)
+        .as_secs()
+        < 60
+);
 
 /// `provider.health()` bounded by `limit`; a timeout reads as unavailable,
 /// with a typed `Timeout` error.
@@ -94,32 +109,57 @@ pub(crate) async fn bounded_health(
     }
 }
 
-/// The local instances Auto may route to whose key lives in the vault: every
-/// one, or only those among the ticked models when the menu restricts the pool.
-/// Remote instances never enter the Auto pool.
+/// The instance's key is read from the vault. `vault:` is the only indirection
+/// to the vault an instance can store (`parse_credential_ref` accepts `none`,
+/// `vault:` and `env:`).
+pub(crate) fn keyed_in_vault(instance: &super::provider::settings::InstanceRecord) -> bool {
+    instance.credential_ref.trim_start().starts_with("vault:")
+}
+
+/// The candidates Auto may route to that depend on the vault: the local
+/// instances keyed in it, and Claude Code when the Anthropic catalog is
+/// offline because of the locked vault (`claude_code_waits_on_vault`: its
+/// models are then rejected as "catalog offline"). Only those the router could
+/// take: allowed for the project (`allowed`, the consent the pool applies), and
+/// among the ticked models when the menu restricts the pool. Remote instances
+/// never enter the Auto pool.
 pub(crate) fn vault_backed_candidates(
     instances: &[super::provider::settings::InstanceRecord],
     ticked: Option<&[super::types::RoutingPoolEntry]>,
+    allowed: impl Fn(&str) -> bool,
+    claude_code_waits_on_vault: bool,
 ) -> Vec<String> {
-    instances
-        .iter()
-        .filter(|i| !super::provider::resolver::is_remote_instance(&i.id))
-        .filter(|i| i.credential_ref.trim_start().starts_with("vault:"))
-        .filter(|i| ticked.is_none_or(|pool| pool.iter().any(|e| e.provider == i.id)))
-        .map(|i| i.id.clone())
+    let claude_code =
+        claude_code_waits_on_vault.then(|| super::provider::resolver::CLAUDE_CODE.to_string());
+    claude_code
+        .into_iter()
+        .chain(
+            instances
+                .iter()
+                .filter(|i| !super::provider::resolver::is_remote_instance(&i.id))
+                .filter(|i| keyed_in_vault(i))
+                .map(|i| i.id.clone()),
+        )
+        .filter(|id| allowed(id))
+        .filter(|id| ticked.is_none_or(|pool| pool.iter().any(|e| e.provider == *id)))
         .collect()
 }
 
 /// Whether opening in Auto must be refused because the vault is locked: the
-/// router chooses (`full`, nothing named) and some candidate's key is in the
-/// locked vault. Routing around it would be a silent fallback (A30).
+/// router's choice applies (`full`, a stage that applies it, nothing named) and
+/// some candidate depends on the locked vault. Routing around it would be a
+/// silent fallback (A30). When the choice is not applied (stage `shadow`, a
+/// pilot at `advisory`), the declared rules open the conversation and nothing
+/// is routed around: no refusal.
 pub(crate) fn auto_refused_by_locked_vault(
     mode: super::provider::cognitive::ProviderRoutingMode,
+    applied: bool,
     named: bool,
     vault_locked: bool,
     vault_backed: &[String],
 ) -> bool {
     mode == super::provider::cognitive::ProviderRoutingMode::Full
+        && applied
         && !named
         && vault_locked
         && !vault_backed.is_empty()
@@ -129,9 +169,10 @@ pub(crate) fn auto_refused_by_locked_vault(
 pub(crate) const MAX_LOCKED_VAULT_FALLBACKS: usize = 3;
 
 /// The models Auto could still open on without the vault, best first: its own
-/// pick, then the eligible alternatives by score. None of them is keyed in the
-/// vault (those came back unhealthy, but the filter says it outright). Empty
-/// when every usable model needs the vault: unlocking is then the only way.
+/// pick, then the eligible alternatives by score. None of them depends on the
+/// vault (those came back unhealthy or offline, but the filter says it
+/// outright). Empty when every usable model needs the vault: unlocking is then
+/// the only way.
 pub(crate) fn locked_vault_fallbacks(
     decision: &super::provider::cognitive::decision::CognitiveDecision,
     vault_backed: &[String],
@@ -170,6 +211,11 @@ pub(crate) fn locked_vault_fallbacks(
     out
 }
 
+/// OOB-triggered `stream_response` rate cap for interactive sessions.
+/// A misbehaving Monitor or background Bash that emits constantly could
+/// otherwise loop the session and inflate the LLM bill — this caps the
+/// number of OOB-driven LLM turns to 50 over a rolling 5-min window
+/// (T7 of plan 9a1684b2).
 pub(crate) const OOB_TRIGGER_CAP_INTERACTIVE: u32 = 50;
 /// Same cap for runner sessions, more conservative since they run
 /// autonomously without a human watching.
@@ -12918,13 +12964,26 @@ impl ChatManager {
             .await
     }
 
-    /// A provider, model, alias or run the caller named: never substituted.
-    fn names_a_choice(request: &ChatRequest) -> bool {
-        request.provider.is_some()
-            || request.model.as_deref().is_some_and(|m| !m.is_empty())
-            || request.task_alias.is_some()
-            || request.persona_alias.is_some()
-            || request.run_provider.is_some()
+    /// A vault is wired and locked now.
+    fn vault_locked(&self) -> bool {
+        self.vault
+            .as_ref()
+            .is_some_and(|v| !v.is_unlocked(chrono::Utc::now()))
+    }
+
+    /// The vault was just unlocked (vault page, chat card, secret request card). What
+    /// Auto measured while it was locked no longer holds: the health of the instances
+    /// is checked again at the next opening, and an Anthropic catalog the locked vault
+    /// left offline refreshes now (bounded), so the message sent again right after the
+    /// unlock is routed with the vault, not around it (review of #689, finding 1).
+    pub async fn vault_unlocked(&self) {
+        let Some(routing) = self.cognitive_routing.as_ref() else {
+            return;
+        };
+        routing.health.clear();
+        if let Some(catalog) = routing.claude_code_catalog.as_ref() {
+            catalog.vault_unlocked().await;
+        }
     }
 
     /// The models ticked for the conversation being opened, `None` when nothing restricts it.
@@ -12957,7 +13016,6 @@ impl ChatManager {
             resolver::Role::Pilot
         };
         let routing_instances = self.cognitive_routing.as_ref().map(|_| instances.clone());
-        let vault_backed = vault_backed_candidates(&instances, Self::routing_pool_of(request));
         let store_catalog =
             catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
         let policy: settings::ModelPolicy = self
@@ -12989,6 +13047,9 @@ impl ChatManager {
             .cognitive_routing
             .as_ref()
             .and_then(|routing| routing.store.clone());
+        // Read ONCE, before the pool is built: the refusal below and the health the pool
+        // caches follow the same state of the vault (review of #689, finding 1).
+        let vault_locked = self.vault_locked();
         let mut cognitive = match (&self.cognitive_routing, routing_instances) {
             (Some(routing), Some(instances)) => {
                 match self
@@ -13001,10 +13062,20 @@ impl ChatManager {
                         &store_catalog,
                         &aliases,
                         session_id,
+                        vault_locked,
                     )
                     .await
                 {
                     Ok(decision) => decision,
+                    // Auto refused on a locked vault: the opening fails, it does not fall
+                    // back to the declared rules.
+                    Err(error)
+                        if error
+                            .downcast_ref::<super::provider::errors::AutoVaultLocked>()
+                            .is_some() =>
+                    {
+                        return Err(error);
+                    }
                     Err(error) => {
                         warn!(%error, "cognitive routing skipped: the declared rules apply");
                         None
@@ -13013,33 +13084,6 @@ impl ChatManager {
             }
             _ => None,
         };
-        // Auto with the vault locked: the instances whose key is in the vault came
-        // back unavailable, so the router would pick among what is left — a silent
-        // fallback, and in practice a slow local agent whose opening ran past the
-        // HTTP timeout (408). Refuse as for a named instance: the person unlocks
-        // the vault, then opens again.
-        if let Some(decision) = &cognitive {
-            let vault_locked = self
-                .vault
-                .as_ref()
-                .is_some_and(|v| !v.is_unlocked(chrono::Utc::now()));
-            if auto_refused_by_locked_vault(
-                decision.mode,
-                Self::names_a_choice(request),
-                vault_locked,
-                &vault_backed,
-            ) {
-                info!(
-                    instances = ?vault_backed,
-                    "Auto routing refused: the vault is locked and holds candidates' keys"
-                );
-                return Err(anyhow::Error::new(
-                    super::provider::errors::AutoVaultLocked {
-                        fallbacks: locked_vault_fallbacks(decision, &vault_backed),
-                    },
-                ));
-            }
-        }
         let mut auto_pick = cognitive
             .as_ref()
             .filter(|d| d.applied)
@@ -13483,7 +13527,7 @@ impl ChatManager {
         use super::provider::cognitive::candidates::ModelFacts;
         use super::provider::cognitive::decider::reserve_probes;
         use super::provider::resolver::{self, InstanceCatalog};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         struct Gathered {
             id: String,
@@ -13515,20 +13559,55 @@ impl ChatManager {
         // bounded: one slow endpoint or agent process must not hold the opening
         // of the conversation (an unbounded, sequential check here returned HTTP
         // 408 on an Auto opening). Stored with the time it ENDED, so a slow
-        // answer is not already stale when cached.
+        // answer is not already stale when cached. Never stored for an instance
+        // keyed in the vault while the vault is locked: that "unavailable" ends
+        // with the unlock, and a cached one would route around the vault for a
+        // minute after it (review of #689, finding 1).
+        let vault_locked = self.vault_locked();
+        let vault_keyed: std::collections::HashSet<&str> = instances
+            .iter()
+            .filter(|i| keyed_in_vault(i))
+            .map(|i| i.id.as_str())
+            .collect();
         let unknown: Vec<_> = providers
             .iter()
             .filter(|(id, _)| routing.health.get(id, Instant::now()).is_none())
-            .map(|(id, provider)| async move {
-                let ok = bounded_health(provider.as_ref(), ROUTING_HEALTH_TIMEOUT)
-                    .await
-                    .status
-                    != nexus_claude::agent::HealthStatus::Unavailable;
-                routing.health.put(id, ok, Instant::now());
-                (id.clone(), ok)
+            .map(|(id, provider)| {
+                let cache = !(vault_locked && vault_keyed.contains(id.as_str()));
+                async move {
+                    let ok = bounded_health(provider.as_ref(), ROUTING_HEALTH_TIMEOUT)
+                        .await
+                        .status
+                        != nexus_claude::agent::HealthStatus::Unavailable;
+                    if cache {
+                        routing.health.put(id, ok, Instant::now());
+                    }
+                    (id.clone(), ok)
+                }
             })
             .collect();
         let measured: HashMap<String, bool> = futures::future::join_all(unknown)
+            .await
+            .into_iter()
+            .collect();
+        let healthy_of = |id: &str| match measured.get(id) {
+            Some(ok) => *ok,
+            None => routing.health.get(id, Instant::now()).unwrap_or(false),
+        };
+        // The catalogs of the healthy instances, all at once and each bounded: a
+        // sequential wait here added `ROUTING_CATALOG_TIMEOUT` per instance (review
+        // of #689, finding 4).
+        let mut catalogs: HashMap<String, Vec<nexus_claude::agent::ModelInfo>> =
+            futures::future::join_all(providers.iter().filter(|(id, _)| healthy_of(id)).map(
+                |(id, provider)| async move {
+                    let models = tokio::time::timeout(ROUTING_CATALOG_TIMEOUT, provider.catalog())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    (id.clone(), models)
+                },
+            ))
             .await
             .into_iter()
             .collect();
@@ -13536,23 +13615,12 @@ impl ChatManager {
         let mut probes = Vec::new();
         for (id, provider) in providers {
             let now = Instant::now();
-            let healthy = match measured.get(&id) {
-                Some(ok) => *ok,
-                None => routing.health.get(&id, now).unwrap_or(false),
-            };
+            let healthy = healthy_of(&id);
             let default_model = instances
                 .iter()
                 .find(|i| i.id == id)
                 .and_then(|i| i.default_model.clone());
-            let models = if healthy {
-                tokio::time::timeout(Duration::from_secs(2), provider.catalog())
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let models = catalogs.remove(&id).unwrap_or_default();
             let allowed = store_catalog.is_allowed_for_project(&id);
             // A model the catalogue itself lists without tools is not worth a probe.
             let no_tools_listed: std::collections::HashSet<String> = models
@@ -13669,6 +13737,8 @@ impl ChatManager {
 
     /// Asks the cognitive router about the session being opened. The decision is
     /// stored by the decider whether it is applied or not.
+    /// Auto on a locked vault (`vault_locked`, read by the caller before anything is
+    /// measured) is refused with [`super::provider::errors::AutoVaultLocked`] instead.
     #[allow(clippy::too_many_arguments)]
     async fn cognitive_decision(
         &self,
@@ -13680,6 +13750,7 @@ impl ChatManager {
         store_catalog: &super::provider::catalog::StoreCatalog,
         aliases: &[super::provider::settings::ModelAlias],
         session_id: Option<Uuid>,
+        vault_locked: bool,
     ) -> Result<Option<super::provider::cognitive::decision::CognitiveDecision>> {
         use super::provider::cognitive::{
             candidates::Slot,
@@ -13780,6 +13851,50 @@ impl ChatManager {
             .filter(|facts| !facts.supports_tools)
             .map(|facts| (facts.provider_id.clone(), facts.model.clone()))
             .collect();
+        // Auto with the vault locked: the candidates that depend on it came back
+        // unavailable (or "catalog offline"), so the router would pick among what is
+        // left — a silent fallback, and in practice a slow local agent whose opening
+        // ran past the HTTP timeout (408). Refuse as for a named instance, BEFORE the
+        // decision is stored: nothing is persisted that no session will ever close
+        // (review of #689, nit 6). The offer is what the router would have chosen
+        // without the vault, previewed, not decided.
+        if vault_locked && !named {
+            let waits = match routing.claude_code_catalog.as_ref() {
+                Some(catalog) => catalog.waits_on_vault().await,
+                None => false,
+            };
+            let vault_backed = vault_backed_candidates(
+                instances,
+                ticked,
+                |id| {
+                    super::provider::resolver::InstanceCatalog::is_allowed_for_project(
+                        store_catalog,
+                        id,
+                    )
+                },
+                waits,
+            );
+            if !vault_backed.is_empty() {
+                let preview = routing.decider.preview(&decide).await?;
+                if auto_refused_by_locked_vault(
+                    preview.mode,
+                    preview.applied,
+                    named,
+                    vault_locked,
+                    &vault_backed,
+                ) {
+                    info!(
+                        candidates = ?vault_backed,
+                        "Auto routing refused: the vault is locked and candidates depend on it"
+                    );
+                    return Err(anyhow::Error::new(
+                        super::provider::errors::AutoVaultLocked {
+                            fallbacks: locked_vault_fallbacks(&preview, &vault_backed),
+                        },
+                    ));
+                }
+            }
+        }
         let decision = routing.decider.decide(&decide).await?;
         // A conversation that routes (Auto, models ticked) is decided turn by turn from
         // pools that follow the stored settings, which may forbid probing: the candidates
@@ -29066,6 +29181,10 @@ mod auto_open_bounds_tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    fn anyone(_: &str) -> bool {
+        true
+    }
+
     #[test]
     fn only_local_instances_keyed_in_the_vault_are_vault_backed() {
         let remote = format!("{REMOTE_PREFIX}box");
@@ -29075,7 +29194,36 @@ mod auto_open_bounds_tests {
             instance("groq", "env:GROQ_API_KEY"),
             instance(&remote, "vault:ssh-key"),
         ];
-        assert_eq!(vault_backed_candidates(&instances, None), ids(&["openai"]));
+        assert_eq!(
+            vault_backed_candidates(&instances, None, anyone, false),
+            ids(&["openai"])
+        );
+    }
+
+    /// Review of #689, finding 2: Claude Code depends on the vault through the
+    /// Anthropic catalog; when the locked vault left it offline, it counts.
+    #[test]
+    fn claude_code_is_vault_backed_while_its_catalog_waits_on_the_vault() {
+        let instances = vec![instance("ollama", "none")];
+        assert!(vault_backed_candidates(&instances, None, anyone, false).is_empty());
+        assert_eq!(
+            vault_backed_candidates(&instances, None, anyone, true),
+            ids(&["claude-code"])
+        );
+    }
+
+    /// Review of #689, finding 3: an instance the project has not consented to
+    /// never enters the pool, so it never makes Auto refuse.
+    #[test]
+    fn an_instance_not_allowed_for_the_project_is_not_vault_backed() {
+        let instances = vec![
+            instance("openai", "vault:openai-key"),
+            instance("mistral", "vault:mistral-key"),
+        ];
+        assert_eq!(
+            vault_backed_candidates(&instances, None, |id| id == "mistral", false),
+            ids(&["mistral"])
+        );
     }
 
     #[test]
@@ -29095,37 +29243,48 @@ mod auto_open_bounds_tests {
             },
         ];
         assert_eq!(
-            vault_backed_candidates(&instances, Some(&ticked)),
+            vault_backed_candidates(&instances, Some(&ticked), anyone, false),
             ids(&["mistral"])
         );
+        assert_eq!(
+            vault_backed_candidates(&instances, Some(&ticked), anyone, true),
+            ids(&["claude-code", "mistral"])
+        );
         let none_keyed = vec![RoutingPoolEntry {
-            provider: "claude-code".into(),
-            model: "opus".into(),
+            provider: "ollama".into(),
+            model: "qwen3".into(),
         }];
-        assert!(vault_backed_candidates(&instances, Some(&none_keyed)).is_empty());
+        assert!(vault_backed_candidates(&instances, Some(&none_keyed), anyone, true).is_empty());
     }
 
     #[test]
     fn auto_is_refused_only_when_it_would_route_around_a_locked_vault() {
         let keyed = ids(&["openai"]);
         let full = ProviderRoutingMode::Full;
-        assert!(auto_refused_by_locked_vault(full, false, true, &keyed));
+        assert!(auto_refused_by_locked_vault(
+            full, true, false, true, &keyed
+        ));
         // Unlocked vault, named choice, no keyed candidate, or not Auto: open as before.
-        assert!(!auto_refused_by_locked_vault(full, false, false, &keyed));
-        assert!(!auto_refused_by_locked_vault(full, true, true, &keyed));
-        assert!(!auto_refused_by_locked_vault(full, false, true, &[]));
         assert!(!auto_refused_by_locked_vault(
+            full, true, false, false, &keyed
+        ));
+        assert!(!auto_refused_by_locked_vault(
+            full, true, true, true, &keyed
+        ));
+        assert!(!auto_refused_by_locked_vault(full, true, false, true, &[]));
+        // Review of #689, finding 3: the choice is not applied (stage `shadow`, a
+        // pilot at `advisory`): the declared rules open, nothing is routed around.
+        assert!(!auto_refused_by_locked_vault(
+            full, false, false, true, &keyed
+        ));
+        for mode in [
             ProviderRoutingMode::Primary,
-            false,
-            true,
-            &keyed
-        ));
-        assert!(!auto_refused_by_locked_vault(
-            ProviderRoutingMode::Mixed,
-            false,
-            true,
-            &keyed
-        ));
+            ProviderRoutingMode::ExecutorsOnly,
+        ] {
+            assert!(!auto_refused_by_locked_vault(
+                mode, true, false, true, &keyed
+            ));
+        }
     }
 
     fn decision_with(
@@ -29210,8 +29369,131 @@ mod auto_open_bounds_tests {
 
     #[test]
     fn the_open_budget_stays_under_the_http_request_timeout() {
-        let budget = ROUTING_HEALTH_TIMEOUT + OPEN_PREFLIGHT_TIMEOUT + PROVIDER_OPEN_TIMEOUT;
+        let budget = ROUTING_POOL_BOUND + OPEN_PREFLIGHT_TIMEOUT + PROVIDER_OPEN_TIMEOUT;
         assert!(budget < Duration::from_secs(60), "{budget:?}");
+    }
+
+    /// A provider whose health answers at once (`healthy`) or never, and whose
+    /// catalog never answers: the slow endpoint or agent process of the 408.
+    struct Hanging {
+        id: String,
+        healthy: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_claude::agent::AgentProvider for Hanging {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn kind(&self) -> nexus_claude::agent::ProviderKind {
+            nexus_claude::agent::ProviderKind::Native
+        }
+        async fn health(&self) -> nexus_claude::agent::ProviderHealth {
+            if !self.healthy {
+                std::future::pending::<()>().await;
+            }
+            nexus_claude::agent::ProviderHealth {
+                status: nexus_claude::agent::HealthStatus::Ok,
+                version: None,
+                detail: None,
+                error: None,
+                login_hint: None,
+                checked_at_ms: 0,
+            }
+        }
+        async fn catalog(
+            &self,
+        ) -> Result<Vec<nexus_claude::agent::ModelInfo>, nexus_claude::agent::ProviderError>
+        {
+            std::future::pending().await
+        }
+        fn capabilities(&self, _model: Option<&str>) -> nexus_claude::agent::Capabilities {
+            nexus_claude::agent::Capabilities::default()
+        }
+        async fn open(
+            &self,
+            _spec: nexus_claude::agent::SessionSpec,
+        ) -> Result<Arc<dyn nexus_claude::agent::AgentSession>, nexus_claude::agent::ProviderError>
+        {
+            Err(nexus_claude::agent::ProviderError::EndpointUnreachable {
+                detail: "never opens".into(),
+            })
+        }
+        async fn resume(
+            &self,
+            _spec: nexus_claude::agent::SessionSpec,
+            _token: nexus_claude::agent::ResumeToken,
+        ) -> Result<Arc<dyn nexus_claude::agent::AgentSession>, nexus_claude::agent::ProviderError>
+        {
+            Err(nexus_claude::agent::ProviderError::EndpointUnreachable {
+                detail: "never opens".into(),
+            })
+        }
+    }
+
+    /// Every id is a [`Hanging`] provider; those named `mute-*` never answer their health.
+    struct HangingSource;
+
+    impl crate::chat::agent_runtime::ProviderSource for HangingSource {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            Some(Arc::new(Hanging {
+                id: provider_id.to_string(),
+                healthy: !provider_id.starts_with("mute-"),
+            }))
+        }
+    }
+
+    /// Review of #689, finding 4: the catalogs were fetched one instance after the
+    /// other (2 s each), so the pool's build grew with the number of instances and
+    /// the 408 came back past a few of them. Health and catalogs now run at once:
+    /// the build stays under `ROUTING_POOL_BOUND` whatever the number of instances.
+    #[tokio::test(start_paused = true)]
+    async fn the_pool_is_bounded_whatever_the_number_of_slow_instances() {
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+        use crate::chat::provider::settings::{GLOBAL, INSTANCE_PREFIX};
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let ids = ["slow-1", "slow-2", "slow-3", "slow-4", "mute-1", "mute-2"];
+        for id in ids {
+            let record = InstanceRecord {
+                id: id.into(),
+                kind: "openai_compatible".into(),
+                credential_ref: "none".into(),
+                default_model: Some("m".into()),
+                ..Default::default()
+            };
+            graph
+                .put_llm_setting(
+                    GLOBAL,
+                    &format!("{INSTANCE_PREFIX}{id}"),
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let state = crate::test_helpers::mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let config = ChatConfig {
+            provider_path: crate::chat::config::ProviderPath::Agent,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(HangingSource))
+            .with_cognitive_routing(CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new())));
+        let start = tokio::time::Instant::now();
+        let pool = manager.routing_pool_known(None).await;
+        let took = start.elapsed();
+        assert!(took <= ROUTING_POOL_BOUND, "built in {took:?}");
+        let health = |id: &str| {
+            pool.iter()
+                .find(|f| f.provider_id == id)
+                .unwrap_or_else(|| panic!("{id} in the pool: {pool:?}"))
+                .healthy
+        };
+        // Still the right facts: a health that never answers is unavailable, a
+        // catalog that never answers leaves the instance its default model.
+        assert_eq!(health("slow-4"), Some(true));
+        assert_eq!(health("mute-2"), Some(false));
     }
 }
 

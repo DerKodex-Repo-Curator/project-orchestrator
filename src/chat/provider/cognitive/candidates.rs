@@ -358,6 +358,15 @@ impl HealthCache {
             .insert(provider_id.to_owned(), (now, healthy));
     }
 
+    /// Forgets every measure: the next pool build checks again. Called when the vault
+    /// is unlocked, since what it measured while locked no longer holds.
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     /// The remembered health, else `probe()`'s answer, remembered. `probe` runs
     /// at most once per instance per window.
     pub fn get_or_probe(
@@ -556,6 +565,17 @@ mod tests {
         let later = t0 + Duration::from_secs(61);
         assert_eq!(cache.get("a", later), None);
         assert!(!cache.get_or_probe("a", later, || false));
+    }
+
+    #[test]
+    fn clearing_forgets_every_measure_within_the_window() {
+        let cache = HealthCache::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        cache.put("vault-keyed", false, t0);
+        cache.put("other", true, t0);
+        cache.clear();
+        assert_eq!(cache.get("vault-keyed", t0), None);
+        assert_eq!(cache.get("other", t0), None);
     }
 
     #[test]

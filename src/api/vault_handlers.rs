@@ -145,6 +145,15 @@ pub struct UnlockedResponse {
     pub unlock_proof: String,
 }
 
+/// What follows any unlock: Auto forgets what it measured while the vault was locked
+/// (see `ChatManager::vault_unlocked`), so a message sent again right after the unlock
+/// is routed with the vault.
+async fn after_unlock(state: &OrchestratorState) {
+    if let Some(cm) = &state.chat_manager {
+        cm.vault_unlocked().await;
+    }
+}
+
 pub async fn init_vault(
     State(state): State<OrchestratorState>,
     Extension(claims): Extension<Claims>,
@@ -156,6 +165,7 @@ pub async fn init_vault(
         .vault
         .init(body.passphrase.to_string(), duration)
         .await?;
+    after_unlock(&state).await;
     Ok((
         StatusCode::CREATED,
         Json(UnlockedResponse {
@@ -176,6 +186,7 @@ pub async fn unlock_vault(
         .vault
         .unlock(body.passphrase.to_string(), duration)
         .await?;
+    after_unlock(&state).await;
     Ok(Json(UnlockedResponse {
         unlocked_until: Some(until),
         unlock_proof: proof,
@@ -389,6 +400,7 @@ pub async fn answer_request(
             Some(pass) => {
                 let d = minutes(body.unlock_minutes, DEFAULT_UNLOCK_MINUTES);
                 let (_, proof) = state.vault.unlock(pass.to_string(), d).await?;
+                after_unlock(&state).await;
                 new_proof = Some(proof);
             }
             None => require_proof(&state, &headers)?,

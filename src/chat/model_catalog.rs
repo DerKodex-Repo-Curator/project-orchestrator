@@ -58,6 +58,10 @@ const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 /// one is due after this rather than `CACHE_TTL`: unlocking the vault (from
 /// the chat or the vault page) then brings the live catalog without a restart.
 const LOCKED_VAULT_RETRY: Duration = Duration::from_secs(60);
+
+/// How long an unlock waits for the refresh of a catalog the locked vault left
+/// offline (see [`ModelCatalogCache::vault_unlocked`]).
+const UNLOCK_REFRESH_WAIT: Duration = Duration::from_secs(5);
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Defensive cap on pagination — the live catalog is small (dozens of
@@ -564,6 +568,9 @@ struct CacheState {
     /// refresh keeps that list, still real data). `false` while the static
     /// fallback is served.
     live: bool,
+    /// The last refresh failed because the vault holding the Anthropic key is locked:
+    /// while the catalog is not live, the Claude Code candidates wait on the vault.
+    offline_by_vault: bool,
 }
 
 /// Handles needed to announce a newly released model. Optional so the cache
@@ -616,6 +623,7 @@ impl ModelCatalogCache {
                 ttl: CACHE_TTL,
                 refreshing: false,
                 live: false,
+                offline_by_vault: false,
             }),
             http: reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
@@ -701,6 +709,41 @@ impl ModelCatalogCache {
         }
     }
 
+    /// The catalog is offline because the vault holding its key is locked: the Claude
+    /// Code candidates of Auto depend on the vault as much as an instance keyed in it.
+    pub async fn waits_on_vault(&self) -> bool {
+        let state = self.inner.read().await;
+        !state.live && state.offline_by_vault
+    }
+
+    /// The vault was just unlocked. A catalog that was offline because of it refreshes
+    /// NOW, and the caller waits for it (at most `UNLOCK_REFRESH_WAIT`): the message
+    /// sent again right after the unlock must not find Claude Code still rejected as
+    /// "catalog offline" for up to `LOCKED_VAULT_RETRY`. Past the wait the refresh
+    /// goes on in the background.
+    pub async fn vault_unlocked(self: &Arc<Self>) {
+        if self.credentials.is_none() || !self.waits_on_vault().await {
+            return;
+        }
+        // Started even when a refresh is in flight: that one may have read the vault
+        // before the unlock. Two refreshes at once are harmless (same fetch, same state).
+        self.inner.write().await.refreshing = true;
+        let this = Arc::clone(self);
+        let refresh = tokio::spawn(async move { this.refresh().await });
+        let _ = tokio::time::timeout(UNLOCK_REFRESH_WAIT, refresh).await;
+    }
+
+    /// A catalog offline because of a locked vault, as the first refresh with the vault
+    /// locked leaves it (tests of the router, which never fetch).
+    #[cfg(test)]
+    pub(crate) fn offline_by_locked_vault() -> Arc<Self> {
+        let cache = Self::with_credentials(CredentialSource::None);
+        if let Ok(mut state) = cache.inner.try_write() {
+            state.offline_by_vault = true;
+        }
+        cache
+    }
+
     /// Force an immediate synchronous refresh attempt (used by tests and by
     /// an optional "refresh now" admin action). Falls back silently to the
     /// existing cache on any failure.
@@ -722,6 +765,7 @@ impl ModelCatalogCache {
                 state.live = true;
                 state.fetched_at = Instant::now();
                 state.ttl = CACHE_TTL;
+                state.offline_by_vault = false;
             }
             Ok(_) => {
                 tracing::warn!(
@@ -737,6 +781,7 @@ impl ModelCatalogCache {
                 // key/network is an acceptable ceiling on wasted calls. The one
                 // exception is a vault that is merely locked — a person unlocks
                 // it in seconds, and the catalog should follow without a restart.
+                state.offline_by_vault = vault_locked;
                 state.fetched_at = Instant::now();
                 state.ttl = if vault_locked {
                     LOCKED_VAULT_RETRY
@@ -1730,6 +1775,45 @@ mod tests {
             ids(&state.models)
         );
         assert_eq!(state.ttl, CACHE_TTL);
+    }
+
+    /// Review of #689, finding 1: after a refresh the locked vault failed, the next one
+    /// was due only 60 s later and `snapshot` returned the offline state to the very call
+    /// that triggered it, so the message sent again right after the unlock still found
+    /// Claude Code "catalog offline". The unlock now refreshes it before returning.
+    #[tokio::test]
+    async fn test_unlocking_brings_the_live_catalog_at_once() {
+        let server = fake_models_api().await;
+        let (vault, graph) = vault_with_key(&server, true).await;
+        vault.lock_now();
+        let cache = vault_only_cache(&server, vault.clone(), graph);
+        cache.refresh().await;
+        assert!(cache.waits_on_vault().await, "offline because of the vault");
+        assert!(!cache.snapshot().await.live);
+
+        vault
+            .unlock(VAULT_PASS.into(), chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        cache.vault_unlocked().await;
+        let snapshot = cache.snapshot().await;
+        assert!(snapshot.live, "the first read after the unlock is live");
+        assert!(ids(&snapshot.models).contains(&LIVE_ONLY_MODEL.to_string()));
+        assert!(!cache.waits_on_vault().await);
+    }
+
+    /// Only a catalog the vault left offline waits on it: one offline for another reason
+    /// (no credential at all) never makes Auto refuse on a locked vault.
+    #[tokio::test]
+    async fn test_only_a_vault_failure_makes_the_catalog_wait_on_the_vault() {
+        let none = ModelCatalogCache::new(None);
+        none.snapshot().await;
+        assert!(!none.waits_on_vault().await);
+        assert!(
+            ModelCatalogCache::offline_by_locked_vault()
+                .waits_on_vault()
+                .await
+        );
     }
 
     #[tokio::test]
