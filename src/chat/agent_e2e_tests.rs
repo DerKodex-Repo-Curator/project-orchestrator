@@ -2036,8 +2036,12 @@ mod turn_routing {
         assert_eq!(r.decider.calls(), 0);
     }
 
+    /// R-S3: the guard is per CLASS, no more "never two changes in consecutive turns":
+    /// alternating classes change the model on every turn (not one turn late); a second
+    /// turn of the same class right after a change is decided without exploration, and
+    /// the pair in force stays.
     #[tokio::test]
-    async fn never_two_changes_in_consecutive_turns() {
+    async fn alternating_classes_change_the_model_on_every_turn() {
         let mut r = rig(
             "full",
             "auto",
@@ -2056,18 +2060,17 @@ mod turn_routing {
         for text in [SIMPLE, DEBUG, SIMPLE, DEBUG, DEBUG] {
             flips.push(!r.turn(text).await.is_empty());
         }
-        for pair in flips.windows(2) {
-            assert!(!(pair[0] && pair[1]), "two changes in a row: {flips:?}");
-        }
-        assert!(
-            flips.iter().any(|f| *f),
-            "the guard does not freeze the router: {flips:?}"
+        assert_eq!(flips[1..], [true, true, true, false], "{flips:?}");
+        let requests = r.decider.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        assert_eq!(
+            last.settings.exploration_epsilon, 0.0,
+            "same class right after a change: no exploration"
         );
-        // The turn that follows a change is still asked, but as a shadow decision.
         let decisions = r.decider.decisions.lock().unwrap();
         assert!(
-            decisions.iter().any(|d| !d.applied),
-            "recorded unapplied: {decisions:?}"
+            decisions.iter().all(|d| d.applied),
+            "every turn decided at the auto stage: {decisions:?}"
         );
     }
 
@@ -3635,21 +3638,20 @@ mod provider_switch {
             .await;
             idle(&w, &new).await;
 
-            // The router now prefers the way back: right after a move, it is only recorded.
+            // The router now prefers the way back: right after a move, no second move (R-S3):
+            // the turn is decided among the models of the provider it moved to.
             answered_in_place(&w, &new, "second question, again").await;
             assert_eq!(
                 relayed_of(&stored_events(&w, &new).await).len(),
                 1,
                 "the move in only"
             );
+            // The Mover records only the requests across providers: the turn after the move
+            // was asked with `restrict_provider = local2` (its model may change, never its
+            // provider), so the way back was never even a candidate.
             let checks = mover.checks();
-            assert_eq!(checks.len(), 2);
-            assert_eq!(
-                checks[1].settings.stage,
-                LearningStage::Shadow,
-                "recorded, not applied"
-            );
-            assert_eq!(checks[1].current, Some(Pick::new("local2", "m")));
+            assert_eq!(checks.len(), 1, "no provider question right after a move");
+            assert_eq!(checks[0].current, Some(Pick::new("local", "m")));
         }
 
         /// A session driven by the settings (`full` + `shadow`, nothing chosen on the
