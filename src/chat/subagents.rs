@@ -64,15 +64,19 @@
 //!
 //! What a child may not do: ask the user (`AskUserQuestion` is denied to a spawned native
 //! session; a question seen anyway fails the call at once); wait for a permission (round 3,
-//! fix B: a request still unanswered [`UNANSWERED_ASK_GRACE`] after it was shown fails the
-//! call, and the child is closed like on every other end — nobody watches a sub-agent's
-//! session, so the request would otherwise hold the parent until its 30-minute turn
-//! timeout); return more than [`MAX_ANSWER_CHARS`] characters (the rest is cut, and said).
-//! Failing fast was chosen over opening the child with a deny-instead-of-ask policy: the
-//! harness has no such mode (`PolicyMode` is plan / ask / auto-edits / trust), and a fail
-//! needs no new policy plumbing and no new prompt — the parent's model reads why and does the
-//! step itself. The grace exists for a request the backend answers by itself (a lasting
-//! rule of the child's owner covers it: its `permission_decision` follows within moments).
+//! fix B, made deterministic by the review of #724: a request the backend does not answer
+//! itself — no grant of the child, no lasting rule of its owner covers it, which the child's
+//! session decides BEFORE it shows the request — fails the call at once; the child's waiting
+//! requests are then answered `deny` through the path a user's answer takes, so none is
+//! left in its owner's cockpit, and the child is closed like on every other end — the request
+//! would otherwise hold the parent until its 30-minute turn timeout. A person who opens the
+//! child (its run is listed, its state live) sees the request but cannot answer it: that is
+//! the choice made, not an oversight); return more than [`MAX_ANSWER_CHARS`] characters (the rest is
+//! cut, and said). Failing fast was chosen over opening the child with a
+//! deny-instead-of-ask policy: the harness has no such mode (`PolicyMode` is plan / ask /
+//! auto-edits / trust), and a fail needs no new policy plumbing and no new prompt — the
+//! parent's model reads why and does the step itself. A covered request never fails the
+//! call, however long its automatic answer takes (unless that answer fails).
 //! The call otherwise waits as long as the child works, bounded by the parent's turn
 //! timeout. Budget and cost of the children are not counted in the parent's (task B36).
 
@@ -476,6 +480,7 @@ impl ChatManager {
         };
         #[cfg(test)]
         panic_injection::panic_if_injected(parent_session_id);
+        self.deny_waiting_permissions(&child_id).await;
         if let Err(e) = self.close_session(&child_id).await {
             tracing::debug!(child = %child_id, error = %e, "sub-agent close");
         }
@@ -486,21 +491,69 @@ impl ChatManager {
         answer
     }
 
+    /// Answers `deny` to every permission request the child `sid` still waits on, through
+    /// the path a user's answer takes ([`ChatManager::route_permission_response`]): its
+    /// `permission_decision` lands on the child's thread, so a request nobody will ever
+    /// answer (the call failed on it, fix B) is no orphan in the cockpit of the child's
+    /// owner for 30 days once the child is closed (review of #724, point 1). The requests
+    /// are the live session's, and those its stored thread shows undecided.
+    async fn deny_waiting_permissions(&self, sid: &str) {
+        let mut ids: Vec<String> = match self.agent_runtime.get(sid).await {
+            Some(handle) => handle.waiting_permission_ids(),
+            None => Vec::new(),
+        };
+        let persisted = self.persisted_events(sid).await;
+        let mut decided = std::collections::HashSet::new();
+        for event in &persisted {
+            if let ChatEvent::PermissionDecision { id, .. } = event {
+                decided.insert(id.clone());
+            }
+        }
+        for event in &persisted {
+            if let ChatEvent::PermissionRequest { id, .. } = event {
+                if !decided.contains(id) && !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        for id in ids {
+            if let Err(e) = self
+                .route_permission_response(
+                    sid,
+                    &id,
+                    false,
+                    super::types::PermissionAnswerScope::Once,
+                    false,
+                )
+                .await
+            {
+                tracing::debug!(child = %sid, request = %id, error = %e, "sub-agent permission deny");
+            }
+        }
+    }
+
     /// The first `result` of the session `sid`, live or already persisted.
     async fn wait_for_answer(&self, sid: &str) -> Result<String, String> {
         let rx = self
             .subscribe(sid)
             .await
             .map_err(|e| format!("the sub-agent cannot be followed: {e:#}"))?;
-        self.answer_from(sid, rx).await
+        // Whether the backend answers a request of the child itself: decided by the child's
+        // session before the request is broadcast (`AgentSessionHandle::answers_itself`).
+        let handle = self.agent_runtime.get(sid).await;
+        let answers_itself = |id: &str| handle.as_ref().is_some_and(|h| h.answers_itself(id));
+        self.answer_from(sid, rx, &answers_itself).await
     }
 
-    /// [`Self::wait_for_answer`] on a subscription already taken — the seam the test of a
-    /// lagged subscription drives.
+    /// [`Self::wait_for_answer`] on a subscription already taken — the seam the tests of a
+    /// lagged subscription and of a permission request drive. `answers_itself` says whether
+    /// the backend answers a request of the child itself (a grant or a lasting rule covers
+    /// it).
     pub(super) async fn answer_from(
         &self,
         sid: &str,
         mut rx: tokio::sync::broadcast::Receiver<ChatEvent>,
+        answers_itself: &(dyn Fn(&str) -> bool + Send + Sync),
     ) -> Result<String, String> {
         let mut watch = Watch::default();
         // A turn that ended before the subscription is in the store.
@@ -512,19 +565,20 @@ impl ChatManager {
         // number of attempts, since the child's events may land on its thread long after
         // the drop (a verbose child is exactly the one that lags). The tick spaces those
         // reads one second apart however often the stream lags, so a chatty child does not
-        // make the parent hammer the store; it also wakes the loop while a permission
-        // request waits (fix B).
+        // make the parent hammer the store; it also wakes the loop while a request the
+        // backend answers itself waits for that answer (its answer may fail: then nobody
+        // answers it).
         let mut tick = tokio::time::interval(READ_BACK_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut lagged = false;
         loop {
-            if let Some(end) = watch.unanswered_ask(tokio::time::Instant::now()) {
+            if let Some(end) = watch.unanswered_ask(answers_itself) {
                 return end;
             }
             tokio::select! {
                 received = rx.recv() => match received {
                     Ok(event) => {
-                        if let Some(end) = watch.observe(event, tokio::time::Instant::now()) {
+                        if let Some(end) = watch.observe(event) {
                             return end;
                         }
                     }
@@ -560,7 +614,7 @@ impl ChatManager {
     /// here). `None` while the thread shows no end.
     async fn read_back(&self, sid: &str, watch: &mut Watch) -> Option<Result<String, String>> {
         let persisted = self.persisted_events(sid).await;
-        watch.reconcile(&persisted, tokio::time::Instant::now());
+        watch.reconcile(&persisted);
         if let Some(answer) = answer_of(&persisted) {
             return Some(answer);
         }
@@ -606,21 +660,17 @@ impl ChatManager {
 #[derive(Default)]
 struct Watch {
     seen: Vec<ChatEvent>,
-    /// Request id → (tool, when the parent first saw it waiting).
-    asks: std::collections::HashMap<String, (String, tokio::time::Instant)>,
+    /// Request id → (tool, order in which the parent first saw it waiting).
+    asks: std::collections::HashMap<String, (String, usize)>,
+    /// How many requests were seen: the order of the next one.
+    asked: usize,
 }
 
 impl Watch {
     /// Takes one live event; the end of the call when this event ends it.
-    fn observe(
-        &mut self,
-        event: ChatEvent,
-        now: tokio::time::Instant,
-    ) -> Option<Result<String, String>> {
+    fn observe(&mut self, event: ChatEvent) -> Option<Result<String, String>> {
         match &event {
-            ChatEvent::PermissionRequest { id, tool, .. } => {
-                self.asks.entry(id.clone()).or_insert((tool.clone(), now));
-            }
+            ChatEvent::PermissionRequest { id, tool, .. } => self.ask(id, tool),
             ChatEvent::PermissionDecision { id, .. } => {
                 self.asks.remove(id);
             }
@@ -635,8 +685,11 @@ impl Watch {
             return Some(answer_of(&self.seen).unwrap_or_else(|| Ok(String::new())));
         }
         if closed {
-            // A child can also close without this event reaching the parent (dropped, a
-            // crash, a restart): the read-back after a `Lagged` sees it on the thread.
+            // A child can also close without this event reaching the parent: when it was
+            // dropped, the read-back after the `Lagged` sees the close on the thread; when
+            // the stream just ends, the read-back on `Closed` does. A close the stream never
+            // carried while it stays open (a clone of `events_tx` alive) and never lags is
+            // NOT caught: the parent then waits until its turn timeout.
             return Some(Err(CLOSED_BEFORE_ANSWER.into()));
         }
         None
@@ -644,10 +697,10 @@ impl Watch {
 
     /// Brings the waiting requests in line with the stored thread: what it shows decided
     /// is not waiting any more, what it shows asked and undecided is.
-    fn reconcile(&mut self, persisted: &[ChatEvent], now: tokio::time::Instant) {
+    fn reconcile(&mut self, persisted: &[ChatEvent]) {
         for event in persisted {
             if let ChatEvent::PermissionRequest { id, tool, .. } = event {
-                self.asks.entry(id.clone()).or_insert((tool.clone(), now));
+                self.ask(id, tool);
             }
         }
         for event in persisted {
@@ -657,18 +710,35 @@ impl Watch {
         }
     }
 
+    /// A request of the child waits from now on (a second sight of it changes nothing).
+    fn ask(&mut self, id: &str, tool: &str) {
+        if !self.asks.contains_key(id) {
+            self.asks
+                .insert(id.to_owned(), (tool.to_owned(), self.asked));
+            self.asked += 1;
+        }
+    }
+
     fn is_asking(&self) -> bool {
         !self.asks.is_empty()
     }
 
-    /// The failure of the call when a permission request of the child has waited past
-    /// [`UNANSWERED_ASK_GRACE`]: nobody watches a sub-agent's session, so nobody would
-    /// answer it before the parent's turn timeout.
-    fn unanswered_ask(&self, now: tokio::time::Instant) -> Option<Result<String, String>> {
+    /// The failure of the call when a permission request of the child waits that the
+    /// backend does not answer itself (`answers_itself`: no grant, no lasting rule covers
+    /// it, or its automatic answer failed): a sub-agent does not wait for a person, and an
+    /// unanswered request would hold the parent until its turn timeout. Decided at once, with no grace
+    /// (review of #724): the backend knows whether it answers a request before the request
+    /// is shown. Several such requests: the first one seen names the tool.
+    fn unanswered_ask(
+        &self,
+        answers_itself: &(dyn Fn(&str) -> bool + Send + Sync),
+    ) -> Option<Result<String, String>> {
         let (tool, _) = self
             .asks
-            .values()
-            .find(|(_, since)| now.duration_since(*since) >= UNANSWERED_ASK_GRACE)?;
+            .iter()
+            .filter(|(id, _)| !answers_itself(id))
+            .map(|(_, ask)| ask)
+            .min_by_key(|(_, order)| *order)?;
         Some(Err(format!(
             "the sub-agent needed a permission for `{tool}`, and a sub-agent cannot ask for one \
              (nobody answers in its session): do that step yourself, or give it a task that \
@@ -680,18 +750,11 @@ impl Watch {
 /// What the call answers when the child closed before its `result`.
 const CLOSED_BEFORE_ANSWER: &str = "the sub-agent's session was closed before it answered";
 
-/// How long a permission request of the child may wait before the call fails (P18b round
-/// 3, fix B). A request one of the child's own grants covers (a lasting rule of its owner)
-/// is answered by the backend itself within moments of being shown
-/// (`AgentSessionHandle::emit`: its `permission_decision` follows); anything still waiting
-/// after this has nobody to answer it.
-const UNANSWERED_ASK_GRACE: Duration = Duration::from_secs(3);
-
-/// How often the parent re-reads the thread of a child whose stream lagged, and checks its
-/// waiting permission requests (P18b round 3, fix C).
+/// How often the parent re-reads the thread of a child whose stream lagged, and checks the
+/// permission requests of the child the backend answers itself (P18b round 3, fix C).
 const READ_BACK_EVERY: Duration = Duration::from_secs(1);
 
-/// How many of a child's most recent persisted events [`ChatManager::persisted_answer`]
+/// How many of a child's most recent persisted events `ChatManager::persisted_events`
 /// reads back (P18b round 2, fix 5): enough for `answer_of` to find a `result` that is
 /// not buried under a very chatty child's thread, without reading the whole thing.
 const PERSISTED_READ_WINDOW: i64 = 5_000;
@@ -783,7 +846,7 @@ mod tests {
         let waiting = {
             let manager = manager.clone();
             let sid = sid.clone();
-            tokio::spawn(async move { manager.answer_from(&sid, rx).await })
+            tokio::spawn(async move { manager.answer_from(&sid, rx, &|_| false).await })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Overrun: eight events into two slots, without yielding to the reader.
@@ -824,20 +887,25 @@ mod tests {
         drop(tx);
     }
 
-    /// P18b round 3, fix B: a permission request of the child nobody answers fails the call
-    /// within [`UNANSWERED_ASK_GRACE`], not at the parent's turn timeout; one the backend
-    /// answers itself (a grant covers it: its `permission_decision` follows) does not.
+    /// P18b round 3, fix B, made deterministic by the review of #724: a permission request
+    /// of the child the backend does not answer itself fails the call AT ONCE, not after a
+    /// grace nor at the parent's turn timeout; one it answers itself (a grant or a lasting
+    /// rule covers it) never fails it, however late its `permission_decision` comes —
+    /// unless that automatic answer fails, and then the request fails the call too. Red
+    /// before: an uncovered request waited 3 s, and a covered one whose answer took longer
+    /// than that failed the call.
     #[tokio::test(start_paused = true)]
-    async fn an_unanswered_permission_fails_the_call_and_a_covered_one_does_not() {
+    async fn an_uncovered_permission_fails_the_call_at_once_and_a_covered_one_never() {
         let (_graph, manager) = bare_manager();
         let sid = Uuid::new_v4().to_string();
 
+        // Uncovered: failed at once (paused time: no tick, no grace elapsed).
         let (tx, rx) = tokio::sync::broadcast::channel::<ChatEvent>(16);
         let started = tokio::time::Instant::now();
         let waiting = {
             let manager = manager.clone();
             let sid = sid.clone();
-            tokio::spawn(async move { manager.answer_from(&sid, rx).await })
+            tokio::spawn(async move { manager.answer_from(&sid, rx, &|_| false).await })
         };
         tx.send(asked("p1")).unwrap();
         let out = tokio::time::timeout(Duration::from_secs(60), waiting)
@@ -849,16 +917,29 @@ mod tests {
                 .is_err_and(|e| e.contains("permission") && e.contains("Bash")),
             "{out:?}"
         );
-        assert!(started.elapsed() < UNANSWERED_ASK_GRACE + READ_BACK_EVERY * 2);
+        assert!(
+            started.elapsed() < READ_BACK_EVERY,
+            "{:?}",
+            started.elapsed()
+        );
 
-        // Covered: decided right away, then the child goes on and answers.
+        // Covered: its automatic answer is late (30 s, ten times the old grace); the call
+        // waits, then the child goes on and answers.
+        let covered = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (tx, rx) = tokio::sync::broadcast::channel::<ChatEvent>(16);
         let waiting = {
             let manager = manager.clone();
             let sid = sid.clone();
-            tokio::spawn(async move { manager.answer_from(&sid, rx).await })
+            let covered = covered.clone();
+            tokio::spawn(async move {
+                let answers_itself =
+                    move |id: &str| id == "p2" && covered.load(std::sync::atomic::Ordering::SeqCst);
+                manager.answer_from(&sid, rx, &answers_itself).await
+            })
         };
         tx.send(asked("p2")).unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!waiting.is_finished(), "a covered request does not fail it");
         tx.send(ChatEvent::PermissionDecision {
             id: "p2".into(),
             allow: true,
@@ -866,7 +947,7 @@ mod tests {
             rule: None,
         })
         .unwrap();
-        tokio::time::sleep(UNANSWERED_ASK_GRACE * 3).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(!waiting.is_finished(), "a decided request does not fail it");
         tx.send(ChatEvent::Result {
             session_id: sid.clone(),
@@ -883,6 +964,29 @@ mod tests {
         })
         .unwrap();
         assert_eq!(waiting.await.unwrap(), Ok("DONE".to_string()));
+
+        // Covered, but its automatic answer failed: nobody answers it any more.
+        let (tx, rx) = tokio::sync::broadcast::channel::<ChatEvent>(16);
+        let waiting = {
+            let manager = manager.clone();
+            let sid = sid.clone();
+            let covered = covered.clone();
+            tokio::spawn(async move {
+                let answers_itself =
+                    move |id: &str| id == "p2" && covered.load(std::sync::atomic::Ordering::SeqCst);
+                manager.answer_from(&sid, rx, &answers_itself).await
+            })
+        };
+        tx.send(asked("p2")).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!waiting.is_finished());
+        covered.store(false, std::sync::atomic::Ordering::SeqCst);
+        let out = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("a request whose automatic answer failed fails the call")
+            .unwrap();
+        assert!(out.is_err_and(|e| e.contains("Bash")));
+        drop(tx);
     }
 
     /// P18b round 2, fix 3: a guard still armed when it drops runs its backstop exactly
