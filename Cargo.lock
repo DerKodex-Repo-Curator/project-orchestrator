@@ -5228,7 +5228,7 @@ dependencies = [
 [[package]]
 name = "nexus-tools"
 version = "0.5.0"
-source = "git+https://github.com/this-rs/nexus.git?rev=cc92412e8aa6ebff6f75042ed8457c5aa42db5a6#cc92412e8aa6ebff6f75042ed8457c5aa42db5a6"
+source = "git+https://github.com/this-rs/nexus.git?rev=82cb6f8ffbac2394b45a53d3d4d05d903f27e7f0#82cb6f8ffbac2394b45a53d3d4d05d903f27e7f0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
