@@ -2446,6 +2446,21 @@ pub(crate) fn host_degraded(
     missing
 }
 
+/// Whether `spec` carries the project-orchestrator server WITHOUT a session token while
+/// the server signs its tokens (`signing`): that server shows its tools and authorises
+/// none ([`spec_tool_profile`]). A session opened without its caller's identity (the
+/// restart recovery) is in that case.
+pub(crate) fn po_server_unauthorised(
+    spec: &nexus_claude::agent::SessionSpec,
+    signing: bool,
+) -> bool {
+    signing
+        && matches!(
+            spec.mcp_servers.get(PO_MCP_SERVER),
+            Some(nexus_claude::agent::McpServerSpec::Stdio { env, .. }) if !env.contains_key("PO_AUTH_TOKEN")
+        )
+}
+
 /// Opens (or resumes) a session with `spec` through `open`. A provider that learned,
 /// between the reading of its capabilities and this opening, that it takes no MCP
 /// server per session (two first sessions opened at once on an ACP agent that refuses
@@ -10182,53 +10197,11 @@ impl ChatManager {
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
-        // Sessions stored without a slug (all-projects mode) resume with the
-        // project inferred from their cwd, like create_session does.
-        if session_node.project_slug.is_none() {
-            session_node.project_slug = infer_session_project(
-                self.graph.as_ref(),
-                self.anchor_mode,
-                Some(uuid),
-                session_node.execution_place,
-                &session_node.cwd,
-            )
-            .await;
-        }
-
-        // The provider is frozen at open (A16): a resume never re-resolves. The
-        // legacy path only drives Claude Code, so a session bound to another
-        // provider cannot be resumed here.
-        let frozen = super::provider::resolver::resolve_for_open(
-            session_node.provider_id.as_deref(),
-            true,
-            None,
-            &super::provider::resolver::BuiltinCatalog,
-        )
-        .map_err(anyhow::Error::new)?;
-        if frozen.provider_id != super::provider::resolver::CLAUDE_CODE
-            && session_node.capabilities.is_none()
-        {
-            return Err(anyhow::Error::new(
-                super::provider::resolver::ResolveError::Unavailable {
-                    provider_id: frozen.provider_id,
-                    role: super::provider::resolver::Role::Pilot,
-                },
-            ));
-        }
+        self.ready_for_resume(&mut session_node).await?;
 
         // A session opened by the agent engine carries its capability snapshot:
-        // it resumes on that engine, and only when that engine is switched on.
+        // it resumes on that engine (`ready_for_resume` checked it is switched on).
         if session_node.capabilities.is_some() {
-            // A third-party session always resumes on the agent engine. A Claude
-            // Code session that was forced onto it needs the flag still on:
-            // otherwise a typed, explicit error (not a mute `provider_unavailable`).
-            if !self.engine_is_agent(&frozen.provider_id) {
-                return Err(anyhow::Error::new(
-                    super::provider::resolver::ResolveError::EngineUnavailable {
-                        provider_id: frozen.provider_id,
-                    },
-                ));
-            }
             return self
                 .resume_agent_session(&session_node, message, user_claims, seen)
                 .await;
@@ -10699,6 +10672,52 @@ impl ChatManager {
         )
         .await;
 
+        Ok(())
+    }
+
+    /// What every resume checks before it reopens a session, a person's
+    /// ([`Self::resume_session_from`]) as the restart recovery's (`recovery.rs`, which
+    /// used to skip it: review of #697, finding 9): a session stored without a slug
+    /// (all-projects mode) gets the project inferred from its cwd, as `create_session`
+    /// does; its provider stays the one frozen at open (A16) — the legacy path only drives
+    /// Claude Code, so a session bound to another provider cannot be resumed there — and a
+    /// session of the agent engine resumes only when that engine is switched on (a Claude
+    /// Code session forced onto it needs the flag still on: otherwise a typed, explicit
+    /// error, not a mute `provider_unavailable`).
+    pub(crate) async fn ready_for_resume(&self, node: &mut ChatSessionNode) -> Result<()> {
+        if node.project_slug.is_none() {
+            node.project_slug = infer_session_project(
+                self.graph.as_ref(),
+                self.anchor_mode,
+                Some(node.id),
+                node.execution_place,
+                &node.cwd,
+            )
+            .await;
+        }
+        let frozen = super::provider::resolver::resolve_for_open(
+            node.provider_id.as_deref(),
+            true,
+            None,
+            &super::provider::resolver::BuiltinCatalog,
+        )
+        .map_err(anyhow::Error::new)?;
+        if node.capabilities.is_none() {
+            if frozen.provider_id != super::provider::resolver::CLAUDE_CODE {
+                return Err(anyhow::Error::new(
+                    super::provider::resolver::ResolveError::Unavailable {
+                        provider_id: frozen.provider_id,
+                        role: super::provider::resolver::Role::Pilot,
+                    },
+                ));
+            }
+        } else if !self.engine_is_agent(&frozen.provider_id) {
+            return Err(anyhow::Error::new(
+                super::provider::resolver::ResolveError::EngineUnavailable {
+                    provider_id: frozen.provider_id,
+                },
+            ));
+        }
         Ok(())
     }
 
@@ -14105,6 +14124,20 @@ impl ChatManager {
                 }
             }
         }
+        self.reopen_agent_session(node, message, user_claims).await
+    }
+
+    /// The reopening itself of [`Self::resume_agent_session`]: the caller HOLDS the
+    /// session's resume lock (`resume_locks`) and has decided there is nothing live to
+    /// deliver to — a person's resume, or the restart recovery, which skips a session
+    /// another resume brought back instead of writing into it (`recovery.rs`).
+    pub(super) async fn reopen_agent_session(
+        &self,
+        node: &ChatSessionNode,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+    ) -> Result<()> {
+        let sid = node.id.to_string();
         let provider_id = node
             .provider_id
             .clone()
@@ -14214,6 +14247,17 @@ impl ChatManager {
         // The project's files are on this machine unless the instance is remote.
         let project_dir = (!super::provider::resolver::is_remote_instance(&provider_id))
             .then(|| spec.cwd.clone());
+        // A resume without its owner's identity (the restart recovery: the owner's claims
+        // are not stored on the session) carries the PO server but no token for it while
+        // the server signs its tokens: every PO tool would be refused. Said, not silent
+        // (review of #697, finding 8b).
+        if po_server_unauthorised(&spec, self.config.jwt_secret.is_some())
+            && !host_missing
+                .iter()
+                .any(|f| f == super::agent_runtime::PO_TOOLS_FEATURE)
+        {
+            host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+        }
         let (session, dropped) = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
             let provider = Arc::clone(&provider);
             let token = token.clone();
@@ -14230,7 +14274,12 @@ impl ChatManager {
         if without_mcp {
             // As at an opening: the token went out in the refused request.
             cleanup.revoke_token();
-            host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+            if !host_missing
+                .iter()
+                .any(|f| f == super::agent_runtime::PO_TOOLS_FEATURE)
+            {
+                host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+            }
         }
         let latest = self
             .graph
@@ -18924,6 +18973,21 @@ mod tests {
         super::super::agent_runtime::fake::FakeProvider,
         Uuid,
     ) {
+        restarted_with(tail, chrono::Duration::zero(), |_| {}).await
+    }
+
+    /// [`restarted_with_tail`], the events stored `age` ago, the server after the restart
+    /// configured by `tweak`.
+    async fn restarted_with(
+        tail: &[(&str, &str)],
+        age: chrono::Duration,
+        tweak: impl FnOnce(&mut ChatConfig),
+    ) -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+        Uuid,
+    ) {
         let (before, graph, _fake) = agent_manager();
         let created = before
             .create_session(&agent_request("hello"))
@@ -18942,7 +19006,7 @@ mod tests {
                         seq: i as i64 + 1,
                         event_type: event_type.to_string(),
                         data: data.to_string(),
-                        created_at: chrono::Utc::now(),
+                        created_at: chrono::Utc::now() - age,
                     }],
                 )
                 .await
@@ -18951,6 +19015,7 @@ mod tests {
         let dyn_graph: Arc<dyn GraphStore> = graph.clone();
         let mut config = test_config();
         config.provider_path = crate::chat::config::ProviderPath::Agent;
+        tweak(&mut config);
         let fake = super::super::agent_runtime::fake::FakeProvider::new();
         let after = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
             .with_provider_source(Arc::new(fake.clone()));
@@ -18964,6 +19029,14 @@ mod tests {
             (
                 "assistant_text",
                 r#"{"type":"assistant_text","content":"I start"}"#,
+            ),
+            (
+                "tool_use",
+                r#"{"type":"tool_use","id":"t1","tool":"Read","input":{"path":"a.rs"}}"#,
+            ),
+            (
+                "tool_result",
+                r#"{"type":"tool_result","id":"t1","result":"ok"}"#,
             ),
         ])
         .await;
@@ -18980,6 +19053,326 @@ mod tests {
             "{}",
             turns[0]
         );
+        // What the PROVIDER received carries the cut turn rebuilt from the stored events
+        // (follow-up review of #697, nit): the request, and the tool already run.
+        assert!(turns[0].contains("User: go"), "{}", turns[0]);
+        assert!(
+            turns[0].contains("Called: Read(") && turns[0].contains("result received"),
+            "{}",
+            turns[0]
+        );
+    }
+
+    /// A provider instance named `claude-code` whose key is a `vault:` reference: the fake
+    /// still plays the provider, the recovery reads the record to know it needs the vault.
+    async fn vault_backed_claude_code(graph: &crate::neo4j::mock::MockGraphStore) {
+        let record = crate::chat::provider::settings::InstanceRecord {
+            id: "claude-code".into(),
+            kind: "openai_compat".into(),
+            label: "vault-backed".into(),
+            cost_source: "none".into(),
+            credential_ref: "vault:the-key".into(),
+            ..Default::default()
+        };
+        super::super::agent_e2e_tests::store_instance(graph, &record).await;
+    }
+
+    async fn events_of(
+        graph: &crate::neo4j::mock::MockGraphStore,
+        sid: Uuid,
+    ) -> Vec<ChatEventRecord> {
+        graph.get_chat_events(sid, 0, 500).await.unwrap()
+    }
+
+    fn assert_closed_by_recovery(events: &[ChatEventRecord]) {
+        let last = events.last().expect("events");
+        assert_eq!(last.event_type, "error", "{events:?}");
+        assert!(last.data.contains("restart_interrupted"), "{}", last.data);
+        let mut seqs: Vec<i64> = events.iter().map(|e| e.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(
+            seqs.len(),
+            events.len(),
+            "every seq is used once: {events:?}"
+        );
+    }
+
+    /// R1 (follow-up review of #697): a person resumes the session while the recovery is
+    /// about to. The recovery waits for the session's resume lock, sees the session the
+    /// person brought back, and SKIPS it: its "continue" never reaches the person's live
+    /// session (it used to be queued there, interrupting the person's turn).
+    #[tokio::test]
+    async fn a_session_the_user_resumed_meanwhile_is_skipped_not_written_into() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(300));
+        let manager = Arc::new(manager);
+        let person = {
+            let manager = manager.clone();
+            tokio::spawn(
+                async move { manager.resume_session(&sid.to_string(), "mine", None).await },
+            )
+        };
+        // The person's resume holds the lock, its provider still opening.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(manager.agent_runtime.get(&sid.to_string()).await.is_none());
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        person.await.unwrap().unwrap();
+        assert_eq!((report.resumed, report.skipped, report.failed), (0, 1, 0));
+        assert_eq!(
+            fake.state.turns_started.lock().unwrap().clone(),
+            vec!["mine".to_string()]
+        );
+        assert!(
+            fake.state.interrupts.lock().unwrap().is_empty(),
+            "the person's turn is not interrupted"
+        );
+        let events = events_of(&graph, sid).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.data.contains(recovery::RESUME_MARKER) || e.event_type == "error"),
+            "nothing of the recovery in the live session: {events:?}"
+        );
+    }
+
+    /// R1 / finding 9 of #697: a resume that fails AFTER it adopted the session (its first
+    /// message refused) used to write its `error` at the seq it saw at the scan — the seq
+    /// its own resume message had just taken — and to leave the handle live.
+    #[tokio::test]
+    async fn a_resume_that_fails_after_adopting_writes_its_error_after_its_events() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        *fake.state.fail_next_turn.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::invalid("refused"));
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1));
+        assert!(
+            !manager.agent_runtime.owns(&sid.to_string()).await,
+            "the failed attempt's session is ended"
+        );
+        assert_closed_by_recovery(&events_of(&graph, sid).await);
+    }
+
+    /// Finding 8c of #697: a provider not ready yet at boot (a transient error) is tried
+    /// again; it used to close the turn for good.
+    #[tokio::test]
+    async fn a_transient_failure_is_tried_again_before_the_turn_is_closed() {
+        let (manager, _graph, fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        *fake.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::Overloaded);
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!((report.resumed, report.retried, report.failed), (1, 1, 0));
+        assert_eq!(fake.state.turns_started.lock().unwrap().len(), 1);
+    }
+
+    /// Finding 9 of #697: the recovery checks what a person's resume checks. A Claude Code
+    /// session forced onto the agent engine, after a restart WITHOUT the flag, is not
+    /// reopened on the agent engine behind the person's back: closed, typed refusal.
+    #[tokio::test]
+    async fn the_recovery_refuses_a_session_whose_engine_was_switched_off() {
+        let (manager, graph, fake, sid) = restarted_with(
+            &[("user_message", "{}"), ("assistant_text", "{}")],
+            chrono::Duration::zero(),
+            |config| config.provider_path = Default::default(),
+        )
+        .await;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+        assert_closed_by_recovery(&events_of(&graph, sid).await);
+    }
+
+    /// Finding 7 of #697: a locked vault holds back only the sessions whose provider reads
+    /// its key there. A built-in provider (no stored instance) resumes at once.
+    #[tokio::test]
+    async fn a_session_that_needs_no_vault_resumes_while_the_vault_is_locked() {
+        let (manager, _graph, fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let vault = crate::vault::VaultService::ephemeral();
+        let manager = manager.with_vault(vault.clone());
+        assert!(!vault.is_unlocked(chrono::Utc::now()));
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(
+                pending,
+                Duration::from_millis(10),
+                Duration::from_millis(500),
+            )
+            .await;
+        assert_eq!((report.resumed, report.abandoned), (1, 0));
+        assert_eq!(fake.state.turns_started.lock().unwrap().len(), 1);
+    }
+
+    /// R2: a cut turn of an orchestrator child is not resumed (its orchestrator relaunches
+    /// the task), and it is CLOSED so it no longer shows "streaming" (it used to be skipped
+    /// in silence). Also the scan's skip of the children, end to end (nit of the follow-up).
+    #[tokio::test]
+    async fn a_cut_child_of_an_orchestrator_is_closed_not_resumed() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        node.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Runner {
+                run_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: None,
+            }
+            .to_json_string(),
+        );
+        graph.create_chat_session(&node).await.unwrap();
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+        assert_closed_by_recovery(&events_of(&graph, sid).await);
+        let (_, again) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(again.closed, 0, "closed once");
+    }
+
+    /// R2: a turn cut longer ago than the window is closed, not left "streaming". Its
+    /// `updated_at` is recent (a long turn does not refresh it): judged on the last event.
+    #[tokio::test]
+    async fn a_turn_cut_out_of_the_window_is_closed() {
+        let (manager, graph, fake, sid) = restarted_with(
+            &[("user_message", "{}"), ("assistant_text", "{}")],
+            chrono::Duration::hours(2),
+            |_| {},
+        )
+        .await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+        assert_closed_by_recovery(&events_of(&graph, sid).await);
+    }
+
+    /// Finding 10 of #697 / R2: a cut turn of a Claude Code CLI session (no capability
+    /// snapshot) is not resumed by this recovery, and it is closed instead of staying
+    /// "streaming".
+    #[tokio::test]
+    async fn a_cut_turn_of_a_cli_session_is_closed_at_boot() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("tool_use", "{}")]).await;
+        let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        node.capabilities = None;
+        graph.create_chat_session(&node).await.unwrap();
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+        assert_closed_by_recovery(&events_of(&graph, sid).await);
+    }
+
+    /// A session live on this server (a run relaunched while the boot scans) is not a turn
+    /// the restart cut: neither queued nor closed.
+    #[tokio::test]
+    async fn a_session_live_here_is_neither_queued_nor_closed_by_the_scan() {
+        let (manager, graph, fake) = agent_manager();
+        let created = manager.create_session(&agent_request("hi")).await.unwrap();
+        let sid = Uuid::parse_str(&created.session_id).unwrap();
+        assert_eq!(fake.state.turns_started.lock().unwrap().len(), 1);
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 0));
+        assert!(!events_of(&graph, sid)
+            .await
+            .iter()
+            .any(|e| e.event_type == "error"));
+        manager.close_session(&created.session_id).await.unwrap();
+    }
+
+    /// Finding 8a of #697: closing a cut turn is published, not only written: the session
+    /// lists learn the session no longer streams.
+    #[tokio::test]
+    async fn closing_a_cut_turn_is_published_for_the_session_lists() {
+        let (manager, _graph, _fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("permission_request", "{}")]).await;
+        let bus = Arc::new(crate::events::EventBus::new(16));
+        let mut rx = bus.subscribe();
+        let manager = manager.with_event_emitter(bus.clone());
+        let (_, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(scan.closed, 1);
+        let event = rx.try_recv().expect("a session update");
+        assert_eq!(event.entity_id, sid.to_string());
+        assert_eq!(event.payload["is_streaming"], serde_json::json!(false));
+    }
+
+    /// Finding 8b of #697: a session reopened without its owner's identity, on a server
+    /// that signs its tokens, has the PO server but no token for it: it SAYS it lacks the
+    /// PO tools instead of losing them silently.
+    #[tokio::test]
+    async fn a_recovered_session_says_it_has_no_po_tools_without_its_owner() {
+        let (manager, graph, fake, sid) = restarted_with(
+            &[("user_message", "{}"), ("assistant_text", "{}")],
+            chrono::Duration::zero(),
+            |config| config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into()),
+        )
+        .await;
+        // A session that carries its MCP servers: the resumed spec HAS the PO server.
+        let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(node.capabilities.as_deref().unwrap()).unwrap();
+        snapshot["per_session_mcp"] = serde_json::json!(true);
+        node.capabilities = Some(snapshot.to_string());
+        graph.create_chat_session(&node).await.unwrap();
+        // And whose provider says it carries them: only the missing token is left to say.
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!(report.resumed, 1);
+        let spec = fake
+            .state
+            .opened_specs
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        match spec.mcp_servers.get(PO_MCP_SERVER) {
+            Some(nexus_claude::agent::McpServerSpec::Stdio { env, .. }) => {
+                assert!(!env.contains_key("PO_AUTH_TOKEN"), "no owner, no token")
+            }
+            other => panic!("the resumed spec carries the PO server: {other:?}"),
+        }
+        let sid = sid.to_string();
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state
+            .push(nexus_claude::agent::AgentEvent::SessionStarted {
+                provider_session_id: Some("p1".into()),
+                model: Some("m".into()),
+                policy_mode: None,
+                native_mode: None,
+                tools: vec![],
+                mcp_servers: vec![],
+                cwd: None,
+            });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        let wire = serde_json::to_value(&init).unwrap();
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
+        assert_eq!(
+            degraded
+                .iter()
+                .filter(|f| *f == super::super::agent_runtime::PO_TOOLS_FEATURE)
+                .count(),
+            1,
+            "{degraded:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
     }
 
     #[tokio::test]
@@ -19036,8 +19429,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_recovery_waits_while_the_vault_is_locked_then_resumes() {
-        let (manager, _graph, fake, _sid) =
+        let (manager, graph, fake, _sid) =
             restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        vault_backed_claude_code(&graph).await;
         let vault = crate::vault::VaultService::ephemeral();
         let manager = manager.with_vault(vault.clone());
         assert!(
@@ -19069,8 +19463,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_recovery_that_waits_for_ever_gives_up_and_says_so() {
-        let (manager, _graph, _fake, _sid) =
+        let (manager, graph, _fake, sid) =
             restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        vault_backed_claude_code(&graph).await;
         let manager = manager.with_vault(crate::vault::VaultService::ephemeral());
         let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
         let report = manager
@@ -19081,6 +19476,8 @@ mod tests {
             )
             .await;
         assert_eq!((report.resumed, report.abandoned), (0, 1));
+        // R2: what the recovery gives up on is closed, not left "streaming".
+        assert_closed_by_recovery(&events_of(&graph, sid).await);
     }
 
     /// A third-party instance (`acp`) a project consented to, played by the fake.
