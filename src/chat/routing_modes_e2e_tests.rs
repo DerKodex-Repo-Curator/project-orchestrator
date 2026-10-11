@@ -528,6 +528,61 @@ async fn a_pool_conversation_opens_on_the_model_decided_among_the_pool_not_on_th
     assert!(turns(&w.primary).is_empty());
 }
 
+/// Review of #713, C1: a `full` conversation with a pool, MOVED by the router, opens the new
+/// session on the target the router decided (`worker/wb`), never on a decision taken again
+/// among the pool at the opening (the arms prefer `wa` for this simple message). The relayed
+/// request names the target with the pool and `full` read from the session: R-S4's pilot
+/// rule is for the menu's `mixed` only.
+#[tokio::test]
+async fn a_full_conversation_with_a_pool_moved_by_the_router_opens_on_its_target() {
+    use super::provider::cognitive::ConversationRoutingMode;
+    use super::types::RoutingPoolEntry;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut full = pilot();
+    full.provider = Some("primary".into());
+    full.model = Some("pm".into());
+    full.routing_mode = Some(ConversationRoutingMode::Full);
+    full.routing_pool = Some(
+        [("primary", "pm"), ("worker", "wa"), ("worker", "wb")]
+            .iter()
+            .map(|(provider, model)| RoutingPoolEntry {
+                provider: (*provider).into(),
+                model: (*model).into(),
+            })
+            .collect(),
+    );
+    let p = open(&w, &full).await;
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("primary"));
+    let moved = w
+        .manager
+        .relay_conversation(
+            &p,
+            "worker",
+            Some("wb"),
+            SIMPLE,
+            Some(crate::auth::jwt::Claims::service_account("e2e")),
+            super::relay::MOVED_BY_AUTO,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("move failed: {e:#}"));
+    // The relayed turn may be over before anyone subscribes: wait for its request instead.
+    for _ in 0..400 {
+        if !model_of_turn(&w.worker, SIMPLE, &[]).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    idle(&w, &moved.session_id).await;
+    let target = node(&w, &moved.session_id).await;
+    assert_eq!(target.provider_id.as_deref(), Some("worker"));
+    assert_eq!(
+        target.model, "wb",
+        "the router's target, not a new decision (wa)"
+    );
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[]), ["wb"]);
+}
+
 /// `shadow`: even in `full`, nothing is applied (no move, no model change), and every
 /// decision is recorded, the per-turn ones included.
 #[tokio::test]

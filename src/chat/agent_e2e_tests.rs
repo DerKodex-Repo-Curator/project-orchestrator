@@ -1725,6 +1725,76 @@ mod cognitive_routing {
         );
     }
 
+    /// A decider that applies `other/o1` for every request: a pair the resolver refuses
+    /// (the project gave no consent to `other`).
+    struct AppliesOther;
+
+    #[async_trait::async_trait]
+    impl crate::chat::provider::cognitive::decision::Decider for AppliesOther {
+        async fn decide(
+            &self,
+            request: &crate::chat::provider::cognitive::decision::DecideRequest,
+        ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+            use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+            Ok(CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: Some(Pick::new("other", "o1")),
+                score: Some(0.9),
+                explored: false,
+                reason: "other/o1: fake".into(),
+                alternatives: Vec::new(),
+                applied: true,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            })
+        }
+    }
+
+    /// Review of #713, C2: the pick among the pool is applied but the resolver refuses it
+    /// (here: no consent for its instance). A pilot never falls back inside the resolver;
+    /// the pool's own fallback — the menu's pilot — opens the conversation instead of the
+    /// opening failing. Before the fix: `not_allowed`, the conversation did not open.
+    #[tokio::test]
+    async fn a_pool_pick_the_resolver_refuses_falls_back_to_the_menus_pilot() {
+        let Setup {
+            _fake,
+            graph,
+            manager,
+        } = setup_with("primary", "auto", false, false).await;
+        let mut other = instance(&_fake, "none");
+        other.id = "other".into();
+        other.label = "other".into();
+        store_instance(&graph, &other).await;
+        let manager =
+            manager.with_cognitive_routing(CognitiveRouting::with_decider(Arc::new(AppliesOther)));
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("other", "o1"), ("local", "m")]);
+        r.provider = Some("local".into());
+        r.model = Some("m".into());
+        let c = manager
+            .resolve_provider_choice(&r, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("the opening must fall back, not fail: {e:#}"));
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("local", Some("m"), RoutedBy::Request)
+        );
+        assert_eq!(
+            c.shadow,
+            Some(("other".to_owned(), Some("o1".to_owned()))),
+            "what the router chose is recorded, not applied"
+        );
+    }
+
     /// Auto in the chat menu (`routing_mode: full`) routes the opening too, whatever the settings.
     #[tokio::test]
     async fn auto_in_the_request_routes_the_opening_even_when_the_settings_say_primary() {

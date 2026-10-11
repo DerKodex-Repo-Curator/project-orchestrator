@@ -340,10 +340,18 @@ impl ChatRequest {
     /// OPENING model is a decision among them too (decision R-S4), and the `provider` /
     /// `model` the menu names with them (its "pilot") are only the fallback when no
     /// decision applies — never an explicit choice that the decision would have to obey.
+    ///
+    /// Only for the menu's `mixed` (or a pool without a mode): a pool sent with
+    /// `routing_mode: full` keeps its named provider/model explicit. That is also what a
+    /// conversation the ROUTER moved carries — its relayed request names the target the
+    /// router decided, with the pool and `full` read from the session — and that target is
+    /// never decided again at the opening of the new session (review of #713, C1).
     pub fn routes_among_pool(&self) -> bool {
-        self.routing_pool
-            .as_ref()
-            .is_some_and(|pool| pool.len() > 1)
+        self.routing_mode != Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full)
+            && self
+                .routing_pool
+                .as_ref()
+                .is_some_and(|pool| pool.len() > 1)
     }
 }
 
