@@ -36,7 +36,7 @@ use chrono::Utc;
 use nexus_claude::agent::{
     AgentProvider, AgentSession, Capabilities, CompactionInfo, HookVerdict, ModelInfo,
     ProviderError, ProviderHealth, ProviderKind, ResumeToken, SessionHooks, SessionSpec,
-    ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
+    SubagentRequest, ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -219,6 +219,14 @@ const FUNCTIONS: &[(&str, &str)] = &[
     ),
     ("cancel_task", "cancel_task arrête une tâche d'arrière-plan"),
     (
+        "ask_user_question",
+        "une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant",
+    ),
+    (
+        "subagents",
+        "un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer",
+    ),
+    (
         "system_init.degraded",
         "system_init n'annonce comme manquant qu'une limite du modèle (liste fermée)",
     ),
@@ -238,32 +246,14 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     ),
     (
         Engine::ClaudeCode,
-        "permissions.session",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P11",
-            why: "la réponse de permission ne porte aucune portée : le backend n'écrit au CLI \
-                  qu'un allow/deny ponctuel (pas d'updatedPermissions de session)",
-        },
-    ),
-    (
-        Engine::ClaudeCode,
         "permissions.always",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "P11",
-            why: "aucune portée persistante (updatedPermissions vers les réglages) n'est écrite \
-                  au CLI",
-        },
-    ),
-    (
-        Engine::Native,
-        "permissions.session",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P11",
-            why: "le harnais natif sait retenir une portée session, mais le backend répond \
-                  toujours allow_once : la permission est redemandée",
+            task: "P11b",
+            why: "volontaire (sécurité) : aucune approbation durable tant que les règles ne sont \
+                  pas tenues par un comparateur strict du backend (revue P11 : une suggestion du \
+                  CLI réécrite vers localSettings pouvait y porter setMode / addDirectories) ; \
+                  always est refusé, typé",
         },
     ),
     (
@@ -271,9 +261,10 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "permissions.always",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "P11",
-            why: "le harnais natif ne déclare pas la portée always (permission_scopes = once, \
-                  session) et le backend ne la transmet pas",
+            task: "P11b",
+            why: "volontaire (sécurité) : aucune règle durable tant qu'elle n'est pas tenue par \
+                  un comparateur strict du backend (revue P11 : un préfixe Bash(cat *) dans la \
+                  liste allow de nexus autorisait cat x >> ~/.zshrc) ; always est refusé, typé",
         },
     ),
 ];
@@ -684,7 +675,7 @@ impl Stage {
     /// A backend process: a manager on the stage's graph and NATS, Claude Code on
     /// the CLI `cli`, the native instance tapped (its hooks recorded in `answers`).
     /// Called again to "restart" the backend: the graph is all that survives.
-    async fn backend(&self, cli: &FakeClaude, answers: &Arc<Answers>) -> ChatManager {
+    async fn backend(&self, cli: &FakeClaude, answers: &Arc<Answers>) -> Arc<ChatManager> {
         let config = ChatConfig {
             provider_path: ProviderPath::Legacy,
             mcp_server_path: fake_bin("fake_mcp"),
@@ -711,10 +702,13 @@ impl Stage {
             .provider_for("local")
             .await
             .unwrap_or_else(|e| panic!("the native instance: {e:#}"));
-        manager.with_provider_source(Arc::new(Tap {
+        let manager = Arc::new(manager.with_provider_source(Arc::new(Tap {
             inner: real,
             answers: Arc::clone(answers),
-        }))
+        })));
+        // The native sessions run their `Agent` calls as child sessions (P18).
+        manager.enable_subagents();
+        manager
     }
 
     /// Asks the session, from the other instance, until its owner answers. A
@@ -1141,6 +1135,23 @@ fn cc_tool_result(id: &str, content: &str, is_error: bool) -> Value {
     }))
 }
 
+/// What a sub-agent says, inside the Task call `parent`.
+fn sub_agent_text(parent: &str, t: &str) -> Value {
+    emit(json!({
+        "type": "assistant",
+        "message": {"id": "msg_sub", "type": "message", "role": "assistant",
+                    "model": "fake-claude", "content": [{"type": "text", "text": t}],
+                    "stop_reason": "end_turn"},
+        "parent_tool_use_id": parent,
+    }))
+}
+
+/// The input of the question both engines ask (Claude Code's AskUserQuestion shape).
+fn question_input() -> Value {
+    json!({"questions": [{"question": "Which database?", "header": "DB",
+        "options": [{"label": "Postgres"}, {"label": "SQLite"}], "multiSelect": false}]})
+}
+
 fn result(subtype: &str, t: &str, is_error: bool) -> Value {
     emit(json!({
         "type": "result", "subtype": subtype, "duration_ms": 12, "duration_api_ms": 7,
@@ -1272,6 +1283,28 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
         text("answered five"),
         result_ok("answered five"),
     ]);
+    // TURN-PERM-S: `ls -la` granted for the session, then the identical call again
+    // (the backend answers it). TURN-PERM-A: an `always` (refused), then once.
+    t.extend(vec![
+        await_in(&k.k("TURN-PERM-S")),
+        cc_tool_use("t5s", "Bash", json!({"command": "ls -la"})),
+        permission_request("req-perm-s", "Bash", json!({"command": "ls -la"}), "t5s"),
+        await_in("req-perm-s"),
+        cc_tool_result("t5s", "clean", false),
+        cc_tool_use("t5t", "Bash", json!({"command": "ls -la"})),
+        permission_request("req-perm-t", "Bash", json!({"command": "ls -la"}), "t5t"),
+        await_in("req-perm-t"),
+        cc_tool_result("t5t", "clean", false),
+        text("answered perm s"),
+        result_ok("answered perm s"),
+        await_in(&k.k("TURN-PERM-A")),
+        cc_tool_use("t5a", "Bash", json!({"command": "cargo fmt"})),
+        permission_request("req-perm-a", "Bash", json!({"command": "cargo fmt"}), "t5a"),
+        await_in("req-perm-a"),
+        cc_tool_result("t5a", "formatted", false),
+        text("answered perm a"),
+        result_ok("answered perm a"),
+    ]);
     // TURN-SIX: a tool whose process runs; the user cancels the tools, the tool
     // ends in error and the turn goes on.
     t.extend(vec![
@@ -1325,6 +1358,32 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
     // References, then an image attachment.
     t.extend(answer(&k.k("TURN-REFS"), "answered refs"));
     t.extend(answer(&k.k("TURN-IMG"), "answered img"));
+    // TURN-ASK: the CLI's AskUserQuestion comes as a can_use_tool request: the engine shows
+    // the question and allows it by itself; the user's answer is the next turn.
+    t.extend(vec![
+        await_in(&k.k("TURN-ASK")),
+        cc_tool_use("t-ask", "AskUserQuestion", question_input()),
+        permission_request("req-ask", "AskUserQuestion", question_input(), "t-ask"),
+        await_in("req-ask"),
+        cc_tool_result("t-ask", "the user was asked", false),
+        text("asked"),
+        result_ok("asked"),
+    ]);
+    t.extend(answer(&k.k("ANSWER"), "answered ask"));
+    // TURN-AGENT: a sub-agent (the CLI's Task): its messages carry the parent tool_use id,
+    // its answer is the tool's result.
+    t.extend(vec![
+        await_in(&k.k("TURN-AGENT")),
+        cc_tool_use(
+            "t-agent",
+            "Task",
+            json!({"description": "find the spec", "prompt": k.k("SUB-PROMPT")}),
+        ),
+        sub_agent_text("t-agent", &k.k("SUB-SAID")),
+        cc_tool_result("t-agent", &k.k("SUB-ANSWER"), false),
+        text("answered agent"),
+        result_ok("answered agent"),
+    ]);
     // Closed by the backend going down (EOF on stdin).
     t.push(wait_eof());
     t
@@ -1402,6 +1461,12 @@ impl SessionHooks for Recording {
     }
     async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
         self.inner.before_turn(ctx).await
+    }
+    fn runs_subagents(&self) -> bool {
+        self.inner.runs_subagents()
+    }
+    async fn run_subagent(&self, request: &SubagentRequest) -> Result<String, String> {
+        self.inner.run_subagent(request).await
     }
 }
 
@@ -1567,14 +1632,32 @@ fn native_script(k: Keys, cwd: &str) -> Value {
             json!({"command": "echo FIVE-$((1+1))"}),
         ),
         says(&k.k("TURN-FIVE"), "answered five"),
-        // TURN-PERM2: the same tool again (a session-scoped grant would not ask).
+        // TURN-PERM2: a tool asked for the first time (Write; Bash stays asked: NATS-PERM
+        // needs it), granted for the session.
         calls(
             &k.k("TURN-PERM2"),
             "c5b",
-            &nexus("Bash"),
-            json!({"command": "echo AGAIN-$((2+2))"}),
+            &nexus("Write"),
+            json!({"file_path": format!("{cwd}/session-1.txt"), "content": "AGAIN-SESSION"}),
         ),
         says(&k.k("TURN-PERM2"), "answered perm2"),
+        // TURN-PERM3: the identical call again: the session grant holds, not asked.
+        calls(
+            &k.k("TURN-PERM3"),
+            "c5c",
+            &nexus("Write"),
+            json!({"file_path": format!("{cwd}/session-1.txt"), "content": "AGAIN-SESSION"}),
+        ),
+        says(&k.k("TURN-PERM3"), "answered perm3"),
+        // TURN-ALWAYS: another tool, `always` asked (refused), then once.
+        calls(
+            &k.k("TURN-ALWAYS"),
+            "c5d",
+            &nexus("Edit"),
+            json!({"file_path": format!("{cwd}/always.txt"), "old_string": "ALWAYS-ONE",
+                   "new_string": "ALWAYS-EDITED"}),
+        ),
+        says(&k.k("TURN-ALWAYS"), "answered always"),
         // TURN-SIX: a tool that sleeps until cancelled; the model then answers.
         calls(&k.k("TURN-SIX"), "c6", &po("slow"), json!({})),
         says(&k.k("TURN-SIX"), "answered six"),
@@ -1623,6 +1706,19 @@ fn native_script(k: Keys, cwd: &str) -> Value {
         // References, the image.
         says(&k.k("TURN-REFS"), "answered refs"),
         says(&k.k("TURN-IMG"), "answered img"),
+        // TURN-ASK: the harness's AskUserQuestion; the turn ends on it, the answer is a turn.
+        calls(&k.k("TURN-ASK"), "cq1", "AskUserQuestion", question_input()),
+        says(&k.k("ANSWER"), "answered ask"),
+        // TURN-AGENT: the harness's Agent; the child session's own request (its prompt, not
+        // the parent's key) is answered before the parent goes on with the result.
+        calls(
+            &k.k("TURN-AGENT"),
+            "ca1",
+            "Agent",
+            json!({"description": "find the spec", "prompt": k.k("SUB-PROMPT")}),
+        ),
+        says(&k.k("SUB-PROMPT"), &k.k("SUB-ANSWER")),
+        says(&k.k("TURN-AGENT"), "answered agent"),
     ];
     // A turn whose reported size makes the next model call compact first; the
     // summary request carries the guidance of the before_compaction hook.
@@ -1680,6 +1776,85 @@ async fn wait_body(fake: &FakeOpenAi, key: &str) -> Option<String> {
     wait_body_nth(fake, key, 0, WAIT).await
 }
 
+/// A Claude Code turn whose permission `req` is answered with `scope`: whether the
+/// answer was routed, and the line the CLI read.
+async fn cc_scoped(
+    manager: &ChatManager,
+    w: &Watch,
+    cli: &FakeClaude,
+    key: String,
+    req: &'static str,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> (bool, String) {
+    let ends = w.turn_ends();
+    manager.send_message(&w.sid, &key).await.unwrap();
+    assert!(
+        w.wait(
+            WAIT,
+            |e| matches!(e, ChatEvent::PermissionRequest { id, .. } if id == req)
+        )
+        .await,
+        "the Claude Code engine did not show {req}"
+    );
+    let routed = manager
+        .route_permission_response(&w.sid, req, true, scope, false)
+        .await;
+    if routed.is_err() {
+        // Refused (the request still waits): unblock the turn.
+        let _ = manager
+            .route_permission_response(
+                &w.sid,
+                req,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
+    let line = cli.wait_line(0, req, WAIT).await.unwrap_or_default();
+    w.settle(ends, manager).await;
+    (routed.is_ok(), line)
+}
+
+/// A native turn whose tool (input holding `needle`) is asked and answered with `scope`:
+/// the request id, and whether the answer was accepted.
+async fn native_grant(
+    manager: &ChatManager,
+    w: &Watch,
+    fake: &FakeOpenAi,
+    key: String,
+    needle: &str,
+    said: &str,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> (Option<String>, bool) {
+    let ends = w.turn_ends();
+    manager.send_message(&w.sid, &key).await.unwrap();
+    let id = w.permission_id(WAIT, needle).await;
+    let granted = match &id {
+        Some(id) => manager
+            .route_permission_response(&w.sid, id, true, scope, false)
+            .await
+            .is_ok(),
+        None => false,
+    };
+    if let (Some(id), false) = (&id, granted) {
+        // Refused (the request still waits): unblock the turn.
+        let _ = manager
+            .route_permission_response(
+                &w.sid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
+    wait_body_nth(fake, &key, 1, WAIT).await;
+    w.said(WAIT, said).await;
+    w.settle(ends, manager).await;
+    (id, granted)
+}
+
 /// Allows the native tool whose input contains `needle` if the session asks; returns
 /// whether it asked. Stops waiting once the model received the `nth` request of `key`
 /// (the tool ran without asking).
@@ -1695,7 +1870,13 @@ async fn answer_if_asked(
     while tokio::time::Instant::now() < deadline {
         if let Some(id) = w.permission_ids(needle).await.into_iter().next() {
             let _ = manager
-                .route_permission_response(&w.sid, &id, true, false)
+                .route_permission_response(
+                    &w.sid,
+                    &id,
+                    true,
+                    crate::chat::types::PermissionAnswerScope::Once,
+                    false,
+                )
                 .await;
             return true;
         }
@@ -1943,7 +2124,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         "the Claude Code engine did not show the permission request"
     );
     manager
-        .route_permission_response(&sid, "req-perm", true, false)
+        .route_permission_response(
+            &sid,
+            "req-perm",
+            true,
+            crate::chat::types::PermissionAnswerScope::Once,
+            false,
+        )
         .await
         .unwrap();
     let allowed = cli.wait_line(0, "req-perm", WAIT).await.unwrap_or_default();
@@ -1953,28 +2140,58 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         Cause::Harness,
         format!("réponse écrite : {}", excerpt(&allowed)),
     );
-    // What the answer carries: no scope at all (the API has none).
-    let scoped = |dest: &[&str]| {
-        allowed.contains("updatedPermissions") && dest.iter().any(|d| allowed.contains(d))
+    w.settle(ends, &manager).await;
+    let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
+    cc.check("tool_timing", timed, Cause::Harness, seen);
+    // `session`: a plain allow for the CLI (never a rule handed to it); the identical
+    // call again is answered by the backend. `always`: refused on every engine (P11b).
+    // Boxed: the scenario's future is already large (a stack overflow otherwise).
+    let (routed_s, line_s) = Box::pin(cc_scoped(
+        &manager,
+        &w,
+        &cli,
+        kc.k("TURN-PERM-S"),
+        "req-perm-s",
+        crate::chat::types::PermissionAnswerScope::Session,
+    ))
+    .await;
+    cc_sent += 1;
+    let (routed_a, line_a) = Box::pin(cc_scoped(
+        &manager,
+        &w,
+        &cli,
+        kc.k("TURN-PERM-A"),
+        "req-perm-a",
+        crate::chat::types::PermissionAnswerScope::Always,
+    ))
+    .await;
+    cc_sent += 1;
+    let second = cli
+        .wait_line(0, "req-perm-t", WAIT)
+        .await
+        .unwrap_or_default();
+    let plain = |line: &str| {
+        line.contains("\"behavior\":\"allow\"") && !line.contains("updatedPermissions")
     };
     cc.check(
         "permissions.session",
-        scoped(&["\"session\""]),
+        routed_s && plain(&line_s) && plain(&second),
         Cause::Harness,
         format!(
-            "portée session dans la réponse : {}",
-            scoped(&["\"session\""])
+            "accordée={routed_s}, réponse : {}, appel identique répondu par le backend : {}",
+            excerpt(&line_s),
+            excerpt(&second)
         ),
     );
     cc.check(
         "permissions.always",
-        scoped(&["localSettings", "userSettings", "projectSettings"]),
+        routed_a,
         Cause::Harness,
-        "portée persistante dans la réponse : aucune".to_string(),
+        format!(
+            "always accepté={routed_a}, réponse écrite : {}",
+            excerpt(&line_a)
+        ),
     );
-    w.settle(ends, &manager).await;
-    let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
-    cc.check("tool_timing", timed, Cause::Harness, seen);
 
     // cancel_tools: the running tool's process is signalled, the turn goes on.
     let ends = w.turn_ends();
@@ -2104,7 +2321,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     if !answered.contains("\"behavior\"") {
         // Not delivered from there: answered here, so the scenario goes on.
         let _ = manager
-            .route_permission_response(&sid, "req-nats", true, false)
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
             .await;
     }
     w.settle(ends, &manager).await;
@@ -2181,6 +2404,70 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         block,
         Cause::Harness,
         format!("bloc image sur stdin={block} ; ligne : {}", excerpt(&img)),
+    );
+    w.settle(ends, &manager).await;
+
+    // A question to the user: shown, allowed by the engine, answered by a turn.
+    let ends = w.turn_ends();
+    manager.send_message(&sid, &kc.k("TURN-ASK")).await.unwrap();
+    cc_sent += 1;
+    let shown = w
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::AskUserQuestion { tool_call_id, questions, .. }
+                if tool_call_id == "t-ask" && questions.to_string().contains("Which database?"))
+        })
+        .await;
+    let allowed = cli.wait_line(0, "req-ask", WAIT).await.unwrap_or_default();
+    w.settle(ends, &manager).await;
+    let ends = w.turn_ends();
+    // What the frontend sends for the answer (`input_response`): an inert user turn.
+    manager
+        .send_message(
+            &sid,
+            &crate::refs::compose::inert(&format!("{}: Postgres", kc.k("ANSWER"))),
+        )
+        .await
+        .unwrap();
+    cc_sent += 1;
+    let answer_read = cli.wait_line(0, &kc.k("ANSWER"), WAIT).await.is_some();
+    cc.check(
+        "ask_user_question",
+        shown
+            && allowed.contains("\"behavior\":\"allow\"")
+            && answer_read
+            && w.said(WAIT, "answered ask").await,
+        Cause::Harness,
+        format!(
+            "ask_user_question={shown}, autorisée={}, réponse lue au tour suivant={answer_read}",
+            allowed.contains("\"behavior\":\"allow\"")
+        ),
+    );
+    w.settle(ends, &manager).await;
+
+    // A sub-agent: its messages under the Task call, its answer as the result.
+    let ends = w.turn_ends();
+    manager
+        .send_message(&sid, &kc.k("TURN-AGENT"))
+        .await
+        .unwrap();
+    cc_sent += 1;
+    let nested = w
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::AssistantText { content, parent_tool_use_id: Some(p) }
+                if p == "t-agent" && content.contains(&kc.k("SUB-SAID")))
+        })
+        .await;
+    let returned = w
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::ToolResult { id, result, is_error: false, .. }
+                if id == "t-agent" && result.to_string().contains(&kc.k("SUB-ANSWER")))
+        })
+        .await;
+    cc.check(
+        "subagents",
+        nested && returned && w.said(WAIT, "answered agent").await,
+        Cause::Harness,
+        format!("messages du sous-agent sous t-agent={nested}, réponse en résultat={returned}"),
     );
     w.settle(ends, &manager).await;
 
@@ -2395,7 +2682,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     let id = wn.permission_id(WAIT, "FIVE-$").await;
     if let Some(id) = &id {
         manager
-            .route_permission_response(&nid, id, true, false)
+            .route_permission_response(
+                &nid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
             .await
             .unwrap();
     }
@@ -2414,42 +2707,88 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     wn.settle(ends, &manager).await;
     let (timed, seen) = timing_verdict(&wn.persisted().await, "c5");
     na.check("tool_timing", timed, Cause::Harness, seen);
-    // The same tool again: a grant for the session would not ask twice.
+    // A tool granted for the session: asked once, then not again in this session.
+    let (first, granted_session) = Box::pin(native_grant(
+        &manager,
+        &wn,
+        &fake,
+        kn.k("TURN-PERM2"),
+        "AGAIN-SESSION",
+        "answered perm2",
+        crate::chat::types::PermissionAnswerScope::Session,
+    ))
+    .await;
+    na_sent += 1;
     let ends = wn.turn_ends();
     manager
-        .send_message(&nid, &kn.k("TURN-PERM2"))
+        .send_message(&nid, &kn.k("TURN-PERM3"))
         .await
         .unwrap();
     na_sent += 1;
-    let again = wn.permission_id(WAIT, "AGAIN-$").await;
-    if let Some(id) = &again {
-        manager
-            .route_permission_response(&nid, id, true, false)
-            .await
-            .unwrap();
+    // The identical call: the backend answers it (the tool runs, nobody is asked).
+    let ran_again = wait_body_nth(&fake, &kn.k("TURN-PERM3"), 1, WAIT)
+        .await
+        .is_some();
+    // The backend answers the second request itself (its decision says `session`); a
+    // request it left to the user would have no such decision.
+    let asked = wn.permission_ids("AGAIN-SESSION").await;
+    let events = wn.all().await;
+    let answered_by_backend = |id: &String| {
+        events.iter().any(|e| {
+            matches!(e, ChatEvent::PermissionDecision { id: d, scope: Some(s), .. }
+                if d == id && *s == crate::chat::types::PermissionAnswerScope::Session)
+        })
+    };
+    let asked_again = !ran_again || asked.iter().skip(1).any(|id| !answered_by_backend(id));
+    for id in asked.iter().skip(1).filter(|id| !answered_by_backend(id)) {
+        let _ = manager
+            .route_permission_response(
+                &nid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
     }
-    wait_body_nth(&fake, &kn.k("TURN-PERM2"), 1, WAIT).await;
     na.check(
         "permissions.session",
-        again.is_none(),
+        first.is_some() && granted_session && !asked_again,
         Cause::Harness,
-        format!("redemandée au second appel={}", again.is_some()),
+        format!(
+            "demandée={}, accordée pour la session={granted_session}, redemandée={asked_again}",
+            first.is_some()
+        ),
     );
-    let init = wn.system_init().await;
-    let scopes = match &init {
+    wn.said(WAIT, "answered perm3").await;
+    wn.settle(ends, &manager).await;
+
+    // `always`: not offered and refused on every engine in this lot (P11b).
+    let offers_always = match &wn.system_init().await {
         Some(ChatEvent::SystemInit { capabilities, .. }) => capabilities
             .as_ref()
             .and_then(|c| c.get("permission_scopes").cloned())
-            .unwrap_or(Value::Null),
-        _ => Value::Null,
+            .is_some_and(|s| s.to_string().contains("always")),
+        _ => false,
     };
+    std::fs::write(stage.dir.path().join("always.txt"), "ALWAYS-ONE").unwrap();
+    let (_, granted_always) = Box::pin(native_grant(
+        &manager,
+        &wn,
+        &fake,
+        kn.k("TURN-ALWAYS"),
+        "ALWAYS-EDITED",
+        "answered always",
+        crate::chat::types::PermissionAnswerScope::Always,
+    ))
+    .await;
+    na_sent += 1;
     na.check(
         "permissions.always",
-        scopes.to_string().to_lowercase().contains("always"),
+        offers_always && granted_always,
         Cause::Harness,
-        format!("permission_scopes={scopes}"),
+        format!("portée offerte={offers_always}, accordée={granted_always}"),
     );
-    wn.settle(ends, &manager).await;
 
     // cancel_tools.
     let ends = wn.turn_ends();
@@ -2690,6 +3029,115 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         part,
         Cause::Harness,
         format!("partie image_url={part}"),
+    );
+    wn.settle(ends, &manager).await;
+
+    // A question to the user: the harness's AskUserQuestion, shown as a synthetic card
+    // (A45); the turn ends on it and the answer is the next turn.
+    let ends = wn.turn_ends();
+    manager.send_message(&nid, &kn.k("TURN-ASK")).await.unwrap();
+    na_sent += 1;
+    let shown = wn
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::AskUserQuestion { tool_call_id, questions, synthetic: Some(true), .. }
+                if tool_call_id == "cq1" && questions.to_string().contains("Which database?"))
+        })
+        .await;
+    let ended = wn.turn_end_after(ends).await;
+    // The model was not asked again within the turn: the question ended it.
+    let asked_once = bodies(&fake)
+        .iter()
+        .filter(|b| b.contains(&kn.k("TURN-ASK")) && !b.contains(&kn.k("ANSWER")))
+        .count()
+        == 1;
+    wn.settle(ends, &manager).await;
+    let ends = wn.turn_ends();
+    manager
+        .send_message(
+            &nid,
+            &crate::refs::compose::inert(&format!("{}: Postgres", kn.k("ANSWER"))),
+        )
+        .await
+        .unwrap();
+    na_sent += 1;
+    let answer_body = wait_body(&fake, &kn.k("ANSWER")).await.unwrap_or_default();
+    // The answer follows the question and its result in what the model reads.
+    let after_question = answer_body.contains("next user message")
+        && last_user(&answer_body)
+            .to_string()
+            .contains(&kn.k("ANSWER"));
+    na.check(
+        "ask_user_question",
+        shown && ended && asked_once && after_question && wn.said(WAIT, "answered ask").await,
+        Cause::Harness,
+        format!(
+            "ask_user_question synthétique={shown}, tour terminé={ended}, une seule requête={asked_once}, \
+             réponse au tour suivant après la question={after_question}"
+        ),
+    );
+    wn.settle(ends, &manager).await;
+
+    // A sub-agent: the harness's Agent runs as a child session (A18) that cannot delegate.
+    let ends = wn.turn_ends();
+    manager
+        .send_message(&nid, &kn.k("TURN-AGENT"))
+        .await
+        .unwrap();
+    na_sent += 1;
+    let parent_body = wait_body(&fake, &kn.k("TURN-AGENT"))
+        .await
+        .unwrap_or_default();
+    let offered = |body: &str| -> Vec<String> {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|b| b["tools"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    };
+    let returned = wn
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::ToolResult { id, result, is_error: false, .. }
+                if id == "ca1" && result.to_string().contains(&kn.k("SUB-ANSWER")))
+        })
+        .await;
+    // The child's own request: its prompt, without the parent's turn.
+    let child_body = bodies(&fake)
+        .into_iter()
+        .find(|b| b.contains(&kn.k("SUB-PROMPT")) && !b.contains(&kn.k("TURN-AGENT")))
+        .unwrap_or_default();
+    let parent_offers = offered(&parent_body).iter().any(|t| t == "Agent");
+    let child_tools = offered(&child_body);
+    let child_cannot_delegate =
+        !child_tools.is_empty() && !child_tools.iter().any(|t| t == "Agent");
+    let children = stage
+        .graph
+        .get_session_children(Uuid::parse_str(&nid).unwrap())
+        .await
+        .unwrap_or_default();
+    let in_tree = children.iter().any(|c| {
+        c.spawned_by
+            .as_deref()
+            .and_then(super::types::SpawnedBy::from_json_str)
+            .is_some_and(|s| {
+                matches!(s, super::types::SpawnedBy::Conversation { tool_use_id: Some(ref t), .. } if t == "ca1")
+            })
+    });
+    na.check(
+        "subagents",
+        parent_offers
+            && returned
+            && child_cannot_delegate
+            && in_tree
+            && wn.said(WAIT, "answered agent").await,
+        Cause::Harness,
+        format!(
+            "Agent offert au parent={parent_offers}, réponse de l'enfant en résultat={returned}, \
+             session enfant dans l'arbre={in_tree}, outils de l'enfant sans Agent={child_cannot_delegate} \
+             ({} outils)",
+            child_tools.len()
+        ),
     );
     wn.settle(ends, &manager).await;
 

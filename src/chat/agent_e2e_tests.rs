@@ -2693,6 +2693,47 @@ mod provider_switch {
         panic!("the expected events were never stored for {session_id}");
     }
 
+    /// P18 / A17: a child session that moves stays a child (its `spawned_by` goes with it), so
+    /// the moved session cannot delegate and keeps its third-party lineage.
+    #[tokio::test]
+    async fn a_child_session_stays_a_child_when_it_moves() {
+        let w = world().await;
+        let parent = Uuid::new_v4();
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: Some("ca1".into()),
+            }
+            .to_json_string(),
+        );
+        let created = w.manager.create_session(&req).await.unwrap();
+        let mut rx = w.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        stored_until(&w, &created.session_id, |events| {
+            events.iter().any(|e| e.event_type == "assistant_text")
+        })
+        .await;
+        let moved = w
+            .manager
+            .switch_session_provider(&created.session_id, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&moved.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = node
+            .spawned_by
+            .as_deref()
+            .and_then(crate::chat::manager::parse_spawned_by)
+            .expect("the moved child keeps its spawned_by");
+        assert_eq!(ctx.parent_session_id, Some(parent.to_string()));
+        assert!(!w.manager.spawned_by_nothing(&moved.session_id).await);
+    }
+
     #[tokio::test]
     async fn a_conversation_moves_to_another_provider_with_its_history_relayed() {
         let w = world().await;
@@ -5332,7 +5373,13 @@ mod legacy_nats_permission {
         assert!(listening, "the owner's RPC listener never answered");
 
         let routed = far
-            .route_permission_response(&sid, "req-nats", true, true)
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                true,
+            )
             .await;
         assert!(
             matches!(routed, Ok(DeliveryRoute::Remote)),
@@ -5356,7 +5403,13 @@ mod legacy_nats_permission {
         // The same request answered again: no longer waiting, a typed refusal, and
         // nothing more reaches the CLI.
         let again = far
-            .route_permission_response(&sid, "req-nats", true, true)
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                true,
+            )
             .await;
         assert!(
             matches!(again, Err(PermissionDeliveryError::NotPending)),
@@ -7306,6 +7359,601 @@ mod legacy_oob_lag {
         assert!(
             !events.iter().any(|(t, _)| t == "background_output"),
             "the turn's own output was taken for background output: {events:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P11a: an approval lasts `once` or for the `session`, on both engines, and the backend
+/// decides what a session grant covers (`chat::session_grants`): the identical call (any
+/// call of a read-only tool), answered by the backend in THIS session only, never handed
+/// to the provider as a rule. `always` is refused, typed, on every engine (P11b).
+mod permission_scopes {
+    use super::*;
+    use crate::chat::manager::PermissionDeliveryError;
+    use crate::chat::types::PermissionAnswerScope;
+
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    // ---------------------------------------------------------------- legacy
+
+    /// One turn, five `can_use_tool` the CLI waits on in turn: `ls -la` twice, then
+    /// `ls -la >> ~/.zshrc`, then `sudo ls`, then `./x.sh`.
+    fn legacy_transcript() -> Vec<Value> {
+        let ask = |id: &str, command: &str| {
+            vec![
+                emit(
+                    json!({"type": "control_request", "request_id": id, "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash",
+                    "input": {"command": command}, "tool_use_id": id}}),
+                ),
+                json!({"op": "await_stdin", "contains": id, "timeout_ms": 15000}),
+            ]
+        };
+        let mut t = vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+        ];
+        t.extend(ask("req-s1", "ls -la"));
+        t.extend(ask("req-s2", "ls -la"));
+        t.extend(ask("req-redirect", "ls -la >> ~/.zshrc"));
+        t.extend(ask("req-wrap", "sudo ls"));
+        t.extend(ask("req-script", "./x.sh"));
+        t.extend(vec![
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "scopes done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "scopes done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]);
+        t
+    }
+
+    fn legacy_wrapper(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("transcript.jsonl");
+        let lines: String = legacy_transcript()
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper.display().to_string()
+    }
+
+    /// The `control_response` the CLI read for `request_id`, once it is there.
+    async fn answer_read(dir: &std::path::Path, request_id: &str) -> Value {
+        for _ in 0..400 {
+            let found = std::fs::read_to_string(dir.join("stdin.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .find(|v| {
+                    v["type"] == "control_response" && v["response"]["request_id"] == request_id
+                });
+            if let Some(v) = found {
+                return v["response"]["response"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the CLI never read an answer to {request_id}");
+    }
+
+    async fn waits(manager: &ChatManager, sid: &str, request_id: &str) {
+        let id = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let snap = manager.live_session_snapshot().await;
+            if snap
+                .pending_permissions
+                .get(&id)
+                .is_some_and(|ids| ids.contains(request_id))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{request_id} never waited on the session");
+    }
+
+    /// `(scope, rule)` of each `permission_decision` of a session, in order, once
+    /// `count` are stored (or after a few seconds).
+    async fn decisions(graph: &MockGraphStore, sid: &str, count: usize) -> Vec<(Value, Value)> {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            seen = graph
+                .get_chat_events(id, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "permission_decision")
+                .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+                .map(|v| (v["scope"].clone(), v["rule"].clone()))
+                .collect();
+            if seen.len() >= count {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn legacy_session_grant_covers_the_identical_call_only_and_is_never_a_cli_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = legacy_wrapper(dir.path());
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+        };
+        manager.update_claude_cli_path(Some(cli)).await;
+        let mut req = request(None, None, "default");
+        req.message = "run the scoped tools".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+
+        // `session` on `ls -la`: a plain allow for the CLI, no rule handed to it.
+        waits(&manager, &sid, "req-s1").await;
+        manager
+            .route_permission_response(&sid, "req-s1", true, PermissionAnswerScope::Session, true)
+            .await
+            .unwrap();
+        let answer = answer_read(dir.path(), "req-s1").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert_eq!(
+            answer["updatedInput"],
+            json!({"command": "ls -la"}),
+            "{answer}"
+        );
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+
+        // The identical call again: the backend answers it, nobody is asked.
+        let answer = answer_read(dir.path(), "req-s2").await;
+        assert_eq!(answer["behavior"], "allow", "{answer}");
+        assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+        // A Deny clicked just before the backend's answer, through the WebSocket: refused
+        // like REST and NATS (the request no longer waits), never a second answer to the CLI
+        // nor a stored refusal of a call that ran.
+        let late = crate::api::ws_chat_handler::answer_permission_frame(
+            &manager,
+            &sid,
+            "req-s2",
+            false,
+            PermissionAnswerScope::Once,
+        )
+        .await;
+        assert!(
+            matches!(late, Err(PermissionDeliveryError::NotPending)),
+            "{late:?}"
+        );
+
+        // `ls -la >> ~/.zshrc` is not covered: it waits for the user; `always` is
+        // refused, typed, and the request still waits.
+        waits(&manager, &sid, "req-redirect").await;
+        let refused = manager
+            .route_permission_response(
+                &sid,
+                "req-redirect",
+                true,
+                PermissionAnswerScope::Always,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(
+                &sid,
+                "req-redirect",
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // `sudo ls` runs another command: no session grant, refused, typed.
+        waits(&manager, &sid, "req-wrap").await;
+        let refused = manager
+            .route_permission_response(&sid, "req-wrap", true, PermissionAnswerScope::Session, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Session
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, "req-wrap", false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+
+        // A local script: the model could edit it and rerun the "identical" call. Refused.
+        waits(&manager, &sid, "req-script").await;
+        let refused = manager
+            .route_permission_response(
+                &sid,
+                "req-script",
+                true,
+                PermissionAnswerScope::Session,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Session
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, "req-script", false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+
+        // The decisions say how long, and exactly what, was granted (the backend's own
+        // decision is stored with the turn: compare without the order).
+        let mut seen: Vec<String> = decisions(&graph, &sid, 5)
+            .await
+            .iter()
+            .map(|(scope, rule)| format!("{scope} {rule}"))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "\"session\" \"Bash: ls -la\"",
+                "\"session\" \"Bash: ls -la\"",
+                "null null",
+                "null null",
+                "null null",
+            ]
+        );
+        // One answer per request reached the CLI (the late Deny wrote nothing).
+        let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
+        let answers_to_s2 = stdin
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "control_response" && v["response"]["request_id"] == "req-s2")
+            .count();
+        assert_eq!(answers_to_s2, 1, "{stdin}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    // ---------------------------------------------------------------- native
+
+    fn calls(key: &str, id: &str, tool: &str, arguments: Value) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(
+                    json!({"tool_calls": [{"index": 0, "id": id, "type": "function", "function": {
+                    "name": tool, "arguments": arguments.to_string()}}]}),
+                ),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    fn says(key: &str, text: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": text})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    const PO_WRITE: &str = "mcp__project-orchestrator__write";
+
+    /// The later turns first: a turn's body holds the earlier turns' text.
+    fn native_script() -> Value {
+        let mut routes = vec![
+            calls("ECHO-AGAIN", "e4", PO_WRITE, json!({"text": "first-echo"})),
+            says("ECHO-AGAIN", "done again"),
+            calls("ECHO-THREE", "e3", PO_WRITE, json!({"text": "other-text"})),
+            says("ECHO-THREE", "done three"),
+            calls("ECHO-TWO", "e2", PO_WRITE, json!({"text": "first-echo"})),
+            says("ECHO-TWO", "done two"),
+            calls("ECHO-ONE", "e1", PO_WRITE, json!({"text": "first-echo"})),
+            says("ECHO-ONE", "done one"),
+            calls(
+                "BASH-LS",
+                "b1",
+                "mcp__nexus__Bash",
+                json!({"command": "ls"}),
+            ),
+            says("BASH-LS", "done ls"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    /// A native manager whose tools are ASKED (no `allow` list), with nexus-tools.
+    async fn native_manager(graph: Arc<MockGraphStore>) -> ChatManager {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: Some(fake_bin("nexus-tools")),
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            // A third-party MCP tool is granted for the session only when the operator
+            // declared it read-only: the fake server's tool is, for the grant mechanics.
+            read_only_mcp_tools: vec![PO_WRITE.to_string()],
+            ..Default::default()
+        };
+        let m = ChatManager::new_without_memory(dyn_graph, state.meili, config);
+        m.update_permission_config(super::super::config::PermissionConfig {
+            mode: "default".into(),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        })
+        .await
+        .unwrap();
+        m
+    }
+
+    /// The ids of the permission requests whose input holds `needle`.
+    async fn asked_ids(graph: &MockGraphStore, sid: &str, needle: &str) -> Vec<String> {
+        let id = Uuid::parse_str(sid).unwrap();
+        graph
+            .get_chat_events(id, 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "permission_request" && e.data.contains(needle))
+            .filter_map(|e| match serde_json::from_str(&e.data) {
+                Ok(ChatEvent::PermissionRequest { id, .. }) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The id of the first permission request whose input holds `needle`.
+    async fn asked(
+        graph: &MockGraphStore,
+        sid: &str,
+        needle: &str,
+        within: Duration,
+    ) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if let Some(id) = asked_ids(graph, sid, needle).await.into_iter().next() {
+                return Some(id);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Whether the model got the tool's result for `key` (its second request).
+    async fn ran(fake: &FakeOpenAi, key: &str) -> bool {
+        for _ in 0..400 {
+            let n = fake
+                .chat_requests()
+                .iter()
+                .filter(|r| r["body"].to_string().contains(key))
+                .count();
+            if n >= 2 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    async fn open(
+        manager: &ChatManager,
+        cwd: &std::path::Path,
+        access: Option<crate::chat::provider::policy::SessionAccess>,
+    ) -> String {
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.cwd = cwd.display().to_string();
+        req.access = access;
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        sid
+    }
+
+    async fn stage(fake: &FakeOpenAi) -> Arc<MockGraphStore> {
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        graph
+    }
+
+    #[tokio::test]
+    async fn native_session_grant_covers_the_identical_call_in_this_session_only() {
+        let fake = FakeOpenAi::start(native_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let manager = native_manager(graph.clone()).await;
+        let sid = open(&manager, cwd.path(), None).await;
+
+        // No engine offers `always` in this lot.
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        let scopes = handle.offered_capabilities().permission_scopes;
+        assert!(
+            !scopes.contains(&nexus_claude::agent::PermissionScope::Always),
+            "{scopes:?}"
+        );
+
+        manager.send_message(&sid, "ECHO-ONE").await.unwrap();
+        let id = asked(&graph, &sid, "first-echo", Duration::from_secs(10))
+            .await
+            .expect("the PO write tool is asked");
+        // always: refused, typed, nothing answered...
+        let refused = manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Always, true)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Always
+                ))
+            ),
+            "{refused:?}"
+        );
+        // ...the request still waits: session goes through.
+        manager
+            .route_permission_response(&sid, &id, true, PermissionAnswerScope::Session, true)
+            .await
+            .unwrap();
+        assert!(
+            ran(&fake, "ECHO-ONE").await,
+            "the tool ran after the approval"
+        );
+
+        // The identical call again in this session: answered by the backend.
+        manager.send_message(&sid, "ECHO-TWO").await.unwrap();
+        assert!(
+            ran(&fake, "ECHO-TWO").await,
+            "the identical call ran without the user"
+        );
+        let all = decisions(&graph, &sid, 2).await;
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[1].0, json!("session"), "{all:?}");
+
+        // Another input of the same tool: asked again.
+        manager.send_message(&sid, "ECHO-THREE").await.unwrap();
+        let other = asked(&graph, &sid, "other-text", Duration::from_secs(10))
+            .await
+            .expect("another input is asked again");
+        manager
+            .route_permission_response(&sid, &other, false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+        manager.close_session(&sid).await.unwrap();
+
+        // Another session: the grant does not follow, the identical call is asked.
+        let sid2 = open(&manager, cwd.path(), None).await;
+        manager.send_message(&sid2, "ECHO-AGAIN").await.unwrap();
+        let again = asked(&graph, &sid2, "first-echo", Duration::from_secs(10)).await;
+        assert!(
+            again.is_some(),
+            "a session grant does not survive into another session"
+        );
+        manager
+            .route_permission_response(
+                &sid2,
+                &again.unwrap(),
+                false,
+                PermissionAnswerScope::Once,
+                true,
+            )
+            .await
+            .unwrap();
+        manager.close_session(&sid2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_access_wins_over_a_session_grant() {
+        let fake = FakeOpenAi::start(native_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let manager = native_manager(graph.clone()).await;
+        let sid = open(
+            &manager,
+            cwd.path(),
+            Some(crate::chat::provider::policy::SessionAccess::ReadOnly),
+        )
+        .await;
+        // A grant that would cover `ls` (as if granted earlier in this session).
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        handle.seed_session_grant(
+            crate::chat::session_grants::grant_for(&crate::chat::session_grants::AskedCall {
+                asker: crate::chat::session_grants::Asker::Native,
+                tool: "mcp__nexus__Bash".into(),
+                canonical: Some("Bash".into()),
+                input: json!({"command": "ls"}),
+            })
+            .unwrap(),
+        );
+        manager.send_message(&sid, "BASH-LS").await.unwrap();
+        assert!(
+            ran(&fake, "BASH-LS").await,
+            "the model got the tool's answer"
+        );
+        let body = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .filter(|b| b.contains("BASH-LS"))
+            .nth(1)
+            .unwrap_or_default();
+        // Read-only does not even offer the command tool: the call is refused before any
+        // question, whatever the grant.
+        assert!(
+            body.contains("unknown tool") || body.contains("denied"),
+            "read-only refused the command whatever the grant: {body}"
+        );
+        assert!(
+            asked_ids(&graph, &sid, "\"ls\"").await.is_empty(),
+            "never asked"
+        );
+        assert!(
+            decisions(&graph, &sid, 1).await.is_empty(),
+            "no decision made"
         );
         manager.close_session(&sid).await.unwrap();
     }
@@ -9362,5 +10010,271 @@ mod openclaw_delegation {
             })
             .count();
         assert_eq!(notices, 1, "the refusal is told once, at the first opening");
+    }
+}
+
+// ============================================================================
+// Sub-agents of a native session (P18): the child's ceiling, the cap of live children
+// under parallel calls, the child closed whatever the end. Scripted provider, no fakes.
+// ============================================================================
+mod native_subagents {
+    use super::parity::{caps, Tapped};
+    use super::*;
+    use nexus_claude::agent::{
+        AgentEvent, AgentProvider, AgentSession, Capabilities, ModelInfo, ProviderError,
+        ProviderHealth, ProviderKind, ResumeToken, SessionSpec, StopReason, SubagentRequest,
+    };
+    use nexus_claude::testkit::{steps, Script, ScriptedProvider, Step};
+
+    /// The scripted provider, each opening taking `open_ms`: the window between the count of
+    /// the live children and the registration of a new one that a real endpoint opens too.
+    #[derive(Clone)]
+    struct SlowOpen {
+        inner: Tapped,
+        open_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProvider for SlowOpen {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn kind(&self) -> ProviderKind {
+            self.inner.kind()
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.inner.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.inner.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            tokio::time::sleep(Duration::from_millis(self.open_ms)).await;
+            self.inner.open(spec).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.resume(spec, token).await
+        }
+    }
+
+    impl crate::chat::agent_runtime::ProviderSource for SlowOpen {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    struct Rig {
+        manager: Arc<ChatManager>,
+        graph: Arc<MockGraphStore>,
+        parent: String,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A native parent session opened in `mode`; every child plays `child_turn`.
+    async fn rig(child_turn: Vec<Step>, mode: &str) -> Rig {
+        rig_slow(child_turn, mode, 0).await
+    }
+
+    async fn rig_slow(child_turn: Vec<Step>, mode: &str, open_ms: u64) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 20,
+            ..Default::default()
+        };
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new(
+                "claude-code",
+                Script::builder()
+                    .capabilities(caps())
+                    .turn(child_turn)
+                    .build(),
+            )),
+            kind: ProviderKind::Native,
+            answers: Arc::default(),
+        };
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, config).with_provider_source(
+                Arc::new(SlowOpen {
+                    inner: provider,
+                    open_ms,
+                }),
+            ),
+        );
+        manager.enable_subagents();
+        let mut req = request(None, Some(&project.slug), mode);
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        Rig {
+            manager,
+            graph,
+            parent,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        async fn children(&self) -> Vec<crate::neo4j::models::ChatSessionNode> {
+            self.graph
+                .get_session_children(Uuid::parse_str(&self.parent).unwrap())
+                .await
+                .unwrap_or_default()
+        }
+
+        async fn none_alive(&self) -> bool {
+            for child in self.children().await {
+                if self.manager.agent_runtime.owns(&child.id.to_string()).await {
+                    return false;
+                }
+            }
+            true
+        }
+
+        async fn run(&self, call: &str) -> Result<String, String> {
+            self.manager
+                .clone()
+                .run_subagent(&self.parent, None, &SubagentRequest::new(call, "do it"))
+                .await
+        }
+    }
+
+    fn answer(text: &str) -> Vec<Step> {
+        vec![steps::text("working"), steps::done_with_text(&caps(), text)]
+    }
+
+    /// B1: a native parent opened in bypassPermissions then put in plan: its child is capped
+    /// at plan (the CURRENT mode), not at the opening one. Red before the agent engine's mode
+    /// was kept live and persisted.
+    #[tokio::test]
+    async fn a_child_is_capped_at_the_parents_current_mode() {
+        let r = rig(answer("CHILD-ANSWER"), "bypassPermissions").await;
+        r.manager
+            .set_session_permission_mode(&r.parent, "plan")
+            .await
+            .unwrap();
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].permission_mode.as_deref(), Some("plan"));
+        // Persisted too: the envelope after a restart reads the same.
+        let parent = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&r.parent).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.permission_mode.as_deref(), Some("plan"));
+        // The child is closed once it answered.
+        assert!(r.none_alive().await);
+    }
+
+    /// B2: six parallel calls on one parent: at most four children, the others refused with a
+    /// clear error; dropping the running calls (the parent's turn interrupted) closes their
+    /// children and gives the slots back.
+    #[tokio::test]
+    async fn parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child() {
+        let r = Arc::new(rig_slow(vec![Step::AwaitInterrupt], "default", 300).await);
+        let calls: Vec<_> = (0..6)
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move { r.run(&format!("c{i}")).await })
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let finished = calls.iter().filter(|h| h.is_finished()).count();
+            if r.children().await.len() >= 4 && finished >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children={}, finished={finished}",
+                r.children().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            r.children().await.len(),
+            4,
+            "the cap holds under parallel calls"
+        );
+        let mut refused = 0;
+        let mut running = Vec::new();
+        for handle in calls {
+            if handle.is_finished() {
+                let out = handle.await.unwrap();
+                assert!(
+                    out.as_ref()
+                        .is_err_and(|e| e.contains("envelope_too_many_children")),
+                    "{out:?}"
+                );
+                refused += 1;
+            } else {
+                running.push(handle);
+            }
+        }
+        assert_eq!(refused, 2);
+        assert!(!r.none_alive().await, "the four children run");
+        for handle in running {
+            handle.abort();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !r.none_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a dropped call must close its child"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_none());
+    }
+
+    /// A child that fails: an error result for the parent, the child closed.
+    #[tokio::test]
+    async fn a_failed_child_is_an_error_and_is_closed() {
+        let failed = AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            subtype: Some("error_during_execution".into()),
+            is_error: true,
+            result_text: Some("boom".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        let r = rig(vec![Step::Emit(failed)], "default").await;
+        let out = r.run("ca1").await;
+        assert!(out.as_ref().is_err_and(|e| e.contains("failed")), "{out:?}");
+        assert!(r.none_alive().await);
     }
 }

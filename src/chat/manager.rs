@@ -258,12 +258,16 @@ pub struct ActiveSession {
     /// (`post_stream::StepBudget`). `POST_STREAM_STEP_BUDGET` everywhere but in
     /// tests, which shorten it to watch a step overrun.
     pub post_stream_budget: Duration,
-    /// Stores the original tool input for pending permission requests.
-    /// Key: request_id, Value: the tool input JSON.
+    /// The permission requests of the CLI still waiting for an answer.
+    /// Key: request_id, Value: the tool input, and the tool.
     /// When the user responds Allow, we include this input in `updatedInput`
     /// so the CLI doesn't lose the original command/parameters.
     pub pending_permission_inputs:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingPermission>>>,
+    /// What the user granted "for the session" (`chat::session_grants`): the backend
+    /// answers itself the later requests of THIS session they cover; never handed to
+    /// the CLI as a rule.
+    pub session_grants: Arc<std::sync::Mutex<super::session_grants::SessionGrants>>,
     /// Whether auto-continue is enabled for this session.
     /// When `true`, the backend automatically sends "Continue" after error_max_turns.
     /// Toggled via WebSocket `set_auto_continue` message.
@@ -369,6 +373,39 @@ pub enum DeliveryRoute {
     ResumedAfterSendFailure,
 }
 
+/// The approval scopes the Claude Code engine (legacy path) offers: `once`, and `session`
+/// kept by the backend (`chat::session_grants`). Never `always` in this lot (P11b).
+/// Declared in its `system_init.capabilities` and checked by
+/// [`ChatManager::deliver_permission_answer`]: what is accepted is what is declared.
+pub const LEGACY_PERMISSION_SCOPES: &[super::types::PermissionAnswerScope] = &[
+    super::types::PermissionAnswerScope::Once,
+    super::types::PermissionAnswerScope::Session,
+];
+
+/// `system_init.capabilities` of the Claude Code engine: the WHOLE capabilities object, as
+/// the agent engine stamps it on a Claude Code session (`AgentSessionHandle::emit_one`:
+/// the provider's capabilities without `always`), its `permission_scopes` being exactly
+/// [`LEGACY_PERMISSION_SCOPES`] (what [`ChatManager::deliver_permission_answer`] accepts).
+pub fn legacy_capabilities() -> serde_json::Value {
+    static CAPABILITIES: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    CAPABILITIES
+        .get_or_init(|| {
+            let mut caps = serde_json::to_value(
+                nexus_claude::providers::claude_code::ClaudeCodeConfig::default()
+                    .capabilities(None),
+            )
+            .unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(fields) = caps.as_object_mut() {
+                fields.insert(
+                    "permission_scopes".to_string(),
+                    serde_json::json!(LEGACY_PERMISSION_SCOPES),
+                );
+            }
+            caps
+        })
+        .clone()
+}
+
 /// Why a permission answer was not delivered.
 #[derive(Debug)]
 pub enum PermissionDeliveryError {
@@ -377,6 +414,10 @@ pub enum PermissionDeliveryError {
     /// The CLI is alive but the request is no longer waiting (already
     /// answered, or never asked).
     NotPending,
+    /// The approval asks for a scope (`session`, `always`) this session does not
+    /// declare, or cannot express for this request: REFUSED, never answered as a
+    /// narrower scope. The request is still waiting.
+    ScopeUnsupported(super::types::PermissionAnswerScope),
     Failed(anyhow::Error),
 }
 
@@ -385,6 +426,11 @@ impl std::fmt::Display for PermissionDeliveryError {
         match self {
             Self::SessionDead(id) => write!(f, "Session {id} not found or inactive"),
             Self::NotPending => write!(f, "Permission request is no longer pending"),
+            Self::ScopeUnsupported(scope) => write!(
+                f,
+                "permission scope {} is not supported by this session",
+                scope.as_str()
+            ),
             Self::Failed(e) => write!(f, "{e}"),
         }
     }
@@ -396,6 +442,21 @@ impl std::error::Error for PermissionDeliveryError {}
 /// on the owning instance: the asking instance turns it back into
 /// [`PermissionDeliveryError::NotPending`].
 pub(crate) const PERMISSION_NOT_PENDING_RPC: &str = "permission_not_pending";
+
+/// The `error` of a NATS `control_response` RPC whose scope the owning instance
+/// refused: the asking instance turns it back into
+/// [`PermissionDeliveryError::ScopeUnsupported`]. Also the `code` of the WS error.
+pub(crate) const PERMISSION_SCOPE_UNSUPPORTED_RPC: &str = "permission_scope_unsupported";
+
+/// A permission request of the CLI waiting for the user's answer
+/// (`ActiveSession::pending_permission_inputs`).
+#[derive(Debug, Clone, Default)]
+pub struct PendingPermission {
+    /// The original tool input, replayed as `updatedInput` (an empty `{}` would erase it).
+    pub input: serde_json::Value,
+    /// The tool asked for.
+    pub tool: String,
+}
 
 /// What delivering a permission answer to a legacy session reads, borrowed from the
 /// manager or from the NATS RPC listener of the session.
@@ -711,6 +772,17 @@ pub struct ChatManager {
     /// One small entry per session opened since the start (its held context is
     /// empty once delivered).
     pub(crate) held_slots: std::sync::Mutex<HashMap<String, Arc<HeldSlot>>>,
+    /// The manager itself, once in its `Arc` ([`Self::enable_subagents`]): what the sub-agents
+    /// of native sessions open their child sessions through (P18, `subagents.rs`).
+    pub(crate) self_ref: std::sync::OnceLock<std::sync::Weak<ChatManager>>,
+    /// The permission mode of each live session of the agent engine, as last set
+    /// (`set_session_permission_mode`): what a child's ceiling reads (A17), the agent engine
+    /// keeping its mode in the harness where `live_session_permission_mode` cannot see it.
+    pub(crate) agent_modes: std::sync::Mutex<HashMap<String, String>>,
+    /// The sub-agents running for each parent session (P18): a slot is taken before the
+    /// envelope counts the live children and held until the sub-agent ends, so parallel `Agent`
+    /// calls cannot all count the same children and pass the cap together.
+    pub(crate) subagent_slots: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 // ============================================================================
@@ -2048,6 +2120,7 @@ pub(crate) async fn run_step<F: std::future::Future>(
             code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
             reason: Some(step.to_string()),
             index: None,
+            request_id: None,
         });
     }
     out
@@ -2070,10 +2143,46 @@ pub(crate) async fn agent_rpc(
     let outcome: Result<()> = match request.message_type.as_str() {
         "control_response" => {
             let allow = field("allow").and_then(|v| v.as_bool()).unwrap_or(false);
-            match field("request_id").and_then(|v| v.as_str().map(str::to_string)) {
-                Some(request_id) => handle.answer_permission(&request_id, allow).await,
-                None => Err(anyhow!("a permission answer needs its request_id")),
-            }
+            // A scope this instance does not know is refused, never read as once.
+            let scope = match field("scope")
+                .map(serde_json::from_value::<super::types::PermissionAnswerScope>)
+            {
+                None => Ok(super::types::PermissionAnswerScope::Once),
+                Some(Ok(scope)) => Ok(scope),
+                Some(Err(_)) => Err(()),
+            };
+            let answered = match (
+                field("request_id").and_then(|v| v.as_str().map(str::to_string)),
+                scope,
+            ) {
+                (None, _) => Err(PermissionDeliveryError::Failed(anyhow!(
+                    "a permission answer needs its request_id"
+                ))),
+                (Some(_), Err(())) => Err(PermissionDeliveryError::ScopeUnsupported(
+                    super::types::PermissionAnswerScope::Once,
+                )),
+                (Some(request_id), Ok(scope)) => {
+                    handle
+                        .answer_permission_scoped(&request_id, allow, scope)
+                        .await
+                }
+            };
+            return match answered {
+                Ok(()) => crate::events::ChatRpcResponse {
+                    success: true,
+                    error: None,
+                },
+                Err(PermissionDeliveryError::ScopeUnsupported(_)) => {
+                    crate::events::ChatRpcResponse {
+                        success: false,
+                        error: Some(PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string()),
+                    }
+                }
+                Err(e) => crate::events::ChatRpcResponse {
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+            };
         }
         "set_auto_continue" => {
             let enabled = field("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2161,6 +2270,76 @@ pub(crate) const CHILD_ENV_TOOLING: &[&str] = &[
 /// Operator-chosen additions to the agent environment: a comma-separated list
 /// of variable names (e.g. `GH_TOKEN,AWS_PROFILE`).
 pub(crate) const CHILD_ENV_INHERIT_VAR: &str = "CHAT_CHILD_ENV_INHERIT";
+
+/// The person behind these claims, as the owner of what they open (P11b): the `sub` of a
+/// person's session JWT, of their MCP token, or of an agent session token minted for them.
+/// `None` for the server's own service account, the anonymous user (no-auth mode, the
+/// standalone MCP server) and any other kind of token (a vault token opens nothing).
+pub(crate) fn person_behind(claims: &crate::auth::jwt::Claims) -> Option<&str> {
+    use crate::auth::jwt::{
+        ANONYMOUS_USER_ID, SERVICE_ACCOUNT_EMAIL, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP,
+    };
+    let kind_of_person = match claims.token_type.as_deref() {
+        None => true,
+        Some(kind) => kind == TOKEN_TYPE_MCP || kind == TOKEN_TYPE_AGENT_SESSION,
+    };
+    (kind_of_person
+        && claims.email != SERVICE_ACCOUNT_EMAIL
+        && claims.sub != ANONYMOUS_USER_ID.to_string()
+        && !claims.sub.is_empty())
+    .then_some(claims.sub.as_str())
+}
+
+/// The MCP server names the native engine keeps for the servers the backend attaches
+/// (nexus-tools, the browser). A server of the session under one of them would REPLACE
+/// the backend's (nexus only attaches its defaults when the name is free), and its tools
+/// would be taken for the built-in ones: nexus gives every tool of a `nexus` server its
+/// canonical name, so a `mcp__nexus__Read` that writes or calls the network would get the
+/// session grant of the read-only built-in (`session_grants`), and a `browser_*` tool
+/// would be classified by name.
+pub(crate) const RESERVED_NATIVE_SERVERS: [&str; 2] = [
+    nexus_claude::providers::native::NEXUS_TOOLS_SERVER,
+    nexus_claude::providers::native::BROWSER_SERVER,
+];
+
+/// Refuses (typed, `invalid`) a native session whose spec already has a server under a
+/// reserved name ([`RESERVED_NATIVE_SERVERS`]), before the backend attaches its own.
+pub(crate) fn refuse_reserved_native_servers(
+    servers: &std::collections::BTreeMap<String, nexus_claude::agent::McpServerSpec>,
+) -> Result<()> {
+    match RESERVED_NATIVE_SERVERS
+        .iter()
+        .find(|name| servers.contains_key(**name))
+    {
+        Some(name) => Err(anyhow::Error::new(
+            nexus_claude::agent::ProviderError::invalid(format!(
+                "an MCP server of the session is named `{name}`: that name is reserved for the \
+                 native engine's own tools; rename the server"
+            )),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Adds the servers the backend attaches to a native session (`nexus`, `browser`). A name
+/// already taken is refused, never kept ([`RESERVED_NATIVE_SERVERS`]).
+pub(crate) fn attach_native_servers(
+    servers: &mut std::collections::BTreeMap<String, nexus_claude::agent::McpServerSpec>,
+    attached: std::collections::BTreeMap<String, nexus_claude::agent::McpServerSpec>,
+) -> Result<()> {
+    for (name, server) in attached {
+        if servers.contains_key(&name) {
+            return Err(anyhow::Error::new(
+                nexus_claude::agent::ProviderError::invalid(format!(
+                    "an MCP server of the session is named `{name}`: that name is reserved for \
+                     the native engine's own tools; rename the server"
+                )),
+            ));
+        }
+        servers.insert(name, server);
+    }
+    Ok(())
+}
 
 /// The MCP tool profile a session's own provider and mode grant it, signed into
 /// its token (`None`: no profile, the full one). A provider other than Claude
@@ -2453,6 +2632,53 @@ impl SessionLocks {
     }
 }
 
+/// Where a resume starts from: the live handle of the session (or none) as the caller saw
+/// it before it awaited anything ([`ChatManager::resume_point`]). Opaque: only the manager
+/// reads it, under the session's resume lock.
+pub struct ResumeFrom(Option<Arc<super::agent_runtime::AgentSessionHandle>>);
+
+/// Test-only pause at the start of `try_remote_send`, keyed by session id: a test makes a
+/// message wait there (where a real deployment waits for the NATS RPC timeout) while
+/// another resume of the same session completes.
+#[cfg(test)]
+pub(crate) mod remote_send_hook {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use tokio::sync::{oneshot, Notify};
+
+    struct Hook {
+        entered: Option<oneshot::Sender<()>>,
+        release: Arc<Notify>,
+    }
+
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> = LazyLock::new(Default::default);
+
+    /// Arms a pause for `session_id`: the receiver fires when a `try_remote_send` reaches
+    /// it; that call then waits until the returned `Notify` is notified. One use.
+    pub(crate) fn arm(session_id: &str) -> (oneshot::Receiver<()>, Arc<Notify>) {
+        let (tx, rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        HOOKS.lock().unwrap().insert(
+            session_id.to_string(),
+            Hook {
+                entered: Some(tx),
+                release: Arc::clone(&release),
+            },
+        );
+        (rx, release)
+    }
+
+    pub(super) async fn wait(session_id: &str) {
+        let hook = HOOKS.lock().unwrap().remove(session_id);
+        if let Some(mut hook) = hook {
+            if let Some(entered) = hook.entered.take() {
+                let _ = entered.send(());
+            }
+            hook.release.notified().await;
+        }
+    }
+}
+
 /// Refuses a model whose context window cannot hold the tool schemas of the
 /// session's `profile` with room to work: the schemas must take at most half of
 /// it. A window that is not known is not a refusal (nothing is invented).
@@ -2580,7 +2806,10 @@ impl ChatManager {
         }));
         let enrichment_pipeline =
             Self::build_enrichment_pipeline(&graph, &search, None, None, None);
-        let agent_runtime = Arc::new(super::agent_runtime::AgentRuntime::new(graph.clone()));
+        let agent_runtime = Arc::new(
+            super::agent_runtime::AgentRuntime::new(graph.clone())
+                .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
+        );
         let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
             super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
         );
@@ -2621,6 +2850,9 @@ impl ChatManager {
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
+            self_ref: Default::default(),
+            agent_modes: Default::default(),
+            subagent_slots: Default::default(),
         }
     }
 
@@ -2664,7 +2896,10 @@ impl ChatManager {
         });
         let enrichment_pipeline =
             Self::build_enrichment_pipeline(&graph, &search, None, None, None);
-        let agent_runtime = Arc::new(super::agent_runtime::AgentRuntime::new(graph.clone()));
+        let agent_runtime = Arc::new(
+            super::agent_runtime::AgentRuntime::new(graph.clone())
+                .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
+        );
         let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
             super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
         );
@@ -2705,6 +2940,9 @@ impl ChatManager {
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
+            self_ref: Default::default(),
+            agent_modes: Default::default(),
+            subagent_slots: Default::default(),
         }
     }
 
@@ -3853,6 +4091,10 @@ impl ChatManager {
                                     .and_then(|r| r.as_str())
                                     .map(str::to_string)
                             });
+                            let scope = answer
+                                .as_ref()
+                                .and_then(|v| v.get("scope").cloned())
+                                .map(serde_json::from_value::<super::types::PermissionAnswerScope>);
 
                             info!(
                                 session_id = %session_id,
@@ -3861,14 +4103,20 @@ impl ChatManager {
                                 "NATS RPC: answering a permission request of the CLI"
                             );
 
-                            match request_id {
-                                None => crate::events::ChatRpcResponse {
+                            match (request_id, scope) {
+                                (None, _) => crate::events::ChatRpcResponse {
                                     success: false,
                                     error: Some(
                                         "a permission answer needs its request_id".to_string(),
                                     ),
                                 },
-                                Some(request_id) => {
+                                // A scope this instance does not know is refused, never read as once.
+                                (Some(_), Some(Err(_))) => crate::events::ChatRpcResponse {
+                                    success: false,
+                                    error: Some(PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string()),
+                                },
+                                (Some(request_id), scope) => {
+                                    let scope = scope.and_then(Result::ok).unwrap_or_default();
                                     let ctx = PermissionAnswer {
                                         active_sessions: &active_sessions,
                                         graph: &graph,
@@ -3880,6 +4128,7 @@ impl ChatManager {
                                         &session_id,
                                         &request_id,
                                         allow,
+                                        scope,
                                         true,
                                     )
                                     .await
@@ -3892,6 +4141,14 @@ impl ChatManager {
                                             crate::events::ChatRpcResponse {
                                                 success: false,
                                                 error: Some(PERMISSION_NOT_PENDING_RPC.to_string()),
+                                            }
+                                        }
+                                        Err(PermissionDeliveryError::ScopeUnsupported(_)) => {
+                                            crate::events::ChatRpcResponse {
+                                                success: false,
+                                                error: Some(
+                                                    PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string(),
+                                                ),
                                             }
                                         }
                                         Err(e) => crate::events::ChatRpcResponse {
@@ -4623,11 +4880,24 @@ impl ChatManager {
     /// The live permission mode of an active session (`None` when the session
     /// is not active or runs on the global default).
     pub async fn live_session_permission_mode(&self, session_id: &str) -> Option<String> {
-        self.active_sessions
+        if let Some(mode) = self
+            .active_sessions
             .read()
             .await
             .get(session_id)
             .and_then(|s| s.permission_mode.clone())
+        {
+            return Some(mode);
+        }
+        // A session of the agent engine (native, Codex, ACP): the mode last set on it.
+        if !self.agent_runtime.owns(session_id).await {
+            return None;
+        }
+        self.agent_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
     }
 
     /// The permission mode a session gets when its request names none.
@@ -4735,6 +5005,42 @@ impl ChatManager {
         }
     }
 
+    /// Whether the session `session_id` is recorded and was spawned by nothing (no
+    /// `spawned_by`): a conversation a person opened. Only such a session may run sub-agents
+    /// (P18, depth 1). An unknown or unreadable record answers `false`.
+    pub(crate) async fn spawned_by_nothing(&self, session_id: &str) -> bool {
+        let Ok(sid) = Uuid::parse_str(session_id) else {
+            return false;
+        };
+        matches!(
+            self.graph.get_chat_session(sid).await,
+            Ok(Some(node)) if node.spawned_by.as_deref().is_none_or(|s| s.trim().is_empty())
+        )
+    }
+
+    /// The lineage of a session something spawned (its record has a `spawned_by`): depth 1
+    /// under its parent session, or under whatever spawned it when it names none. `None` for a
+    /// session a person opened, or an unknown record.
+    pub(crate) async fn spawned_lineage(
+        &self,
+        session_id: &str,
+    ) -> Option<nexus_claude::agent::Lineage> {
+        let sid = Uuid::parse_str(session_id).ok()?;
+        let node = self.graph.get_chat_session(sid).await.ok()??;
+        let spawned_by = node.spawned_by.filter(|s| !s.trim().is_empty())?;
+        let ctx = parse_spawned_by(&spawned_by);
+        let parent = ctx
+            .as_ref()
+            .and_then(|c| c.parent_session_id.clone())
+            .unwrap_or_default();
+        Some(nexus_claude::agent::Lineage {
+            root_session_id: parent.clone(),
+            parent_session_id: parent,
+            depth: 1,
+            spawned_by: ctx.map_or_else(|| "unknown".to_string(), |c| c.spawn_type),
+        })
+    }
+
     /// Where a session comes from, for its tool profile (H6).
     ///
     /// `opened_by_third_party`: its caller's signed token carries the lineage
@@ -4760,6 +5066,45 @@ impl ChatManager {
             origin_known: user_claims.is_some_and(|c| !c.is_service_account())
                 || parent == SpawnParent::ClaudeCode,
         }
+    }
+
+    /// The person a session opened by these claims belongs to (`ChatSessionNode::owner`,
+    /// P11b):
+    /// - a signed-in person, with their session JWT or their MCP token, is the owner;
+    /// - an agent session's token hands down the owner of the session it was minted for (a
+    ///   delegated session belongs to the person behind its parent). When that parent
+    ///   cannot be read, the token's own `sub` (the person it was minted for, copied by
+    ///   `generate_session_token`) is the owner; a token minted for the server itself is
+    ///   then REFUSED: a session is never left without an owner by a read that failed
+    ///   (`owner` is written once, at open);
+    /// - the server itself (a plan run, a protocol), an anonymous caller or no claims at
+    ///   all: nobody.
+    pub(crate) async fn session_owner(
+        &self,
+        claims: Option<&crate::auth::jwt::Claims>,
+    ) -> Result<Option<String>> {
+        let Some(claims) = claims else {
+            return Ok(None);
+        };
+        if claims.is_agent_session() {
+            let parent = crate::auth::jwt::agent_session_binding(claims)
+                .and_then(|binding| binding.session_id.parse::<Uuid>().ok());
+            let read = match parent {
+                Some(parent) => self.graph.get_chat_session(parent).await.ok().flatten(),
+                None => None,
+            };
+            if let Some(parent) = read {
+                return Ok(parent.owner);
+            }
+            return match person_behind(claims) {
+                Some(sub) => Ok(Some(sub.to_string())),
+                None => Err(anyhow!(
+                    "the session that opens this one cannot be read, and its token names no \
+                     person: the new session would have no owner"
+                )),
+            };
+        }
+        Ok(person_behind(claims).map(str::to_string))
     }
 
     /// Environment of the project-orchestrator MCP server of one session: the
@@ -5228,6 +5573,7 @@ impl ChatManager {
                         code: None,
                         reason: None,
                         index: None,
+                        request_id: None,
                     }],
                     "init" => {
                         // Extract session metadata from init system message
@@ -5265,7 +5611,7 @@ impl ChatManager {
                             mcp_servers,
                             permission_mode,
                             provider: None,
-                            capabilities: None,
+                            capabilities: Some(legacy_capabilities()),
                             tool_policy: None,
                             policy_mode: None,
                             // The historical engine does everything: nothing is missing.
@@ -5415,6 +5761,9 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
+        // Who the session belongs to, settled before anything is opened: a refusal (no owner
+        // can be named for a delegated session) leaves nothing behind.
+        let owner = self.session_owner(request.user_claims.as_ref()).await?;
         // Check max sessions: both engines' live sessions count.
         {
             if self.active_session_count().await >= self.config.max_sessions {
@@ -5601,6 +5950,7 @@ impl ChatManager {
                 super::neutral_place::ExecutionPlace::Project
             },
             access,
+            owner,
         };
         self.graph
             .create_chat_session(&session_node)
@@ -5932,6 +6282,14 @@ impl ChatManager {
                     objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+                    session_grants: Arc::new(std::sync::Mutex::new(
+                        super::session_grants::SessionGrants::declaring(
+                            super::session_grants::declarations_for_project(
+                                &self.config.read_only_mcp_tools,
+                                Some(std::path::Path::new(&crate::expand_tilde(&request.cwd))),
+                            ),
+                        ),
+                    )),
                     oob_trigger_cap,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
@@ -6957,18 +7315,20 @@ impl ChatManager {
         //
         // Also clone the stdin_tx sender for auto-allowing AskUserQuestion control
         // requests inline (without going through send_permission_response).
-        let (pending_perm_inputs, stdin_tx_for_auto_allow, work_log) = {
+        let (pending_perm_inputs, stdin_tx_for_auto_allow, work_log, session_grants) = {
             let guard = active_sessions.read().await;
             match guard.get(&session_id) {
                 Some(s) => (
                     s.pending_permission_inputs.clone(),
                     s.stdin_tx.clone(),
                     s.work_log.clone(),
+                    s.session_grants.clone(),
                 ),
                 None => (
                     Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                     None,
                     Arc::new(Mutex::new(SessionWorkLog::default())),
+                    Arc::default(),
                 ),
             }
         };
@@ -7063,6 +7423,7 @@ impl ChatManager {
                                     code: None,
                                     reason: None,
                                     index: None,
+                                    request_id: None,
                                 },
                                 &events_tx,
                                 &nats,
@@ -7145,6 +7506,32 @@ impl ChatManager {
                         Some(event)
                     };
 
+                    // A decision the backend made itself (a request a session grant covers): persisted
+                    // and broadcast like the request it answers, and the attention it raised cleared
+                    // (`attention_changed`, as for a decision of the user).
+                    let record_decision =
+                        |event: ChatEvent,
+                         events_to_persist: &mut Vec<ChatEventRecord>,
+                         next_seq: &std::sync::atomic::AtomicI64| {
+                            if let Some(uuid) = session_uuid {
+                                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                                events_to_persist.push(ChatEventRecord {
+                                    id: Uuid::new_v4(),
+                                    session_id: uuid,
+                                    seq,
+                                    event_type: event.event_type().to_string(),
+                                    data: serde_json::to_string(&event).unwrap_or_default(),
+                                    created_at: chrono::Utc::now(),
+                                });
+                            }
+                            emit_chat(event, &events_tx, &nats, &session_id);
+                            notify_attention(
+                                &event_emitter,
+                                AttentionSubject::Session(session_id.to_string()),
+                                AttentionReason::PermissionDecision,
+                            );
+                        };
+
                     // Main stream loop — uses tokio::select! to listen for BOTH stream
                     // events AND SDK control messages (permission requests) concurrently.
                     //
@@ -7197,6 +7584,7 @@ impl ChatManager {
                                             }
 
                                             if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
+                                                let mut granted_decision: Option<ChatEvent> = None;
                                                 // AskUserQuestion: auto-allow the control request so the CLI
                                                 // waits for the tool_result (user's answer) instead of blocking.
                                                 // Do NOT store in pending_perm_inputs (it's not a permission).
@@ -7218,13 +7606,20 @@ impl ChatManager {
                                                             info!(request_id = %id, "Auto-allowed AskUserQuestion control request");
                                                         }
                                                     }
-                                                } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                                } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                     // Regular permission: store original input for later response
                                                     if !id.is_empty() {
-                                                        store_pending_perm_input(&pending_perm_inputs, id, input).await;
+                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                        if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
+                                                            record_decision(decision.clone(), &mut events_to_persist, &next_seq);
+                                                            granted_decision = Some(decision);
+                                                        }
                                                     }
                                                 }
                                                 streaming_events.lock().await.push(evt);
+                                                if let Some(decision) = granted_decision {
+                                                    streaming_events.lock().await.push(decision);
+                                                }
                                             }
                                             continue; // Go back to select! for next event
                                         }
@@ -7259,6 +7654,7 @@ impl ChatManager {
                                                 }
 
                                                 if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
+                                                let mut granted_decision: Option<ChatEvent> = None;
                                                     // AskUserQuestion: auto-allow (same logic as above)
                                                     if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
                                                         if let Some(ref tx) = stdin_tx_for_auto_allow {
@@ -7279,12 +7675,19 @@ impl ChatManager {
                                                                 info!(request_id = %id, "Auto-allowed AskUserQuestion control request (drain)");
                                                             }
                                                         }
-                                                    } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
+                                                    } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                         if !id.is_empty() {
-                                                            store_pending_perm_input(&pending_perm_inputs, id, input).await;
+                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                        if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
+                                                            record_decision(decision.clone(), &mut events_to_persist, &next_seq);
+                                                            granted_decision = Some(decision);
+                                                        }
                                                         }
                                                     }
                                                     streaming_events.lock().await.push(evt);
+                                                    if let Some(decision) = granted_decision {
+                                                        streaming_events.lock().await.push(decision);
+                                                    }
                                                 }
                                             }
                                             result
@@ -7713,6 +8116,7 @@ impl ChatManager {
                                             code: None,
                                             reason: None,
                                             index: None,
+                                            request_id: None,
                                         },
                                         &events_tx,
                                         &nats,
@@ -7993,6 +8397,8 @@ impl ChatManager {
         message: &str,
         message_type: &str,
     ) -> Result<bool> {
+        #[cfg(test)]
+        remote_send_hook::wait(session_id).await;
         let Some(ref nats) = self.nats else {
             debug!(
                 session_id = %session_id,
@@ -8382,6 +8788,8 @@ impl ChatManager {
         content: &str,
         claims: Option<&crate::auth::jwt::Claims>,
     ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        // Read before anything awaits: see `resume_point`.
+        let from = self.resume_point(session_id).await;
         if self.is_session_active(session_id).await {
             match self.queue_user_message(session_id, content).await {
                 Ok(_) => return Ok(DeliveryRoute::Local),
@@ -8391,7 +8799,10 @@ impl ChatManager {
                         error = %send_err,
                         "queue_user_message failed, attempting resume_session as fallback"
                     );
-                    return match self.resume_session(session_id, content, claims).await {
+                    return match self
+                        .resume_session_from(session_id, content, claims, from)
+                        .await
+                    {
                         Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
                         Err(resume) => Err(MessageDeliveryError::SendAndResume {
                             send: send_err,
@@ -8408,7 +8819,7 @@ impl ChatManager {
         {
             return Ok(DeliveryRoute::Remote);
         }
-        self.resume_session(session_id, content, claims)
+        self.resume_session_from(session_id, content, claims, from)
             .await
             .map(|()| DeliveryRoute::Resumed)
             .map_err(MessageDeliveryError::Resume)
@@ -8462,12 +8873,18 @@ impl ChatManager {
         request_id: &str,
         allow: bool,
     ) -> Result<()> {
-        self.send_permission_response_inner(session_id, request_id, allow, false)
-            .await
-            .map_err(|e| match e {
-                PermissionDeliveryError::Failed(e) => e,
-                other => anyhow!(other.to_string()),
-            })
+        self.send_permission_response_inner(
+            session_id,
+            request_id,
+            allow,
+            super::types::PermissionAnswerScope::Once,
+            false,
+        )
+        .await
+        .map_err(|e| match e {
+            PermissionDeliveryError::Failed(e) => e,
+            other => anyhow!(other.to_string()),
+        })
     }
 
     /// Shared body of the permission answer. With `require_pending`, the
@@ -8481,6 +8898,7 @@ impl ChatManager {
         session_id: &str,
         request_id: &str,
         allow: bool,
+        scope: super::types::PermissionAnswerScope,
         require_pending: bool,
     ) -> std::result::Result<(), PermissionDeliveryError> {
         let answer = PermissionAnswer {
@@ -8489,22 +8907,42 @@ impl ChatManager {
             nats: self.nats.as_ref(),
             event_emitter: &self.event_emitter,
         };
-        Self::deliver_permission_answer(answer, session_id, request_id, allow, require_pending)
-            .await
+        Self::deliver_permission_answer(
+            answer,
+            session_id,
+            request_id,
+            allow,
+            scope,
+            require_pending,
+        )
+        .await
     }
 
     /// The body of [`Self::send_permission_response_inner`], without `self`: the
     /// NATS RPC listener of a legacy session answers through it too, so a permission
     /// granted on another instance is the same `control_response` (subtype, request_id,
     /// behavior) written on `stdin_tx`, never under the client lock that a turn holds.
+    ///
+    ///
+    /// `session`: the CLI gets a plain allow (never `updatedPermissions`: no rule is handed
+    /// to the CLI); the grant (`session_grants::grant_for`) is kept in the session and the
+    /// backend answers the later requests it covers. `always`, or a `session` the call cannot
+    /// be granted for: refused ([`PermissionDeliveryError::ScopeUnsupported`]), the request
+    /// stays waiting.
     async fn deliver_permission_answer(
         ctx: PermissionAnswer<'_>,
         session_id: &str,
         request_id: &str,
         allow: bool,
+        scope: super::types::PermissionAnswerScope,
         require_pending: bool,
     ) -> std::result::Result<(), PermissionDeliveryError> {
-        let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq) = {
+        // What is accepted is what the engine declares (`system_init.capabilities`), as on
+        // the agent engine: a scope it does not declare is refused, never narrowed.
+        if allow && !LEGACY_PERMISSION_SCOPES.contains(&scope) {
+            return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+        }
+        let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq, session_grants) = {
             let mut sessions = ctx.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
@@ -8522,6 +8960,7 @@ impl ChatManager {
                 session.events_tx.clone(),
                 uuid::Uuid::parse_str(session_id).ok(),
                 session.next_seq.clone(),
+                session.session_grants.clone(),
             )
         };
 
@@ -8535,19 +8974,51 @@ impl ChatManager {
         if require_pending && claimed.is_none() {
             return Err(PermissionDeliveryError::NotPending);
         }
-        let was_claimed = claimed.is_some();
-        let original_input = claimed.unwrap_or_else(|| serde_json::json!({}));
         // The entry is only really consumed once the decision reached the CLI:
         // on a failed send it is put back so a retry is still `pending`.
-        let restore_claim = |input: serde_json::Value| {
+        let restore_claim = |entry: Option<PendingPermission>| {
             let pending = pending_perm_inputs.clone();
             let request_id = request_id.to_string();
             async move {
-                if was_claimed {
-                    pending.lock().await.insert(request_id, input);
+                if let Some(entry) = entry {
+                    pending.lock().await.insert(request_id, entry);
                 }
             }
         };
+        // How long the approval lasts is the backend's business: `session` is a grant kept
+        // here, `always` does not exist in this lot (P11b). Never a narrower or wider answer.
+        let grant = match (allow, scope) {
+            (false, _) | (true, super::types::PermissionAnswerScope::Once) => None,
+            (true, super::types::PermissionAnswerScope::Session) => {
+                // With this session's declared read-only MCP tools.
+                let grant = claimed.as_ref().and_then(|c| {
+                    session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .grant_for(&super::session_grants::AskedCall {
+                            asker: super::session_grants::Asker::ClaudeCode,
+                            tool: c.tool.clone(),
+                            canonical: None,
+                            input: c.input.clone(),
+                        })
+                });
+                match grant {
+                    Some(grant) => Some(grant),
+                    None => {
+                        restore_claim(claimed).await;
+                        return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                    }
+                }
+            }
+            (true, super::types::PermissionAnswerScope::Always) => {
+                restore_claim(claimed).await;
+                return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+            }
+        };
+        let original_input = claimed
+            .as_ref()
+            .map(|c| c.input.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
 
         let permission_response = if allow {
             serde_json::json!({
@@ -8574,7 +9045,7 @@ impl ChatManager {
         let json = match serde_json::to_string(&control_response) {
             Ok(j) => j,
             Err(e) => {
-                restore_claim(original_input).await;
+                restore_claim(claimed).await;
                 return Err(PermissionDeliveryError::Failed(anyhow!(
                     "Failed to serialize control response: {}",
                     e
@@ -8586,6 +9057,7 @@ impl ChatManager {
             session_id = %session_id,
             request_id = %request_id,
             allow,
+            scope = scope.as_str(),
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
@@ -8594,17 +9066,27 @@ impl ChatManager {
         let mark = tool_clock.decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = stdin_tx.send(json).await {
             tool_clock.undecided(request_id, mark);
-            restore_claim(original_input).await;
+            restore_claim(claimed).await;
             return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",
                 e
             )));
+        }
+        if let Some(grant) = &grant {
+            session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .add(grant.clone());
         }
 
         // Persist and broadcast the permission decision so it survives session reload.
         let decision_event = ChatEvent::PermissionDecision {
             id: request_id.to_string(),
             allow,
+            scope: scope.lasting(allow),
+            rule: grant
+                .as_ref()
+                .map(super::session_grants::SessionGrant::describe),
         };
 
         // Broadcast to all connected WebSocket clients
@@ -8648,24 +9130,32 @@ impl ChatManager {
     ///
     /// `require_pending` makes the answer strict for a LOCAL session (see
     /// [`Self::send_permission_response_inner`]); a remote owner does its own
-    /// bookkeeping. No instance holds the session -> `SessionDead`.
+    ///
+    /// `scope` says how long an approval lasts; a scope the session does not declare
+    /// is `ScopeUnsupported` wherever the session lives (never a narrower answer).
     pub async fn route_permission_response(
         &self,
         session_id: &str,
         request_id: &str,
         allow: bool,
+        scope: super::types::PermissionAnswerScope,
         require_pending: bool,
     ) -> std::result::Result<DeliveryRoute, PermissionDeliveryError> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             return handle
-                .answer_permission(request_id, allow)
+                .answer_permission_scoped(request_id, allow, scope)
                 .await
-                .map(|()| DeliveryRoute::Local)
-                .map_err(PermissionDeliveryError::Failed);
+                .map(|()| DeliveryRoute::Local);
         }
         if self.is_session_active(session_id).await {
             return self
-                .send_permission_response_inner(session_id, request_id, allow, require_pending)
+                .send_permission_response_inner(
+                    session_id,
+                    request_id,
+                    allow,
+                    scope,
+                    require_pending,
+                )
                 .await
                 .map(|()| DeliveryRoute::Local);
         }
@@ -8674,7 +9164,12 @@ impl ChatManager {
         // `request_id`: the CLI matches the control_response to its can_use_tool by it.
         // The owner answers strictly (a request no longer waiting is refused), so the
         // refusal comes back typed. Asked ONCE: a resend would write the answer twice.
-        let payload = serde_json::json!({ "allow": allow, "request_id": request_id }).to_string();
+        let payload = serde_json::json!({
+            "allow": allow,
+            "request_id": request_id,
+            "scope": scope,
+        })
+        .to_string();
         let Some(ref nats) = self.nats else {
             return Err(PermissionDeliveryError::SessionDead(session_id.to_string()));
         };
@@ -8685,6 +9180,9 @@ impl ChatManager {
             Some(answer) if answer.success => Ok(DeliveryRoute::Remote),
             Some(answer) if answer.error.as_deref() == Some(PERMISSION_NOT_PENDING_RPC) => {
                 Err(PermissionDeliveryError::NotPending)
+            }
+            Some(answer) if answer.error.as_deref() == Some(PERMISSION_SCOPE_UNSUPPORTED_RPC) => {
+                Err(PermissionDeliveryError::ScopeUnsupported(scope))
             }
             Some(answer) => {
                 debug!(
@@ -8785,6 +9283,8 @@ impl ChatManager {
         // write goes to a closed stdin and the turn ends empty): drop it so the
         // message takes the resume path below.
         self.evict_if_cli_dead(session_id).await;
+        // Read before anything awaits: see `resume_point`.
+        let from = self.resume_point(session_id).await;
         if self.is_session_active(session_id).await {
             match self.send_message(session_id, content).await {
                 Ok(()) => return Ok(DeliveryRoute::Local),
@@ -8794,7 +9294,10 @@ impl ChatManager {
                         error = %send_err,
                         "send_message failed, attempting resume_session as fallback"
                     );
-                    return match self.resume_session(session_id, content, claims).await {
+                    return match self
+                        .resume_session_from(session_id, content, claims, from)
+                        .await
+                    {
                         Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
                         Err(resume) => Err(MessageDeliveryError::SendAndResume {
                             send: send_err,
@@ -8811,7 +9314,7 @@ impl ChatManager {
         {
             return Ok(DeliveryRoute::Remote);
         }
-        self.resume_session(session_id, content, claims)
+        self.resume_session_from(session_id, content, claims, from)
             .await
             .map(|()| DeliveryRoute::Resumed)
             .map_err(MessageDeliveryError::Resume)
@@ -8842,6 +9345,21 @@ impl ChatManager {
                 session_id,
                 pair.neutral != nexus_claude::agent::PolicyMode::Trust,
             );
+            // What a child's ceiling reads (A17, P18): kept live, and persisted so a resume and
+            // the envelope after a restart see the mode the session is in, not its opening one.
+            self.agent_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.to_string(), pair.legacy.to_string());
+            if let Ok(uuid) = Uuid::parse_str(session_id) {
+                if let Err(e) = self
+                    .graph
+                    .update_chat_session_permission_mode(uuid, pair.legacy)
+                    .await
+                {
+                    warn!(session_id = %session_id, error = %e, "Failed to persist the permission mode of an agent session (non-fatal)");
+                }
+            }
             return Ok(());
         }
         // Validate mode: the Claude strings or the neutral names (A43). The CLI
@@ -9054,7 +9572,12 @@ impl ChatManager {
             add_dirs: node.add_dirs.clone(),
             workspace_slug: node.workspace_slug.clone(),
             user_claims: claims,
-            spawned_by: None,
+            // A child of a session stays one when it moves: its lineage (depth 1, P18 / A17)
+            // and its third-party parent (H6) go with it.
+            spawned_by: node
+                .spawned_by
+                .clone()
+                .filter(|s| parse_spawned_by(s).is_some_and(|ctx| ctx.parent_session_id.is_some())),
             task_context: None,
             scaffolding_override: None,
             // A switch never widens: the new session keeps the access of the old one.
@@ -9616,17 +10139,43 @@ impl ChatManager {
         Ok(())
     }
 
+    /// The live handle (if any) of `session_id`, read by a caller BEFORE it checks whether
+    /// the session is live and before it asks another instance (`try_remote_send`, up to
+    /// the NATS RPC timeout): handed to [`Self::resume_session_from`], a resume that finds
+    /// ANOTHER live handle once it holds the session's lock knows a resume succeeded while
+    /// the caller was looking, and delivers to it (follow-up of the review of #696).
+    pub async fn resume_point(&self, session_id: &str) -> ResumeFrom {
+        ResumeFrom(self.agent_runtime.get(session_id).await)
+    }
+
+    /// [`Self::resume_session_from`], from the live handle of now: for a caller that did
+    /// not look at the session before (a caller that checked `is_session_active` or tried
+    /// another instance first reads [`Self::resume_point`] before, and passes it).
     pub async fn resume_session(
         &self,
         session_id: &str,
         message: &str,
         user_claims: Option<&crate::auth::jwt::Claims>,
     ) -> Result<()> {
+        let from = self.resume_point(session_id).await;
+        self.resume_session_from(session_id, message, user_claims, from)
+            .await
+    }
+
+    /// Resumes `session_id` and delivers `message`, starting from `from`: the live handle
+    /// the caller saw before it awaited anything (its liveness check, a failed send, the
+    /// NATS RPC). A resume that finds ANOTHER live handle once it holds the session's lock
+    /// was overtaken by a resume that succeeded meanwhile, and delivers to it (review of
+    /// #696, finding 1, and its follow-up: the caller's window).
+    pub async fn resume_session_from(
+        &self,
+        session_id: &str,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        from: ResumeFrom,
+    ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
-        // The live handle (if any) this resume starts from, read before anything awaits: a
-        // resume that finds ANOTHER one once it holds the session's lock was overtaken by
-        // a resume that succeeded meanwhile (review of #696, finding 1).
-        let seen = self.agent_runtime.get(session_id).await;
+        let seen = from.0;
 
         // Load session from Neo4j
         let mut session_node = self
@@ -9971,6 +10520,16 @@ impl ChatManager {
                     // Resumed sessions = interactive: use the generous cap (50/5min).
                     // T7 of plan 9a1684b2.
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+                    session_grants: Arc::new(std::sync::Mutex::new(
+                        super::session_grants::SessionGrants::declaring(
+                            super::session_grants::declarations_for_project(
+                                &self.config.read_only_mcp_tools,
+                                Some(std::path::Path::new(&crate::expand_tilde(
+                                    &session_node.cwd,
+                                ))),
+                            ),
+                        ),
+                    )),
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
@@ -10800,6 +11359,7 @@ impl ChatManager {
                 code: Some("turn_abandoned".to_string()),
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::StreamingStatus {
                 is_streaming: false,
@@ -12809,6 +13369,12 @@ impl ChatManager {
         // opening (#598); its profile is signed into a per-session token, its network tools
         // follow the project's consent by origin and the browser its authorisation (#596).
         let mut gate: Option<Vec<String>> = None;
+        // The names of the native engine's own servers are reserved (P11b): a server of
+        // the session named `nexus` would replace nexus-tools, and its tools would pass for
+        // the built-in ones (`mcp__nexus__Read` granted whole for the session).
+        if kind == nexus_claude::agent::ProviderKind::Native {
+            refuse_reserved_native_servers(&spec.mcp_servers)?;
+        }
         if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
             use super::provider::native_factory::runnable_nexus_tools;
             use super::provider::nexus_tools as nt;
@@ -12850,10 +13416,7 @@ impl ChatManager {
                             "search engine left out of the session"
                         );
                     }
-                    for (name, server) in attachment.servers {
-                        // A session that already names its own server keeps it.
-                        spec.mcp_servers.entry(name).or_insert(server);
-                    }
+                    attach_native_servers(&mut spec.mcp_servers, attachment.servers)?;
                     gate = Some(attachment.search_origins);
                 }
                 None => tracing::warn!(
@@ -12903,6 +13466,31 @@ impl ChatManager {
                 )
                 .with_turn_router(self.turn_routing.get(session_id)),
             ));
+        }
+        // The `Agent` tool of the native harness (P18): its calls run as child sessions of this
+        // one (A18). Only for a local session nothing spawned (depth 1, A17), once the manager
+        // can hand itself over (`enable_subagents`).
+        if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
+            // A spawned native session: the harness's own depth guard applies (`lineage`), and
+            // it asks no question nobody would see (its user is a parent session, not a person).
+            if let Some(lineage) = self.spawned_lineage(session_id).await {
+                spec.lineage = Some(lineage);
+                spec.policy
+                    .deny
+                    .push(nexus_claude::agent::ToolPattern::tool(
+                        nexus_claude::providers::native::builtin::ASK_USER_QUESTION_TOOL,
+                    ));
+            }
+            if let Some(manager) = self.weak_self() {
+                if self.spawned_by_nothing(session_id).await {
+                    spec.hooks = Some(Arc::new(super::subagents::SubagentHooks::new(
+                        spec.hooks.take(),
+                        manager,
+                        session_id,
+                        user_claims.cloned(),
+                    )));
+                }
+            }
         }
         // The consent of the project and the revocation of the token are checked before ANY
         // other hook, and whether or not the session has the knowledge-graph hooks.
@@ -13038,6 +13626,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        // The project's files are on this machine unless the instance is remote.
+        let project_dir =
+            (!super::provider::resolver::is_remote_instance(provider_id)).then(|| spec.cwd.clone());
         let (session, dropped) =
             open_dropping_refused_mcp(provider.kind(), spec, |spec| provider.open(spec))
                 .await
@@ -13066,6 +13657,7 @@ impl ChatManager {
             tool_policy,
             host_missing,
             !per_session_mcp || without_mcp,
+            project_dir,
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -13202,6 +13794,9 @@ impl ChatManager {
     /// lacks ([`host_degraded`]: its `nexus-tools` server, the project-orchestrator
     /// server), which it reports as features it does not have rather than leaving only
     /// a line in the server's log.
+    /// `project_dir`: the session's project directory on THIS machine (`None` for a remote
+    /// session), whose `.mcp.json` decides which read-only MCP declarations hold for it
+    /// (`session_grants::declarations_for_project`).
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -13213,6 +13808,7 @@ impl ChatManager {
         tool_policy: serde_json::Value,
         host_missing: Vec<String>,
         without_mcp: bool,
+        project_dir: Option<std::path::PathBuf>,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
@@ -13239,13 +13835,10 @@ impl ChatManager {
                 warn!(session_id, error = %e, "Failed to persist the provider snapshot (non-fatal)");
             }
         }
-        let kind_name = serde_json::to_value(kind)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "claude_code".to_string());
+        let kind_name = provider_kind_name(&kind);
         let handle = self
             .agent_runtime
-            .adopt_with(
+            .adopt_declaring(
                 session_id,
                 provider_id,
                 session,
@@ -13254,6 +13847,10 @@ impl ChatManager {
                 tool_policy,
                 Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
                 host_missing,
+                super::session_grants::declarations_for_project(
+                    &self.config.read_only_mcp_tools,
+                    project_dir.as_deref(),
+                ),
             )
             .await;
         // A failed turn is retried as the chat's configuration says, on both engines.
@@ -13492,11 +14089,22 @@ impl ChatManager {
         // other set up. Once it holds the lock, a resume that finds a live handle OTHER than
         // the one it started from was overtaken by a resume that succeeded: its message goes
         // to that session, through `send_message` (routing applies in `full` mode). The same
-        // handle (dead, a resume after a failed send) or none: it resumes.
+        // handle (dead, a resume after a failed send) or none: it resumes. When the send to
+        // the handle that overtook it fails (its process died while this message waited, the
+        // NATS RPC included: a handle leaves the runtime only by `close`), it resumes over
+        // that handle, as after any failed send (review of #706, finding 1). Still under the
+        // lock: no new race.
         let _resuming = self.resume_locks.lock(&sid).await;
         if let Some(now) = self.agent_runtime.get(&sid).await {
             if seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, &now)) {
-                return self.send_message(&sid, message).await;
+                match self.send_message(&sid, message).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => warn!(
+                        session_id = %sid,
+                        %error,
+                        "the session that overtook this resume refused the message: resuming over it"
+                    ),
+                }
             }
         }
         let provider_id = node
@@ -13605,6 +14213,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        // The project's files are on this machine unless the instance is remote.
+        let project_dir = (!super::provider::resolver::is_remote_instance(&provider_id))
+            .then(|| spec.cwd.clone());
         let (session, dropped) = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
             let provider = Arc::clone(&provider);
             let token = token.clone();
@@ -13638,6 +14249,7 @@ impl ChatManager {
             tool_policy,
             host_missing,
             !per_session_mcp || without_mcp,
+            project_dir,
         )
         .await;
         let handle = self
@@ -13699,6 +14311,10 @@ impl ChatManager {
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
         if self.agent_runtime.owns(session_id).await {
+            self.agent_modes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(session_id);
             crate::auth::agent_tokens::revoke_session(session_id);
             // Every instance learns the session is gone, as on the legacy path: the
             // `session_closed` the runtime emits is published like every event.
@@ -14117,6 +14733,17 @@ mod idle_expiry_tests {
     }
 }
 
+/// The wire name of a provider kind (`claude_code`, `native`, `codex`...), from which a
+/// session's `session_grants::Asker` is derived. Never a guess: a kind that does not
+/// serialize to a name is `unknown`, whose requests are never granted for the session
+/// (`Asker::Other`, the most restrictive).
+fn provider_kind_name<K: serde::Serialize + ?Sized>(kind: &K) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Parse a raw SDK control message into a [`ChatEvent::PermissionRequest`] if it is
 /// a `can_use_tool` request.  Returns `None` for any other subtype.
 ///
@@ -14126,11 +14753,68 @@ mod idle_expiry_tests {
 /// Extracted as a standalone async fn so that `tokio::select!` blocks don't
 /// struggle with type inference on `Arc<Mutex<HashMap>>` inline locks.
 async fn store_pending_perm_input(
-    map: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    map: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingPermission>>>,
     id: &str,
     input: &serde_json::Value,
+    tool: &str,
 ) {
-    map.lock().await.insert(id.to_string(), input.clone());
+    map.lock().await.insert(
+        id.to_string(),
+        PendingPermission {
+            input: input.clone(),
+            tool: tool.to_string(),
+        },
+    );
+}
+
+/// A permission request of the CLI the session's grants cover (`chat::session_grants`):
+/// answered here, once, with its original input; the request leaves the pending map.
+/// Returns the decision to record, `None` when nothing covers it or the write failed
+/// (the user is then asked as usual).
+async fn answer_granted_request(
+    grants: &std::sync::Mutex<super::session_grants::SessionGrants>,
+    pending: &tokio::sync::Mutex<std::collections::HashMap<String, PendingPermission>>,
+    stdin_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    id: &str,
+    tool: &str,
+    input: &serde_json::Value,
+) -> Option<ChatEvent> {
+    let call = super::session_grants::AskedCall {
+        asker: super::session_grants::Asker::ClaudeCode,
+        tool: tool.to_string(),
+        canonical: None,
+        input: input.clone(),
+    };
+    let grant = grants
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .covering(&call)
+        .cloned()?;
+    let tx = stdin_tx?;
+    let line = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": id,
+            "response": { "behavior": "allow", "updatedInput": input }
+        }
+    })
+    .to_string();
+    // Claimed before the write, like an answer of the user: whoever claims first answers,
+    // never two answers to one request (a request already claimed is left alone). Given
+    // back if the write fails: the request then still waits for the user.
+    let claimed = pending.lock().await.remove(id)?;
+    if tx.send(line).await.is_err() {
+        pending.lock().await.insert(id.to_string(), claimed);
+        return None;
+    }
+    info!(request_id = %id, rule = %grant.describe(), "permission covered by a session grant: answered by the backend");
+    Some(ChatEvent::PermissionDecision {
+        id: id.to_string(),
+        allow: true,
+        scope: Some(super::types::PermissionAnswerScope::Session),
+        rule: Some(grant.describe()),
+    })
 }
 
 /// Relay a permission request / question as a light `attention_changed` on
@@ -14283,6 +14967,36 @@ pub(crate) fn legacy_messages_filter(conversation_id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
+    /// serialize to a name falls back to `unknown` (no session grant), never to a
+    /// permissive kind.
+    #[test]
+    fn an_unnamed_provider_kind_falls_back_to_unknown() {
+        use crate::chat::session_grants::Asker;
+        struct Unserializable;
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("no name"))
+            }
+        }
+        for name in [
+            provider_kind_name(&Unserializable),
+            provider_kind_name(&42),
+            provider_kind_name(&serde_json::json!({ "kind": "claude_code" })),
+        ] {
+            assert_eq!(name, "unknown");
+            assert_eq!(Asker::from_provider_kind(&name), Asker::Other);
+        }
+        assert_eq!(
+            provider_kind_name(&nexus_claude::agent::ProviderKind::Native),
+            "native"
+        );
+        assert_eq!(
+            provider_kind_name(&nexus_claude::agent::ProviderKind::ClaudeCode),
+            "claude_code"
+        );
+    }
+
     #[test]
     fn legacy_messages_filter_escapes_the_conversation_id() {
         assert_eq!(legacy_messages_filter("abc"), "conversation_id = \"abc\"");
@@ -14342,6 +15056,7 @@ mod tests {
             jwt_secret: None,
             server_port: 8080,
             session_token_expiry_secs: 86400,
+            read_only_mcp_tools: Vec::new(),
         }
     }
 
@@ -14854,6 +15569,136 @@ mod tests {
         fn is_enabled(&self, _config: &crate::chat::enrichment::EnrichmentConfig) -> bool {
             true
         }
+    }
+
+    /// Review #679 finding 6: a session belongs to the person who opened it, a delegated
+    /// session to the person behind its parent; the server's own sessions to nobody.
+    #[tokio::test]
+    async fn a_session_belongs_to_the_person_behind_it() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let m = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+        let person = Uuid::new_v4();
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let human = crate::auth::jwt::decode_jwt(
+            &crate::auth::jwt::encode_jwt(person, "p@ffs.holdings", "P", secret, 60).unwrap(),
+            secret,
+        )
+        .unwrap();
+        assert_eq!(
+            m.session_owner(Some(&human)).await.unwrap(),
+            Some(person.to_string())
+        );
+        let server = crate::auth::jwt::Claims::service_account("runner");
+        assert_eq!(m.session_owner(Some(&server)).await.unwrap(), None);
+        assert_eq!(m.session_owner(None).await.unwrap(), None);
+
+        // The agent session token of a session P owns opens sessions P owns.
+        let parent = crate::neo4j::models::ChatSessionNode {
+            owner: Some(person.to_string()),
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        mock.create_chat_session(&parent).await.unwrap();
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: parent.id.to_string(),
+            ceiling: None,
+            tool_profile: None,
+            third_party: false,
+        };
+        let (token, _) =
+            crate::auth::jwt::generate_session_token(&human, Some(&binding), secret, 60).unwrap();
+        let agent = crate::auth::jwt::decode_jwt(&token, secret).unwrap();
+        assert!(agent.is_agent_session());
+        assert_eq!(
+            m.session_owner(Some(&agent)).await.unwrap(),
+            Some(person.to_string())
+        );
+    }
+
+    /// Review of #699, finding 2: a read of the parent that fails never leaves a delegated
+    /// session without an owner (written once, at open). The token's `sub` is the person
+    /// it was minted for; a token minted for the server itself is refused.
+    #[tokio::test]
+    async fn a_delegated_session_whose_parent_cannot_be_read_is_not_left_without_owner() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let m = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let parent = crate::neo4j::models::ChatSessionNode {
+            owner: Some("someone-else".into()),
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        mock.create_chat_session(&parent).await.unwrap();
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: parent.id.to_string(),
+            ceiling: None,
+            tool_profile: None,
+            third_party: false,
+        };
+        let agent_of = |claims: &crate::auth::jwt::Claims| {
+            let (token, _) =
+                crate::auth::jwt::generate_session_token(claims, Some(&binding), secret, 60)
+                    .unwrap();
+            crate::auth::jwt::decode_jwt(&token, secret).unwrap()
+        };
+        let person = Uuid::new_v4();
+        let human = crate::auth::jwt::decode_jwt(
+            &crate::auth::jwt::encode_jwt(person, "p@ffs.holdings", "P", secret, 60).unwrap(),
+            secret,
+        )
+        .unwrap();
+        mock.fail_reads.lock().unwrap().insert("get_chat_session");
+
+        assert_eq!(
+            m.session_owner(Some(&agent_of(&human))).await.unwrap(),
+            Some(person.to_string()),
+            "the person the token was minted for"
+        );
+        let server = crate::auth::jwt::Claims::service_account("runner");
+        assert!(
+            m.session_owner(Some(&agent_of(&server))).await.is_err(),
+            "no person to fall back on: the open is refused"
+        );
+
+        // Readable again: the parent's owner wins over the token's `sub`.
+        mock.fail_reads.lock().unwrap().clear();
+        assert_eq!(
+            m.session_owner(Some(&agent_of(&human))).await.unwrap(),
+            Some("someone-else".to_string())
+        );
+    }
+
+    /// Review of #699, finding 3: a person opening a session from an MCP client (their MCP
+    /// token) owns it, like with their session JWT.
+    #[tokio::test]
+    async fn a_session_opened_with_a_persons_mcp_token_belongs_to_that_person() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let m = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let person = Uuid::new_v4();
+        let (token, _) = crate::auth::jwt::encode_mcp_token(
+            person,
+            "p@ffs.holdings",
+            "P",
+            "mcp:read mcp:write",
+            secret,
+            60,
+        )
+        .unwrap();
+        let mcp = crate::auth::jwt::decode_jwt(&token, secret).unwrap();
+        assert!(mcp.is_mcp_token());
+        assert_eq!(
+            m.session_owner(Some(&mcp)).await.unwrap(),
+            Some(person.to_string())
+        );
+        // The anonymous user (no-auth mode, the standalone MCP server) owns nothing.
+        assert_eq!(
+            m.session_owner(Some(&crate::auth::jwt::Claims::anonymous()))
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     fn neutral_session() -> crate::neo4j::models::ChatSessionNode {
@@ -15531,6 +16376,50 @@ mod tests {
             .contains_key("nexus"));
     }
 
+    /// P11b point 7: a server of a native session named `nexus` (or `browser`) is refused,
+    /// never kept in place of the backend's: nexus would skip nexus-tools and give its tools
+    /// the built-in names, so a third party's `mcp__nexus__Read` would be granted whole
+    /// for the session.
+    #[test]
+    fn a_native_session_server_named_nexus_is_refused() {
+        use nexus_claude::agent::McpServerSpec;
+        use std::collections::BTreeMap;
+        let server = |command: &str| McpServerSpec::Stdio {
+            command: command.to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+        };
+        for reserved in RESERVED_NATIVE_SERVERS {
+            let mut servers = BTreeMap::new();
+            servers.insert("project-orchestrator".to_string(), server("/po/mcp_server"));
+            servers.insert(reserved.to_string(), server("/tmp/someone-elses-server"));
+            let refused = refuse_reserved_native_servers(&servers).unwrap_err();
+            assert!(refused.to_string().contains(reserved), "{refused}");
+
+            // The attachment does not keep the session's server in its place either.
+            let attached = BTreeMap::from([(reserved.to_string(), server("/usr/bin/nexus-tools"))]);
+            assert!(attach_native_servers(&mut servers, attached).is_err());
+            assert!(matches!(
+                servers.get(reserved),
+                Some(McpServerSpec::Stdio { command, .. }) if command == "/tmp/someone-elses-server"
+            ));
+        }
+        // Without a reserved name, the backend's servers are attached.
+        let mut servers = BTreeMap::new();
+        servers.insert("project-orchestrator".to_string(), server("/po/mcp_server"));
+        servers.insert("acme".to_string(), server("/opt/acme"));
+        refuse_reserved_native_servers(&servers).unwrap();
+        attach_native_servers(
+            &mut servers,
+            BTreeMap::from([("nexus".to_string(), server("/usr/bin/nexus-tools"))]),
+        )
+        .unwrap();
+        assert!(matches!(
+            servers.get("nexus"),
+            Some(McpServerSpec::Stdio { command, .. }) if command == "/usr/bin/nexus-tools"
+        ));
+    }
+
     /// `nexus-tools` is launched with the session's directory as its working
     /// directory: a relative program path (NEXUS_TOOLS_PATH=./nexus-tools, a `.` or
     /// empty entry of the PATH) would then name a file of the PROJECT, which the
@@ -15990,6 +16879,103 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// P18: a native session a person opened runs sub-agents (the harness then offers
+    /// `Agent`); a session something spawned — the sub-agent's own child session included —
+    /// never does (depth 1, A17); nor does a manager that cannot hand itself over.
+    #[tokio::test]
+    async fn only_a_native_session_nothing_spawned_runs_subagents() {
+        use nexus_claude::agent::ProviderKind;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(graph.clone());
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            config,
+        ));
+        let (top, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut node = crate::test_helpers::test_chat_session(Some("proj"));
+        node.id = top;
+        graph.create_chat_session(&node).await.unwrap();
+        node.id = child;
+        node.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: top,
+                tool_use_id: Some("ca1".into()),
+            }
+            .to_json_string(),
+        );
+        graph.create_chat_session(&node).await.unwrap();
+        let claims = crate::auth::jwt::Claims::service_account("p18");
+        let runs = |sid: String, kind: ProviderKind| {
+            let manager = manager.clone();
+            let claims = claims.clone();
+            async move {
+                let spec = manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/work/app",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(&claims),
+                        session_id: &sid,
+                        third_party: true,
+                        max_tokens: None,
+                        kind,
+                        remote_cwd: None,
+                        per_session_mcp: true,
+                        hooks: Some(AgentHookScope {
+                            project_slug: Some("proj".into()),
+                            task_id: None,
+                            runner: false,
+                        }),
+                    })
+                    .await
+                    .unwrap();
+                crate::auth::agent_tokens::revoke_session(&sid);
+                let asks = !spec
+                    .policy
+                    .deny
+                    .iter()
+                    .any(|p| p.matches("AskUserQuestion", None));
+                (
+                    spec.hooks.is_some_and(|h| h.runs_subagents()),
+                    spec.lineage.map(|l| l.depth),
+                    asks,
+                )
+            }
+        };
+        assert!(
+            !runs(top.to_string(), ProviderKind::Native).await.0,
+            "without enable_subagents the manager cannot open a child"
+        );
+        manager.enable_subagents();
+        // A session a person opened: the host, no lineage, the question.
+        assert_eq!(
+            runs(top.to_string(), ProviderKind::Native).await,
+            (true, None, true)
+        );
+        // A spawned session: no host, the harness's depth guard armed (lineage depth 1), no
+        // question nobody would see.
+        assert_eq!(
+            runs(child.to_string(), ProviderKind::Native).await,
+            (false, Some(1), false),
+            "a spawned session cannot delegate again nor ask"
+        );
+        assert!(
+            !runs(Uuid::new_v4().to_string(), ProviderKind::Native)
+                .await
+                .0,
+            "an unknown record is not trusted"
+        );
+        assert!(
+            !runs(top.to_string(), ProviderKind::ClaudeCode).await.0,
+            "Claude Code brings its own Task"
+        );
     }
 
     #[tokio::test]
@@ -18407,6 +19393,99 @@ mod tests {
         fake.state.end_turn();
         manager.close_session(&sid).await.unwrap();
     }
+    /// Follow-up of the review of #696 (scenario A, the caller's window): a message that
+    /// finds the session not live asks another instance first (`try_remote_send`, up to
+    /// the NATS RPC timeout in a cluster). A resume of the same session that completes
+    /// during that wait must receive the message, not be resumed over: the caller reads
+    /// the live handle BEFORE its liveness check. Before, `resume_session` read it only
+    /// after the wait, saw the new handle as its own starting point and resumed a second
+    /// time (a second token superseding the first, the first turn ended by `adopt`).
+    #[tokio::test]
+    async fn a_resume_that_completes_while_a_message_asks_nats_is_not_resumed_over() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.state.opened_specs.lock().unwrap().clear();
+        fake.state.turns_started.lock().unwrap().clear();
+        let (entered, release) = remote_send_hook::arm(&sid);
+        let claims = req.user_claims.as_ref();
+        let (routed, resumed_first) =
+            tokio::join!(manager.route_user_message(&sid, "two", claims), async {
+                // "two" saw the session not live and now waits on the remote instances.
+                entered.await.unwrap();
+                let first = manager.resume_session(&sid, "one", claims).await;
+                release.notify_one();
+                first
+            },);
+        resumed_first.unwrap();
+        assert_eq!(routed.unwrap(), DeliveryRoute::Resumed);
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 1, "the session is resumed once");
+        assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
+            &resumed[0]
+        )));
+        delivered(&fake, &["one", "two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Review of #706, finding 1: a message that waited (the NATS RPC) while another
+    /// resume installed a handle whose process then died is not lost: the send to that
+    /// handle fails, and the resume goes on over it (a handle leaves the runtime only by
+    /// `close`). Before, the failed send was the answer: the message never arrived.
+    #[tokio::test]
+    async fn a_message_overtaken_by_a_resume_whose_session_died_resumes_over_it() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.state.opened_specs.lock().unwrap().clear();
+        fake.state.turns_started.lock().unwrap().clear();
+        // "two" looked before the session was resumed: it saw no live handle.
+        let from = manager.resume_point(&sid).await;
+        manager
+            .resume_session(&sid, "one", req.user_claims.as_ref())
+            .await
+            .unwrap();
+        delivered(&fake, &["one"]).await;
+        fake.state.end_turn();
+        let overtaking = manager.agent_runtime.get(&sid).await.expect("live");
+        wait_idle(&overtaking).await;
+        // Its process dies: the next turn on it fails.
+        *fake.state.fail_next_turn.lock().unwrap() = Some(
+            nexus_claude::agent::ProviderError::unsupported("the agent is gone"),
+        );
+        manager
+            .resume_session_from(&sid, "two", req.user_claims.as_ref(), from)
+            .await
+            .unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 2, "resumed over the dead session");
+        let live = manager.agent_runtime.get(&sid).await.expect("live");
+        assert!(!Arc::ptr_eq(&live, &overtaking), "a new handle");
+        assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
+            &resumed[1]
+        )));
+        delivered(&fake, &["two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Waits until `handle` has no turn running.
+    async fn wait_idle(handle: &super::super::agent_runtime::AgentSessionHandle) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
@@ -18541,7 +19620,13 @@ mod tests {
         })
         .await;
         manager
-            .route_permission_response(&sid, "perm-1", true, true)
+            .route_permission_response(
+                &sid,
+                "perm-1",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                true,
+            )
             .await
             .unwrap();
         let answers = fake.state.permission_answers.lock().unwrap().clone();
@@ -19259,6 +20344,21 @@ mod tests {
         assert_eq!(wire["degraded_features"], serde_json::json!([]), "{wire}");
     }
 
+    #[test]
+    fn the_legacy_system_init_declares_the_permission_scopes_the_engine_accepts() {
+        let msg = Message::System {
+            subtype: "init".into(),
+            data: serde_json::json!({"session_id": "cli-1", "model": "m"}),
+        };
+        let events = ChatManager::message_to_events(&msg);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(
+            wire["capabilities"]["permission_scopes"],
+            serde_json::json!(["once", "session"]),
+            "{wire}"
+        );
+    }
+
     fn done_event(
         is_error: bool,
         error: Option<nexus_claude::agent::ProviderError>,
@@ -19636,7 +20736,13 @@ mod tests {
 
         for attempt in 1..=2 {
             let err = manager
-                .send_permission_response_inner(&sid, "req-1", true, true)
+                .send_permission_response_inner(
+                    &sid,
+                    "req-1",
+                    true,
+                    crate::chat::types::PermissionAnswerScope::Once,
+                    true,
+                )
                 .await
                 .unwrap_err();
             assert!(
@@ -19823,6 +20929,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -20192,6 +21299,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -20231,6 +21339,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -20314,6 +21423,7 @@ mod tests {
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            session_grants: Arc::default(),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
             oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -20950,6 +22060,7 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -22064,6 +23175,7 @@ mod tests {
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            session_grants: Arc::default(),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
             oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -22679,7 +23791,7 @@ mod tests {
             .pending_permission_inputs
             .lock()
             .await
-            .insert("req-d".to_string(), serde_json::json!({}));
+            .insert("req-d".to_string(), PendingPermission::default());
         manager
             .active_sessions
             .write()
@@ -22719,11 +23831,13 @@ mod tests {
             "command": "echo \"hello\"",
             "description": "Print hello"
         });
-        session
-            .pending_permission_inputs
-            .lock()
-            .await
-            .insert("req-allow-001".to_string(), original_input.clone());
+        session.pending_permission_inputs.lock().await.insert(
+            "req-allow-001".to_string(),
+            PendingPermission {
+                input: original_input.clone(),
+                tool: "Bash".to_string(),
+            },
+        );
 
         let session_id = "test-perm-allow";
         manager
@@ -26259,7 +27373,13 @@ pub(crate) mod test_support {
         let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
         let mut pending = HashMap::new();
         for id in pending_permissions {
-            pending.insert((*id).to_string(), serde_json::json!({ "command": "ls" }));
+            pending.insert(
+                (*id).to_string(),
+                super::PendingPermission {
+                    input: serde_json::json!({ "command": "ls" }),
+                    tool: "Bash".to_string(),
+                },
+            );
         }
         let session = ActiveSession {
             anchor: Default::default(),
@@ -26286,6 +27406,7 @@ pub(crate) mod test_support {
             stream_task: Arc::new(std::sync::Mutex::new(None)),
             post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(pending)),
+            session_grants: Arc::default(),
             auto_continue: Arc::new(AtomicBool::new(false)),
             auto_continue_count: Arc::new(AtomicU32::new(0)),
             max_auto_continues: 0,
