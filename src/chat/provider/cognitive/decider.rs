@@ -792,4 +792,40 @@ mod tests {
             d.reason
         );
     }
+
+    /// Follow-up review of #710 (A): the margin on the means is pinned at 0.1. The pair in
+    /// force is `b` (3/5); the challenger `a` (2/3) is better ON AVERAGE by ~0.067, under the
+    /// margin: a thousand independent steady turns keep `b`. Red with an argmax on the
+    /// means (`gap < 0.0`): `a` is taken whenever it leads the draw.
+    #[test]
+    fn a_steady_turn_keeps_the_pair_in_force_against_a_mean_gap_under_the_margin() {
+        let sig = pilot();
+        let arms = barely_observed(&sig);
+        let mean = |m: &str| {
+            arms.iter()
+                .find(|a| a.key.model == m)
+                .map(ArmStats::mean)
+                .unwrap()
+        };
+        let gap = mean("a") - mean("b");
+        assert!(gap > 0.0 && gap < HYSTERESIS_MARGIN, "{gap}");
+        let mut req = request(sig, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![facts("local", "a", 1.0), facts("local", "b", 1.0)];
+        req.settings.exploration_epsilon = 0.2;
+        req.steady = true;
+        req.current = Some(Pick::new("local", "b"));
+        let changes = (0..1_000u128)
+            .filter(|seed| {
+                let d = decide_with(
+                    Uuid::from_u128(*seed),
+                    Utc::now(),
+                    &req,
+                    &arms,
+                    &PriorHints::new(),
+                );
+                d.chosen != Some(Pick::new("local", "b"))
+            })
+            .count();
+        assert_eq!(changes, 0);
+    }
 }
