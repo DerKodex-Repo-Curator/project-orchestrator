@@ -385,6 +385,7 @@ pub(crate) const MAX_TRANSIENT_RETRIES: u32 = 3;
 
 /// Why a cut turn of a session recovery does not resume was closed.
 const CLOSED_LEFT_TO_OWNER: &str = "The server restarted while this turn was running. This session is driven by its owner (plan run, pipeline, delegation, or the `Agent` call of a parent session), which relaunches the work itself: it is not resumed here.";
+const CLOSED_MIRROR: &str = "The server restarted while the Claude Code sub-agent this conversation mirrors was running. A mirror is read-only and is never resumed: its parent conversation shows what happened.";
 const CLOSED_LEGACY: &str = "The server restarted while this turn was running, and this session is not resumed automatically: send your message again to continue.";
 const CLOSED_CLAUDE_CODE: &str = "The server restarted while this Claude Code turn was running. It is not resumed without you (it could run tools unattended): send your message again to continue.";
 const CLOSED_STALE: &str = "The server restarted while this turn was running, too long ago to resume it automatically: send your message again to continue.";
@@ -471,7 +472,11 @@ impl ChatManager {
             // an owner-managed one (runner, pipeline, gate-retry, delegation, or a sub-agent
             // of an `Agent` call) is relaunched by its owner. A `chat(send_message)`
             // sub-session and a trigger-spawned session have no owner: resumed.
-            let left_alone = if !node.opened_on_agent() {
+            let left_alone = if node.mirror_of.is_some() {
+                // A read-only mirror of a Claude Code sub-agent (P18c) has no process: never
+                // resumed, only closed when cut.
+                Some(CLOSED_MIRROR)
+            } else if !node.opened_on_agent() {
                 Some(CLOSED_LEGACY)
             } else if node.served_by_claude_code() && !self.recovery_resumes_claude_code {
                 Some(CLOSED_CLAUDE_CODE)
@@ -546,7 +551,7 @@ impl ChatManager {
     /// child has an owner, in whose attention they would stay pending for 30 days (lot
     /// review of #721, finding 4).
     async fn close_cut_session(&self, node: &ChatSessionNode, reason: &str) {
-        if node.spawned_by.as_deref().is_some_and(is_agent_tool_child) {
+        if node.spawned_by.as_deref().is_some_and(is_agent_tool_child) && node.mirror_of.is_none() {
             self.deny_waiting_permissions(&node.id.to_string()).await;
         }
         self.close_cut_turn(node.id, reason).await;

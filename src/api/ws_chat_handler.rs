@@ -760,6 +760,17 @@ async fn handle_ws_chat_loop(
                         let text_str: &str = &text;
                         match serde_json::from_str::<WsChatClientMessage>(text_str) {
                             Ok(client_msg) => {
+                                // A read-only mirror of a Claude Code sub-agent (P18c) takes nothing
+                                // that writes to it: refused with its own flat frame, before any
+                                // send, resume, proxy or answer is attempted.
+                                if writes_to_session(&client_msg)
+                                    && chat_manager.refuse_if_mirror(&session_id).await.is_err()
+                                {
+                                    let _ = ws_sender
+                                        .send(Message::Text(mirror_read_only_frame().to_string().into()))
+                                        .await;
+                                    continue;
+                                }
                                 match client_msg {
                                     WsChatClientMessage::UserMessage { content, attachments, queue, refs } => {
                                         debug!(session_id = %session_id, queue, "WS: Received user_message");
@@ -857,10 +868,13 @@ async fn handle_ws_chat_loop(
                                                     resume_error = %resume,
                                                     "Both send_message and resume_session failed"
                                                 );
-                                                let err = serde_json::json!({
-                                                    "type": "error",
-                                                    "message": format!("Failed to send message: {}", resume),
-                                                });
+                                                let err = delivery_error_frame(&MessageDeliveryError::SendAndResume { send, resume });
+                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                            Err(MessageDeliveryError::MirrorReadOnly) => {
+                                                // A read-only mirror of a Claude Code sub-agent
+                                                // (P18c): nothing was sent.
+                                                let err = delivery_error_frame(&MessageDeliveryError::MirrorReadOnly);
                                                 let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                             }
                                             Err(MessageDeliveryError::Resume(e)) => {
@@ -870,10 +884,7 @@ async fn handle_ws_chat_loop(
                                                     error = %e,
                                                     "resume_session failed"
                                                 );
-                                                let err = serde_json::json!({
-                                                    "type": "error",
-                                                    "message": format!("Failed to resume session: {}", e),
-                                                });
+                                                let err = delivery_error_frame(&MessageDeliveryError::Resume(e));
                                                 let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                             }
                                         }
@@ -1420,6 +1431,62 @@ pub(crate) fn lasting_answer_refused(
         && scope == crate::chat::types::PermissionAnswerScope::Always
         && !claims.may_keep_lasting_approvals())
     .then_some(AnswerRefusal::NotAPerson)
+}
+
+/// Whether a client frame writes to the session (a message, queued or not, an answer to a
+/// permission or a question): what a read-only mirror refuses (P18c).
+pub(crate) fn writes_to_session(msg: &WsChatClientMessage) -> bool {
+    matches!(
+        msg,
+        WsChatClientMessage::UserMessage { .. }
+            | WsChatClientMessage::PermissionResponse { .. }
+            | WsChatClientMessage::InputResponse { .. }
+    )
+}
+
+/// The FLAT `error` frame refusing anything written to a read-only mirror of a Claude Code
+/// sub-agent (`chat::mirror`, P18c): `{type: "error", code: "mirror_read_only", message}`,
+/// its message never behind a prefix, so the client recognises the code. Nothing was sent.
+pub(crate) fn mirror_read_only_frame() -> serde_json::Value {
+    serde_json::to_value(crate::chat::types::ChatEvent::Error {
+        message: crate::chat::mirror::MirrorReadOnly.to_string(),
+        parent_tool_use_id: None,
+        code: Some(crate::chat::mirror::MIRROR_READ_ONLY.to_string()),
+        reason: None,
+        index: None,
+        request_id: None,
+    })
+    .unwrap_or_default()
+}
+
+/// The `error` frame of a message the routing could not deliver. A refusal by a mirror —
+/// its own variant, or carried by a failed resume — is the flat
+/// [`mirror_read_only_frame`], never the generic "Failed to …" text.
+pub(crate) fn delivery_error_frame(
+    error: &crate::chat::manager::MessageDeliveryError,
+) -> serde_json::Value {
+    use crate::chat::manager::MessageDeliveryError;
+    let is_mirror = |e: &anyhow::Error| {
+        e.chain()
+            .any(|c| c.is::<crate::chat::mirror::MirrorReadOnly>())
+    };
+    match error {
+        MessageDeliveryError::MirrorReadOnly => mirror_read_only_frame(),
+        MessageDeliveryError::SendAndResume { send, resume }
+            if is_mirror(resume) || is_mirror(send) =>
+        {
+            mirror_read_only_frame()
+        }
+        MessageDeliveryError::Resume(e) if is_mirror(e) => mirror_read_only_frame(),
+        MessageDeliveryError::SendAndResume { resume, .. } => serde_json::json!({
+            "type": "error",
+            "message": format!("Failed to send message: {}", resume),
+        }),
+        MessageDeliveryError::Resume(e) => serde_json::json!({
+            "type": "error",
+            "message": format!("Failed to resume session: {}", e),
+        }),
+    }
 }
 
 /// The `error` frame refusing a `permission_response` before delivery: nothing was

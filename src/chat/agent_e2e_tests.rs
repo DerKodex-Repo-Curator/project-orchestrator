@@ -9328,6 +9328,7 @@ mod permission_scopes {
             )
         };
         let session = |id: Uuid| ChatSessionNode {
+            mirror_of: None,
             id,
             cli_session_id: None,
             project_slug: None,
@@ -13440,5 +13441,315 @@ mod legacy_turn_end_at_boot {
         );
         assert_eq!(cli.closed_at_next_boot().await, 0);
         cli.manager.close_session(&cli.sid).await.unwrap();
+    }
+}
+
+// ============================================================================
+// P18c: the sub-agents of Claude Code get read-only mirror children
+// ============================================================================
+
+/// A sub-agent launched by Claude Code's own `Task`/`Agent` tool runs inside the CLI; its
+/// activity reaches the parent with `parent_tool_use_id`. Each engine mirrors it into ONE
+/// read-only child (`chat::mirror`), the parent's thread left as it was; a native session
+/// (whose sub-agents are real children) gets no mirror; nothing can be sent to a mirror.
+mod claude_code_mirror {
+    use nexus_claude::agent::{AgentEvent, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::Step;
+
+    use super::parity::{caps, rig};
+    use super::*;
+    use crate::chat::manager::MessageDeliveryError;
+    use crate::chat::mirror::test_support::{closed_mirrors, mirrors_of, thread, RecordingEmitter};
+    use crate::chat::mirror::{MIRROR_OF_CLAUDE_CODE, MIRROR_READ_ONLY};
+    use crate::chat::types::SpawnedBy;
+    use crate::events::CrudAction;
+
+    const CALL: &str = "t-agent";
+
+    /// `step`, as the sub-agent of the call `parent` emits it.
+    fn nested(step: Step, parent: &str) -> Step {
+        match step {
+            Step::Emit(mut event) => {
+                match &mut event {
+                    AgentEvent::Text { parent: p, .. }
+                    | AgentEvent::ToolCall { parent: p, .. }
+                    | AgentEvent::ToolResult { parent: p, .. } => *p = Some(parent.to_string()),
+                    _ => {}
+                }
+                Step::Emit(event)
+            }
+            other => other,
+        }
+    }
+
+    fn task_turn() -> Vec<Step> {
+        vec![
+            steps::tool_call(
+                CALL,
+                "Task",
+                json!({"description": "find the spec", "prompt": "Look for the spec"}),
+            ),
+            nested(steps::text("looking"), CALL),
+            nested(
+                steps::tool_call("t-read", "Read", json!({"file_path": "a.md"})),
+                CALL,
+            ),
+            nested(steps::tool_result("t-read", "the spec"), CALL),
+            nested(steps::text("found it"), CALL),
+            steps::tool_result(CALL, "The spec is in a.md"),
+            steps::text("answered agent"),
+            steps::done(&caps()),
+        ]
+    }
+
+    /// Asserts the mirror of a turn that ran [`task_turn`] (or the CLI's equivalent): one
+    /// child linked to the call, its thread the prompt then the sub-agent's events at top
+    /// level, closed with the call's result; a message to it refused before any turn.
+    async fn assert_one_closed_mirror(
+        manager: &ChatManager,
+        graph: &MockGraphStore,
+        parent: Uuid,
+        said: &[&str],
+        answer: &str,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let mirrors = closed_mirrors(graph, parent, 1).await;
+        assert_eq!(mirrors.len(), 1, "exactly one mirror");
+        let mirror = mirrors[0].clone();
+        assert_eq!(mirror.mirror_of.as_deref(), Some(MIRROR_OF_CLAUDE_CODE));
+        assert_eq!(mirror.title.as_deref(), Some("find the spec"));
+        assert_eq!(
+            SpawnedBy::from_json_str(mirror.spawned_by.as_deref().unwrap()),
+            Some(SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: Some(CALL.into()),
+            })
+        );
+        let events = thread(graph, mirror.id).await;
+        assert!(
+            matches!(&events[0], ChatEvent::UserMessage { content } if content.contains("Look for the spec")),
+            "{events:?}"
+        );
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::AssistantText {
+                    content,
+                    parent_tool_use_id: None,
+                } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, said, "the sub-agent's words, top level: {events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            ChatEvent::ToolUse { tool, parent_tool_use_id: None, .. } if tool == "Read")));
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result { result_text: Some(t), is_error: false, .. }) if t.contains(answer)),
+            "{events:?}"
+        );
+        // The listing carries the marker (the frontend reads `mirror_of`).
+        let children = graph.get_session_children(parent).await.unwrap();
+        assert_eq!(children.len(), 1);
+
+        // Read-only: refused, typed, before any send or resume.
+        let sid = mirror.id.to_string();
+        assert!(matches!(
+            manager.route_user_message(&sid, "hello", None).await,
+            Err(MessageDeliveryError::MirrorReadOnly)
+        ));
+        assert!(matches!(
+            manager.route_queued_user_message(&sid, "hello", None).await,
+            Err(MessageDeliveryError::MirrorReadOnly)
+        ));
+        let err = manager
+            .resume_session(&sid, "hello", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::chat::provider::errors::classify_open_error(&err, None)
+                .map(|f| (f.status, f.code)),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert!(
+            !manager.is_session_active(&sid).await,
+            "no process was started"
+        );
+        mirror
+    }
+
+    /// Agent engine (the default for Claude Code): the mirror is written from the events
+    /// the runtime emits; the parent keeps its nested events exactly as before.
+    #[tokio::test]
+    async fn a_claude_code_task_call_gets_a_mirror_on_the_agent_engine() {
+        let mut r = rig(ProviderKind::ClaudeCode, vec![task_turn()]).await;
+        r.manager.send_message(&r.sid, "find it").await.unwrap();
+        r.turn_end().await;
+        let parent = Uuid::parse_str(&r.sid).unwrap();
+        assert_one_closed_mirror(
+            &r.manager,
+            &r.graph,
+            parent,
+            &["looking", "found it"],
+            "The spec is in a.md",
+        )
+        .await;
+        // The parent's own thread is untouched: the sub-agent still nested under its call.
+        let own = thread(r.graph.as_ref(), parent).await;
+        assert!(
+            own.iter().any(|e| matches!(e,
+            ChatEvent::AssistantText { content, parent_tool_use_id: Some(p) }
+                if content == "looking" && p == CALL)),
+            "{own:?}"
+        );
+        assert!(own.iter().any(|e| matches!(e,
+            ChatEvent::ToolResult { id, parent_tool_use_id: None, .. } if id == CALL)));
+        assert_eq!(r.sent().len(), 1, "the mirror sent nothing to the provider");
+    }
+
+    /// A native session's sub-agents are real children (`chat::subagents`): the same
+    /// stream gets no mirror.
+    #[tokio::test]
+    async fn a_native_session_gets_no_mirror() {
+        let mut r = rig(ProviderKind::Native, vec![task_turn()]).await;
+        r.manager.send_message(&r.sid, "find it").await.unwrap();
+        r.turn_end().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let parent = Uuid::parse_str(&r.sid).unwrap();
+        assert!(mirrors_of(r.graph.as_ref(), parent).await.is_empty());
+    }
+
+    /// Historical engine: the same, from the CLI itself (`fake_claude`): a Task call whose
+    /// sub-agent speaks with `parent_tool_use_id`, then its `tool_result`. The CRUD bus
+    /// sees the mirror created once, then streaming true / false.
+    #[tokio::test]
+    async fn a_claude_code_task_call_gets_a_mirror_on_the_historical_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let assistant = |content: Value, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude", "content": content,
+                "stop_reason": "end_turn"}, "parent_tool_use_id": parent}})
+        };
+        let tool_result = |id: &str, text: &str, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": id, "content": text, "is_error": false}
+                ]}, "parent_tool_use_id": parent}})
+        };
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": "cli-mirror-1",
+                "model": "fake-claude", "cwd": ".", "tools": ["Read", "Task"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            assistant(
+                json!([{"type": "tool_use", "id": CALL, "name": "Task",
+                    "input": {"description": "find the spec", "prompt": "Look for the spec"}}]),
+                None,
+            ),
+            assistant(json!([{"type": "text", "text": "looking"}]), Some(CALL)),
+            assistant(
+                json!([{"type": "tool_use", "id": "t-read", "name": "Read",
+                    "input": {"file_path": "a.md"}}]),
+                Some(CALL),
+            ),
+            tool_result("t-read", "the spec", Some(CALL)),
+            assistant(json!([{"type": "text", "text": "found it"}]), Some(CALL)),
+            tool_result(CALL, "The spec is in a.md", None),
+            assistant(json!([{"type": "text", "text": "answered agent"}]), None),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": "cli-mirror-1", "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "answered agent"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let fake = fake_bin("fake_claude");
+        let cli = dir.path().join("claude");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do if [ \"$a\" = \"--version\" ]; then exec \"{fake}\" \"$@\"; fi; done\n\
+                 FAKE_CLAUDE_TRANSCRIPT=\"{t}\" FAKE_CLAUDE_MAX_RUNTIME_MS=60000 exec \"{fake}\" \"$@\"\n",
+                fake = fake.display(),
+                t = transcript.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let emitter = Arc::new(RecordingEmitter::default());
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            claude_cli_path: Some(cli.display().to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_event_emitter(emitter.clone());
+        let mut req = request(None, None, "default");
+        req.message = "find it".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        assert!(
+            !manager.agent_runtime.owns(&sid).await,
+            "the historical engine"
+        );
+        let parent = Uuid::parse_str(&sid).unwrap();
+        let mirror = assert_one_closed_mirror(
+            &manager,
+            &graph,
+            parent,
+            &["looking", "found it"],
+            "The spec is in a.md",
+        )
+        .await;
+
+        let crud = emitter.of(&mirror.id.to_string());
+        assert_eq!(crud.len(), 3, "{crud:?}");
+        assert_eq!(crud[0].0, CrudAction::Created);
+        assert_eq!(
+            crud[0].1["spawned_by"]["tool_use_id"], CALL,
+            "{:?}",
+            crud[0].1
+        );
+        assert_eq!(crud[0].1["spawned_by"]["parent_session_id"], sid);
+        assert_eq!(crud[0].1["mirror_of"], MIRROR_OF_CLAUDE_CODE);
+        assert_eq!(
+            crud[1],
+            (CrudAction::Updated, json!({"is_streaming": true}))
+        );
+        assert_eq!(
+            crud[2],
+            (CrudAction::Updated, json!({"is_streaming": false}))
+        );
+
+        // The parent's thread keeps the sub-agent nested under its call.
+        let mut own = Vec::new();
+        for _ in 0..200 {
+            own = thread(graph.as_ref(), parent).await;
+            if own.iter().any(|e| matches!(e, ChatEvent::Result { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            own.iter().any(|e| matches!(e,
+            ChatEvent::AssistantText { content, parent_tool_use_id: Some(p) }
+                if content == "looking" && p == CALL)),
+            "{own:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
     }
 }
