@@ -31,7 +31,9 @@ pub const DEFAULT_DEMOTE_AFTER: u32 = 20;
 /// Smallest meaningful demotion window.
 pub const MIN_DEMOTE_AFTER: u32 = 5;
 
-/// Who chooses the provider and model.
+/// Who chooses the provider and model, as the SETTINGS say (global or project
+/// document). Not to be confused with [`ConversationRoutingMode`], the choice the chat
+/// menu makes for ONE conversation (decision R-S4: `mixed` is that one's word only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderRoutingMode {
@@ -39,15 +41,51 @@ pub enum ProviderRoutingMode {
     /// what it would have chosen.
     #[default]
     Primary,
-    /// The primary pilots the conversation; PO routes the executor sessions
-    /// (runner, delegation, utilities).
-    Mixed,
+    /// The primary pilots the conversation; PO routes the executor sessions only
+    /// (runner, delegation, utilities). Written `executors_only`; a document stored
+    /// before R-S4 says `mixed`, read as this variant (an alias, no migration).
+    #[serde(rename = "executors_only", alias = "mixed")]
+    ExecutorsOnly,
     /// PO routes everything, the pilot included.
     Full,
 }
 
 impl ProviderRoutingMode {
     /// Every mode, in the order the interface shows them.
+    pub const ALL: [Self; 3] = [Self::Primary, Self::ExecutorsOnly, Self::Full];
+
+    /// The name a settings document stored before R-S4 gives [`Self::ExecutorsOnly`]:
+    /// still read (and accepted in a body), never written.
+    pub const LEGACY_EXECUTORS_ONLY: &'static str = "mixed";
+
+    /// Stable serialised name (identical to the serde form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::ExecutorsOnly => "executors_only",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// The routing ONE conversation asked for in the chat menu (`ChatRequest.routing_mode`,
+/// `PUT /api/chat/sessions/{id}/routing`, the session's `routing_mode`). Derived from the
+/// menu, never stored in the settings: Auto = `full`, two models ticked or more = `mixed`
+/// (PO routes among them), one model ticked = `primary` (strict).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationRoutingMode {
+    /// Strict: the model ticked is imposed, never substituted.
+    Primary,
+    /// PO routes this conversation among the models ticked (`routing_pool`): the
+    /// opening decision AND every turn's, the pilot included.
+    Mixed,
+    /// Auto: PO routes everything, the provider included.
+    Full,
+}
+
+impl ConversationRoutingMode {
+    /// Every mode, in the order the menu reads them.
     pub const ALL: [Self; 3] = [Self::Primary, Self::Mixed, Self::Full];
 
     /// Stable serialised name (identical to the serde form).
@@ -56,6 +94,18 @@ impl ProviderRoutingMode {
             Self::Primary => "primary",
             Self::Mixed => "mixed",
             Self::Full => "full",
+        }
+    }
+
+    /// The settings-level mode this conversation's PILOT decisions are asked with.
+    /// `full` is `full`. `primary` is strict. `mixed` routes the pilot only through its
+    /// pool: where a decision restricted to the pool is asked, it is asked as `full`
+    /// inside the pool; outside the pool nothing is routed and the provider never moves,
+    /// which is `primary` — never `executors_only`, whose pilot is never routed.
+    pub fn pilot_mode(self) -> ProviderRoutingMode {
+        match self {
+            Self::Primary | Self::Mixed => ProviderRoutingMode::Primary,
+            Self::Full => ProviderRoutingMode::Full,
         }
     }
 }
@@ -146,7 +196,7 @@ impl Default for RoutingSettings {
 /// messages never echo a value the caller sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutingError {
-    /// `mode` is not `primary`, `mixed` or `full`.
+    /// `mode` is not `primary`, `executors_only` (or its old name `mixed`) or `full`.
     InvalidMode,
     /// `stage` is not `shadow`, `advisory` or `auto`.
     InvalidStage,
@@ -175,7 +225,7 @@ impl std::fmt::Display for RoutingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidMode => {
-                f.write_str("unknown routing mode: expected primary, mixed or full")
+                f.write_str("unknown routing mode: expected primary, executors_only or full")
             }
             Self::InvalidStage => {
                 f.write_str("unknown learning stage: expected shadow, advisory or auto")
@@ -249,9 +299,12 @@ pub fn parse_routing_settings(body: &Value) -> Result<RoutingSettings, RoutingEr
     if !body.is_object() {
         return Err(RoutingError::Malformed);
     }
+    // A document stored before R-S4, or a client not updated yet, may still say `mixed`:
+    // read as `executors_only`, the same thing under its old name.
     let modes: Vec<&str> = ProviderRoutingMode::ALL
         .iter()
         .map(|m| m.as_str())
+        .chain([ProviderRoutingMode::LEGACY_EXECUTORS_ONLY])
         .collect();
     let stages: Vec<&str> = LearningStage::ALL.iter().map(|s| s.as_str()).collect();
     enum_field(body, "mode", &modes, RoutingError::InvalidMode)?;
@@ -300,8 +353,8 @@ pub fn effective_routing(
 /// Whether the user handed THIS conversation's routing to PO (decision R-S1): Auto in the
 /// menu (`routing_mode: full`) or two models ticked or more (a pool). One model ticked is
 /// strict (a pin), and a conversation that asked nothing follows the settings.
-pub fn conversation_routes(mode: Option<ProviderRoutingMode>, pool_len: usize) -> bool {
-    mode == Some(ProviderRoutingMode::Full) || pool_len > 1
+pub fn conversation_routes(mode: Option<ConversationRoutingMode>, pool_len: usize) -> bool {
+    mode == Some(ConversationRoutingMode::Full) || pool_len > 1
 }
 
 /// The stage a conversation's decisions are taken at (decision R-S1): a choice the user
@@ -348,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_choice_on_the_conversation_is_the_auto_stage_for_it_only() {
-        use ProviderRoutingMode::*;
+        use ConversationRoutingMode::*;
         // Auto, or a pool of two models or more: the user handed the routing to PO.
         assert!(conversation_routes(Some(Full), 0));
         assert!(conversation_routes(Some(Mixed), 2));
@@ -396,7 +449,7 @@ mod tests {
         }
         assert_eq!(
             ProviderRoutingMode::ALL.map(|m| m.as_str()),
-            ["primary", "mixed", "full"]
+            ["primary", "executors_only", "full"]
         );
         assert_eq!(
             LearningStage::ALL.map(|s| s.as_str()),
@@ -411,6 +464,62 @@ mod tests {
             assert_eq!(s, format!("\"{}\"", sc.as_str()));
             assert_eq!(serde_json::from_str::<RoutingScope>(&s).unwrap(), sc);
         }
+    }
+
+    /// Decision R-S4: two notions, two names. The settings' "the primary pilots, PO routes
+    /// the executors" is `executors_only`; `mixed` is the conversation's "PO routes among
+    /// the models ticked". Each round-trips under its own name.
+    #[test]
+    fn the_settings_and_the_conversation_name_their_modes_apart() {
+        let s = serde_json::to_string(&ProviderRoutingMode::ExecutorsOnly).unwrap();
+        assert_eq!(s, "\"executors_only\"");
+        assert_eq!(
+            serde_json::from_str::<ProviderRoutingMode>(&s).unwrap(),
+            ProviderRoutingMode::ExecutorsOnly
+        );
+        for m in ConversationRoutingMode::ALL {
+            let s = serde_json::to_string(&m).unwrap();
+            assert_eq!(s, format!("\"{}\"", m.as_str()));
+            assert_eq!(
+                serde_json::from_str::<ConversationRoutingMode>(&s).unwrap(),
+                m
+            );
+        }
+        assert_eq!(
+            ConversationRoutingMode::ALL.map(|m| m.as_str()),
+            ["primary", "mixed", "full"],
+            "the wire value of a pool keeps its name (contract compat)"
+        );
+        // A conversation never says `executors_only`: that is not a choice of the menu.
+        assert!(serde_json::from_str::<ConversationRoutingMode>("\"executors_only\"").is_err());
+        // A pool routes the pilot among the pool; it is never "the pilot left alone".
+        assert_eq!(
+            ConversationRoutingMode::Mixed.pilot_mode(),
+            ProviderRoutingMode::Primary
+        );
+        assert_eq!(
+            ConversationRoutingMode::Full.pilot_mode(),
+            ProviderRoutingMode::Full
+        );
+    }
+
+    /// A settings document stored before R-S4 says `mixed`: it still reads, as
+    /// `executors_only`, and is written back under the new name. No migration.
+    #[test]
+    fn a_settings_document_stored_with_mixed_still_reads_as_executors_only() {
+        let stored: RoutingSettings =
+            serde_json::from_str(r#"{"mode":"mixed","stage":"auto"}"#).unwrap();
+        assert_eq!(stored.mode, ProviderRoutingMode::ExecutorsOnly);
+        assert_eq!(stored.stage, LearningStage::Auto);
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap()["mode"],
+            "executors_only"
+        );
+        // A body from a client not updated yet is accepted the same way.
+        let parsed = parse_routing_settings(&json!({"mode": "mixed"})).unwrap();
+        assert_eq!(parsed.mode, ProviderRoutingMode::ExecutorsOnly);
+        let parsed = parse_routing_settings(&json!({"mode": "executors_only"})).unwrap();
+        assert_eq!(parsed.mode, ProviderRoutingMode::ExecutorsOnly);
     }
 
     #[test]
@@ -514,7 +623,7 @@ mod tests {
     #[test]
     fn effective_routing_prefers_project_then_global_then_default() {
         let global = RoutingSettings {
-            mode: ProviderRoutingMode::Mixed,
+            mode: ProviderRoutingMode::ExecutorsOnly,
             ..Default::default()
         };
         let project = RoutingSettings {
@@ -544,7 +653,7 @@ mod tests {
             None,
         )))
         .unwrap();
-        assert_eq!(v["mode"], "mixed");
+        assert_eq!(v["mode"], "executors_only");
         assert_eq!(v["scope"], "global");
         assert_eq!(v["demote_after"], 20);
     }

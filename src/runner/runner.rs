@@ -9320,8 +9320,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_two_tasks_of_different_classes_give_two_decisions_carried_on_request_and_record()
-    {
+    async fn executors_only_two_tasks_of_different_classes_give_two_decisions_carried_on_request_and_record(
+    ) {
         use crate::runner::routing::test_support::FakeDecider;
         let _lock = TEST_MUTEX.lock().await;
         reset_globals().await;
@@ -9331,7 +9331,7 @@ mod tests {
             .put_llm_setting(
                 crate::chat::provider::settings::GLOBAL,
                 crate::chat::provider::cognitive::ROUTING_KEY,
-                r#"{"mode":"mixed","stage":"auto"}"#,
+                r#"{"mode":"executors_only","stage":"auto"}"#,
             )
             .await
             .unwrap();
@@ -9376,7 +9376,7 @@ mod tests {
         assert!(seen[0].signature.budget_remaining_usd.is_some());
         assert_eq!(
             seen[0].settings.mode,
-            crate::chat::provider::cognitive::ProviderRoutingMode::Mixed
+            crate::chat::provider::cognitive::ProviderRoutingMode::ExecutorsOnly
         );
 
         let spied = runner.request_spy.lock().unwrap().clone();

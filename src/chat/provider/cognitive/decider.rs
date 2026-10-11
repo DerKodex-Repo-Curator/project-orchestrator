@@ -28,7 +28,7 @@ pub const NO_CANDIDATE: &str = "no_candidate";
 
 /// Whether a choice is used, from the mode, the stage and the role.
 ///
-/// `shadow` never applies; `primary` applies nothing; `mixed` applies to
+/// `shadow` never applies; `primary` applies nothing; `executors_only` applies to
 /// executors only; `full` applies to everyone. At the `advisory` stage the
 /// pilot is advised, never applied, in every mode.
 pub fn is_applied(mode: ProviderRoutingMode, stage: LearningStage, role: Role) -> bool {
@@ -37,7 +37,7 @@ pub fn is_applied(mode: ProviderRoutingMode, stage: LearningStage, role: Role) -
     }
     let by_mode = match mode {
         ProviderRoutingMode::Primary => false,
-        ProviderRoutingMode::Mixed => role == Role::Executor,
+        ProviderRoutingMode::ExecutorsOnly => role == Role::Executor,
         ProviderRoutingMode::Full => true,
     };
     match stage {
@@ -731,9 +731,9 @@ mod tests {
             (Primary, Shadow, false, false),
             (Primary, Advisory, false, false),
             (Primary, Auto, false, false),
-            (Mixed, Shadow, false, false),
-            (Mixed, Advisory, false, true),
-            (Mixed, Auto, false, true),
+            (ExecutorsOnly, Shadow, false, false),
+            (ExecutorsOnly, Advisory, false, true),
+            (ExecutorsOnly, Auto, false, true),
             (Full, Shadow, false, false),
             (Full, Advisory, false, true),
             (Full, Auto, true, true),
@@ -1351,7 +1351,7 @@ mod tests {
         use LearningStage::*;
         use ProviderRoutingMode::*;
         assert_eq!(ProbeScope::for_settings(Primary, Shadow), ProbeScope::None);
-        for (mode, stage) in [(Primary, Auto), (Mixed, Shadow), (Full, Advisory)] {
+        for (mode, stage) in [(Primary, Auto), (ExecutorsOnly, Shadow), (Full, Advisory)] {
             assert_eq!(ProbeScope::for_settings(mode, stage), ProbeScope::All);
         }
         let only = ProbeScope::Only(vec![("i".into(), "a".into())]);

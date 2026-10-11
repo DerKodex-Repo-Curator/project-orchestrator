@@ -425,10 +425,11 @@ async fn primary_sends_every_turn_to_the_primary_and_only_records() {
     );
 }
 
-/// `mixed`: the executor is routed (to the worker the arms prefer), the pilot is not.
+/// Settings `executors_only` (named `mixed` before R-S4): the executor is routed (to the
+/// worker the arms prefer), the pilot is not.
 #[tokio::test]
-async fn mixed_routes_the_executor_and_leaves_the_pilot_on_the_primary() {
-    let w = world("mixed", "auto").await;
+async fn executors_only_routes_the_executor_and_leaves_the_pilot_on_the_primary() {
+    let w = world("executors_only", "auto").await;
     let p = open(&w, &pilot()).await;
     let e = open(&w, &executor()).await;
     let (pilot_node, executor_node) = (node(&w, &p).await, node(&w, &e).await);
@@ -464,12 +465,12 @@ async fn full_auto_routes_the_pilot_and_changes_its_model_between_two_turns() {
 /// stayed on `wa` (`no_candidate`).
 #[tokio::test]
 async fn a_conversation_routed_among_two_ticked_models_changes_model_between_turns() {
-    use super::provider::cognitive::ProviderRoutingMode;
+    use super::provider::cognitive::ConversationRoutingMode;
     use super::types::RoutingPoolEntry;
     let w = world("primary", "auto").await;
     probe_wb(&w).await;
     let mut ticked = pilot();
-    ticked.routing_mode = Some(ProviderRoutingMode::Mixed);
+    ticked.routing_mode = Some(ConversationRoutingMode::Mixed);
     ticked.routing_pool = Some(
         ["wa", "wb"]
             .iter()
@@ -491,6 +492,148 @@ async fn a_conversation_routed_among_two_ticked_models_changes_model_between_tur
         })
         .expect("the opening turn is decided");
     assert!(opening_turn.chosen.is_some(), "{}", opening_turn.reason);
+}
+
+/// R-S4, end to end: the menu opens a pool conversation naming its pilot (`worker/wa`) with
+/// the pool, as the frontend does. The OPENING model is decided among the pool (the debug
+/// message runs on `wb`, `routed_by: auto`), whatever the global `primary` + `shadow`: the
+/// pilot is only the fallback. Before R-S4 the pilot opened it (`wa`, `routed_by: request`).
+#[tokio::test]
+async fn a_pool_conversation_opens_on_the_model_decided_among_the_pool_not_on_the_pilot() {
+    use super::provider::cognitive::ConversationRoutingMode;
+    use super::types::RoutingPoolEntry;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut ticked = pilot();
+    ticked.message = DEBUG.into();
+    ticked.provider = Some("worker".into());
+    ticked.model = Some("wa".into());
+    ticked.routing_mode = Some(ConversationRoutingMode::Mixed);
+    ticked.routing_pool = Some(
+        ["wa", "wb"]
+            .iter()
+            .map(|m| RoutingPoolEntry {
+                provider: "worker".into(),
+                model: (*m).into(),
+            })
+            .collect(),
+    );
+    let p = open(&w, &ticked).await;
+    let opened = node(&w, &p).await;
+    assert_eq!(opened.provider_id.as_deref(), Some("worker"));
+    assert_eq!(opened.model, "wb", "decided among the pool, not the pilot");
+    assert_eq!(opened.routed_by.as_deref(), Some("auto"));
+    assert_eq!(opened.routing_mode.as_deref(), Some("mixed"));
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
+    assert!(turns(&w.primary).is_empty());
+}
+
+/// Review of #713, C1: a `full` conversation with a pool, MOVED by the router, opens the new
+/// session on the target the router decided (`worker/wb`), never on a decision taken again
+/// among the pool at the opening (the arms prefer `wa` for this simple message). The relayed
+/// request names the target with the pool and `full` read from the session: R-S4's pilot
+/// rule is for the menu's `mixed` only.
+#[tokio::test]
+async fn a_full_conversation_with_a_pool_moved_by_the_router_opens_on_its_target() {
+    use super::provider::cognitive::ConversationRoutingMode;
+    use super::types::RoutingPoolEntry;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut full = pilot();
+    full.provider = Some("primary".into());
+    full.model = Some("pm".into());
+    full.routing_mode = Some(ConversationRoutingMode::Full);
+    full.routing_pool = Some(
+        [("primary", "pm"), ("worker", "wa"), ("worker", "wb")]
+            .iter()
+            .map(|(provider, model)| RoutingPoolEntry {
+                provider: (*provider).into(),
+                model: (*model).into(),
+            })
+            .collect(),
+    );
+    let p = open(&w, &full).await;
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("primary"));
+    let moved = w
+        .manager
+        .relay_conversation(
+            &p,
+            "worker",
+            Some("wb"),
+            SIMPLE,
+            Some(crate::auth::jwt::Claims::service_account("e2e")),
+            super::relay::MOVED_BY_AUTO,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("move failed: {e:#}"));
+    // The relayed turn may be over before anyone subscribes: wait for its request instead.
+    for _ in 0..400 {
+        if !model_of_turn(&w.worker, SIMPLE, &[]).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    idle(&w, &moved.session_id).await;
+    let target = node(&w, &moved.session_id).await;
+    assert_eq!(target.provider_id.as_deref(), Some("worker"));
+    assert_eq!(
+        target.model, "wb",
+        "the router's target, not a new decision (wa)"
+    );
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[]), ["wb"]);
+}
+
+/// Review of #713 (follow-up), C1-bis: a pool sent WITHOUT a mode, routed `full` by the
+/// settings, moved by the router: the relayed request says `full`, so the new session opens
+/// on the router's target (`worker/wb`), not on a decision taken again among the pool (`wa`
+/// for this simple message).
+#[tokio::test]
+async fn a_pool_without_a_mode_moved_by_the_router_opens_on_its_target() {
+    use super::types::RoutingPoolEntry;
+    let w = world("full", "auto").await;
+    probe_wb(&w).await;
+    let mut pooled = pilot();
+    // The explore class prefers the primary: the opening, decided among the pool, lands there.
+    pooled.message = EXPLORE.into();
+    pooled.routing_pool = Some(
+        [("primary", "pm"), ("worker", "wa"), ("worker", "wb")]
+            .iter()
+            .map(|(provider, model)| RoutingPoolEntry {
+                provider: (*provider).into(),
+                model: (*model).into(),
+            })
+            .collect(),
+    );
+    let p = open(&w, &pooled).await;
+    let opened = node(&w, &p).await;
+    assert_eq!(opened.provider_id.as_deref(), Some("primary"));
+    assert_eq!(opened.routing_mode, None, "no mode asked");
+    let moved = w
+        .manager
+        .relay_conversation(
+            &p,
+            "worker",
+            Some("wb"),
+            SIMPLE,
+            Some(crate::auth::jwt::Claims::service_account("e2e")),
+            super::relay::MOVED_BY_AUTO,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("move failed: {e:#}"));
+    for _ in 0..400 {
+        if !model_of_turn(&w.worker, SIMPLE, &[]).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    idle(&w, &moved.session_id).await;
+    let target = node(&w, &moved.session_id).await;
+    assert_eq!(
+        target.model, "wb",
+        "the router's target, not a new decision (wa)"
+    );
+    assert_eq!(target.routing_mode.as_deref(), Some("full"));
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[]), ["wb"]);
 }
 
 /// `shadow`: even in `full`, nothing is applied (no move, no model change), and every
@@ -677,11 +820,11 @@ async fn decisions_of(w: &World, session_id: &str) -> Vec<CognitiveDecision> {
 /// happened (`stage: auto`, the change `applied`, with its reason).
 #[tokio::test]
 async fn a_conversation_in_auto_routes_its_turns_whatever_the_global_shadow_stage() {
-    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    use super::provider::cognitive::{ConversationRoutingMode, LearningStage};
     let w = world("primary", "shadow").await;
     probe_wb(&w).await;
     let mut auto = pilot();
-    auto.routing_mode = Some(ProviderRoutingMode::Full);
+    auto.routing_mode = Some(ConversationRoutingMode::Full);
     let p = open(&w, &auto).await;
     turn(&w, &p, SIMPLE).await;
     let events = turn_events(&w, &p, DEBUG).await;
@@ -712,12 +855,12 @@ async fn a_conversation_in_auto_routes_its_turns_whatever_the_global_shadow_stag
 /// runs on `wb`, decided among the pool at `stage: auto`.
 #[tokio::test]
 async fn a_pool_ticked_on_the_conversation_routes_its_turns_whatever_the_global_shadow_stage() {
-    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    use super::provider::cognitive::{ConversationRoutingMode, LearningStage};
     use super::types::RoutingPoolEntry;
     let w = world("primary", "shadow").await;
     probe_wb(&w).await;
     let mut ticked = pilot();
-    ticked.routing_mode = Some(ProviderRoutingMode::Mixed);
+    ticked.routing_mode = Some(ConversationRoutingMode::Mixed);
     ticked.routing_pool = Some(
         ["wa", "wb"]
             .iter()
@@ -771,13 +914,13 @@ async fn without_a_conversation_choice_the_global_shadow_stage_still_governs() {
 /// puts the conversation in Auto over a `shadow` setting.
 #[tokio::test]
 async fn a_pinned_model_is_never_substituted_even_in_a_conversation_in_auto() {
-    use super::provider::cognitive::ProviderRoutingMode;
+    use super::provider::cognitive::ConversationRoutingMode;
     let w = world("primary", "shadow").await;
     probe_wb(&w).await;
     let mut pinned = pilot();
     pinned.provider = Some("worker".into());
     pinned.model = Some("wa".into());
-    pinned.routing_mode = Some(ProviderRoutingMode::Full);
+    pinned.routing_mode = Some(ConversationRoutingMode::Full);
     let p = open(&w, &pinned).await;
     let events = turn_events(&w, &p, DEBUG).await;
     assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wa"], "not wb");
@@ -797,10 +940,10 @@ async fn a_pinned_model_is_never_substituted_even_in_a_conversation_in_auto() {
 /// and every decision is `shadow`, none applied.
 #[tokio::test]
 async fn a_delegation_cannot_put_itself_in_auto() {
-    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    use super::provider::cognitive::{ConversationRoutingMode, LearningStage};
     let w = world("primary", "shadow").await;
     let mut delegated = executor();
-    delegated.routing_mode = Some(ProviderRoutingMode::Full);
+    delegated.routing_mode = Some(ConversationRoutingMode::Full);
     let e = open(&w, &delegated).await;
     turn(&w, &e, DEBUG).await;
     let opened = node(&w, &e).await;
@@ -821,11 +964,11 @@ async fn a_delegation_cannot_put_itself_in_auto() {
 /// debug turn still changes the model, decided at `stage: auto`.
 #[tokio::test]
 async fn a_resumed_conversation_in_auto_still_routes_at_the_auto_stage() {
-    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    use super::provider::cognitive::{ConversationRoutingMode, LearningStage};
     let w = world("primary", "shadow").await;
     probe_wb(&w).await;
     let mut auto = pilot();
-    auto.routing_mode = Some(ProviderRoutingMode::Full);
+    auto.routing_mode = Some(ConversationRoutingMode::Full);
     let p = open(&w, &auto).await;
     assert_eq!(node(&w, &p).await.routing_mode.as_deref(), Some("full"));
     w.manager.close_session(&p).await.unwrap();
@@ -861,10 +1004,10 @@ async fn a_resumed_conversation_in_auto_still_routes_at_the_auto_stage() {
 /// R-S3: a conversation in Auto (`routing_mode: full` over `primary` + `shadow`), opened on
 /// `worker/wa` with `wb` probed.
 async fn auto_conversation(w: &World) -> String {
-    use super::provider::cognitive::ProviderRoutingMode;
+    use super::provider::cognitive::ConversationRoutingMode;
     probe_wb(w).await;
     let mut auto = pilot();
-    auto.routing_mode = Some(ProviderRoutingMode::Full);
+    auto.routing_mode = Some(ConversationRoutingMode::Full);
     let p = open(w, &auto).await;
     assert_eq!(node(w, &p).await.model, "wa", "the plain opening: wa");
     p

@@ -417,7 +417,7 @@ mod tests {
             reason: "test".into(),
             alternatives: vec![],
             applied: false,
-            mode: ProviderRoutingMode::Mixed,
+            mode: ProviderRoutingMode::ExecutorsOnly,
             stage: LearningStage::Shadow,
             session_id: None,
             task_id: None,
@@ -650,7 +650,7 @@ mod tests {
         let d = closed(decision(TaskClass::Simple, "a", None), 0.7, Some(0.1));
         let json = serde_json::to_value(RoutingDecisionView::from(&d)).unwrap();
         assert_eq!(json["task_class"], "simple");
-        assert_eq!(json["mode"], "mixed");
+        assert_eq!(json["mode"], "executors_only");
         assert_eq!(json["stage"], "shadow");
         assert_eq!(json["provider_id"], "p");
         assert_eq!(json["model"], "a");

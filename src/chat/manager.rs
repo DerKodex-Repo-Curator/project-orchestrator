@@ -669,7 +669,7 @@ pub(crate) struct OpeningTurn<'a> {
     /// model was chosen by the router, not imposed, and its next turn does not move again.
     pub moved_in: bool,
     /// The mode the request asked for; it replaces the one of the settings for this conversation.
-    pub routing_mode: Option<super::provider::cognitive::ProviderRoutingMode>,
+    pub routing_mode: Option<super::provider::cognitive::ConversationRoutingMode>,
     /// The pairs the request restricted routing to (`mixed`).
     pub routing_pool: Option<Vec<super::types::RoutingPoolEntry>>,
     pub permission_mode: Option<&'a str>,
@@ -3160,7 +3160,7 @@ impl ChatManager {
         {
             Ok((mut settings, _)) => {
                 if let Some(mode) = turn.routing_mode {
-                    settings.mode = mode;
+                    settings.mode = mode.pilot_mode();
                 }
                 settings
             }
@@ -5887,7 +5887,15 @@ impl ChatManager {
         let provider_choice = self
             .resolve_provider_choice_for(request, project_slug.as_deref(), Some(session_id))
             .await?;
-        let model = match request.model.as_deref().filter(|m| !m.is_empty()) {
+        // A conversation routed among its pool opens on the model PO chose among it; the
+        // pilot the menu names is only the fallback when no decision applied (R-S4).
+        let decided_among_pool = request.routes_among_pool()
+            && provider_choice.routed_by == super::provider::resolver::RoutedBy::Auto;
+        let model = match request
+            .model
+            .as_deref()
+            .filter(|m| !m.is_empty() && !decided_among_pool)
+        {
             Some(explicit) => explicit.to_string(),
             None => match provider_choice.model.as_deref() {
                 Some(chosen) => chosen.to_string(),
@@ -9660,7 +9668,14 @@ impl ChatManager {
                 .routing_mode
                 .as_deref()
                 .filter(|_| by_router)
-                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()),
+                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok())
+                // The router moves only a conversation that is `full` in effect; a pool kept
+                // without a mode (the settings said `full`) says so, or the opening of the new
+                // session would decide its target again among the pool (review of #713, C1-bis).
+                .or_else(|| {
+                    (by_router && node.routing_pool.is_some())
+                        .then_some(super::provider::cognitive::ConversationRoutingMode::Full)
+                }),
             attachments: Vec::new(),
             refs: Vec::new(),
             message: message.to_string(),
@@ -9816,7 +9831,7 @@ impl ChatManager {
         session_id: &str,
         body: &super::types::SessionRoutingRequest,
     ) -> Result<ChatSessionNode> {
-        use super::provider::cognitive::ProviderRoutingMode as Mode;
+        use super::provider::cognitive::ConversationRoutingMode as Mode;
         use super::types::SessionRoutingError as Refused;
         let uuid =
             Uuid::parse_str(session_id).map_err(|_| anyhow::Error::new(Refused::NotFound))?;
@@ -12642,7 +12657,11 @@ impl ChatManager {
         // The cognitive router (R2): a decision is always taken and stored; it
         // fills the project-rule level only when the mode and the stage say so.
         // Never fatal: any failure leaves the declarative resolution untouched.
-        let cognitive = match (&self.cognitive_routing, routing_instances) {
+        let routing_store = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.store.clone());
+        let mut cognitive = match (&self.cognitive_routing, routing_instances) {
             (Some(routing), Some(instances)) => {
                 match self
                     .cognitive_decision(
@@ -12666,15 +12685,42 @@ impl ChatManager {
             }
             _ => None,
         };
-        let auto_pick = cognitive
+        let mut auto_pick = cognitive
             .as_ref()
             .filter(|d| d.applied)
             .and_then(|d| d.chosen.clone());
+        // A pool of two models or more (R-S4): what opens the conversation when the decision
+        // among the pool does not — the menu's pilot (its provider AND its model), else the
+        // first ticked model, never a default the user did not tick.
+        let pool_fallback = request.routes_among_pool().then(|| {
+            match (
+                input.request.as_ref().map(|c| c.provider_id.clone()),
+                request.model.as_deref().filter(|m| !m.is_empty()),
+            ) {
+                (Some(provider), Some(model)) => {
+                    Some(resolver::Candidate::new(provider, Some(model.to_owned())))
+                }
+                (Some(_), None) => input.request.clone(),
+                (None, _) => Self::routing_pool_of(request)
+                    .and_then(<[_]>::first)
+                    .map(|first| {
+                        resolver::Candidate::new(first.provider.clone(), Some(first.model.clone()))
+                    }),
+            }
+        });
+        let declared_project_rule = input.project_rule.clone();
         if let Some(pick) = &auto_pick {
             input.project_rule = Some(resolver::Candidate::new(
                 pick.provider_id.clone(),
                 Some(pick.model.clone()),
             ));
+            // One applied among the pool: the decision opens the conversation, the pilot
+            // only stands behind it (`pool_fallback`).
+            if pool_fallback.is_some() {
+                input.request = None;
+            }
+        } else if let Some(fallback) = &pool_fallback {
+            input.request = fallback.clone();
         }
         // Models ticked, none named and no applied pick among them: the first ticked model
         // opens the conversation, never a default the user did not tick.
@@ -12691,7 +12737,33 @@ impl ChatManager {
         if let Some(p) = pick.as_ref().filter(|p| p.enforced) {
             input.global_rule = Some(p.candidate.clone());
         }
-        let mut choice = resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?;
+        let mut choice = match resolver::resolve(&input, &store_catalog) {
+            Ok(choice) => choice,
+            // The pick among the pool was applied but the resolver refuses it (its view of
+            // the instance — health, consent — differs from the decider's): a pilot never
+            // falls back inside the resolver, so the pool's own fallback opens the
+            // conversation instead of the opening failing (review of #713, C2). The decision
+            // is stored back as not applied, with why.
+            Err(refused) if auto_pick.is_some() && pool_fallback.is_some() => {
+                // Rewritten BEFORE the fallback is resolved: the pick was not applied, whether
+                // the fallback then opens the conversation or is refused too (nothing opens).
+                if let Some(decision) = cognitive.as_mut() {
+                    decision.applied = false;
+                    decision.reason =
+                        format!("{}; not_opened: {}", decision.reason, refused.code());
+                    if let Some(store) = routing_store.as_ref() {
+                        if let Err(error) = store.put_decision(decision).await {
+                            warn!(decision_id = %decision.id, %error, "the refused opening was not recorded on its decision");
+                        }
+                    }
+                }
+                input.project_rule = declared_project_rule;
+                input.request = pool_fallback.flatten();
+                auto_pick = None;
+                resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?
+            }
+            Err(refused) => return Err(anyhow::Error::new(refused)),
+        };
         choice.decision_id = cognitive.as_ref().map(|d| d.id);
         if let Some(p) = &pick {
             if p.enforced && choice.routed_by == resolver::RoutedBy::GlobalRule {
@@ -13259,9 +13331,14 @@ impl ChatManager {
             ),
         };
         routing.set_hints(PriorHints::from_aliases(aliases));
-        // A provider, model, alias or run the caller named is never substituted.
-        let named = request.provider.is_some()
-            || request.model.as_deref().is_some_and(|m| !m.is_empty())
+        // A provider, model, alias or run the caller named is never substituted. The
+        // provider and model the menu names WITH a pool of two models or more are its pilot,
+        // not a choice: the opening is decided among the pool (decision R-S4), the pilot is
+        // only the fallback when that decision does not apply.
+        let pilot_only = request.routes_among_pool();
+        let pilot_named =
+            request.provider.is_some() || request.model.as_deref().is_some_and(|m| !m.is_empty());
+        let named = (!pilot_only && pilot_named)
             || request.task_alias.is_some()
             || request.persona_alias.is_some()
             || request.run_provider.is_some();
@@ -13277,7 +13354,7 @@ impl ChatManager {
             ),
         );
         if let Some(mode) = request.routing_mode {
-            settings.mode = mode;
+            settings.mode = mode.pilot_mode();
         }
         let ticked = Self::routing_pool_of(request);
         // The models ticked in the menu are routed like `full` inside them, whatever the

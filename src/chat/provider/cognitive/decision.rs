@@ -188,7 +188,7 @@ impl DecideRequest {
 ///
 /// Contract: the decision is persisted before it is returned, whether it is
 /// applied or not. `applied` follows the mode and the stage: a `shadow` stage
-/// never applies, `primary` applies nothing, `mixed` applies to executors and
+/// never applies, `primary` applies nothing, `executors_only` applies to executors and
 /// utilities only, `full` applies to everyone. An explicit slot is returned
 /// unapplied with `chosen: None`.
 #[async_trait]

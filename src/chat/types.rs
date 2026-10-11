@@ -327,13 +327,31 @@ impl ChatRequest {
                 request.provider = Some(only.provider.clone());
                 request.model = Some(only.model.clone());
                 request.routing_mode =
-                    Some(crate::chat::provider::cognitive::ProviderRoutingMode::Primary);
+                    Some(crate::chat::provider::cognitive::ConversationRoutingMode::Primary);
                 request.routing_pool = None;
             }
             _ if settled == *pool => return None,
             _ => request.routing_pool = Some(settled),
         }
         Some(request)
+    }
+
+    /// The conversation is routed among the models ticked in the menu (two or more): its
+    /// OPENING model is a decision among them too (decision R-S4), and the `provider` /
+    /// `model` the menu names with them (its "pilot") are only the fallback when no
+    /// decision applies — never an explicit choice that the decision would have to obey.
+    ///
+    /// Only for the menu's `mixed` (or a pool without a mode): a pool sent with
+    /// `routing_mode: full` keeps its named provider/model explicit. That is also what a
+    /// conversation the ROUTER moved carries — its relayed request names the target the
+    /// router decided, with the pool and `full` read from the session — and that target is
+    /// never decided again at the opening of the new session (review of #713, C1).
+    pub fn routes_among_pool(&self) -> bool {
+        self.routing_mode != Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full)
+            && self
+                .routing_pool
+                .as_ref()
+                .is_some_and(|pool| pool.len() > 1)
     }
 }
 
@@ -377,14 +395,17 @@ pub struct ChatRequest {
     #[serde(default)]
     pub provider: Option<String>,
     /// Routing mode for THIS conversation (`primary` / `mixed` / `full`), replacing the
-    /// one of the settings. Absent: the settings in force decide. Only read when a
-    /// conversation opens.
+    /// one of the settings. `mixed` is the conversation's word (PO routes among
+    /// `routing_pool`), never the settings' `executors_only` (decision R-S4). Absent: the
+    /// settings in force decide. Only read when a conversation opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing_mode: Option<crate::chat::provider::cognitive::ProviderRoutingMode>,
+    pub routing_mode: Option<crate::chat::provider::cognitive::ConversationRoutingMode>,
     /// The (provider, model) pairs PO may route THIS conversation among (the models
     /// ticked in the menu), sent with `routing_mode: mixed`. The candidates of the open-time
     /// decision AND of every per-turn decision are restricted to it; a named pilot is not a
-    /// pin then. One entry = strict (that model, never substituted); absent or empty = every
+    /// pin then, nor the opening model: the opening is decided among the pool, and the pilot
+    /// (`provider` / `model`) only opens the conversation when no decision applies (R-S4).
+    /// One entry = strict (that model, never substituted); absent or empty = every
     /// eligible model. Per turn only the entries of the session's own provider count: a
     /// conversation runs on ONE provider, moving it is `switch-provider`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

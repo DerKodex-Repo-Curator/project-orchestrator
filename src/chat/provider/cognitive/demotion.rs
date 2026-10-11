@@ -260,7 +260,7 @@ mod tests {
             reason: "t".into(),
             alternatives: vec![],
             applied,
-            mode: ProviderRoutingMode::Mixed,
+            mode: ProviderRoutingMode::ExecutorsOnly,
             stage: if applied {
                 LearningStage::Auto
             } else {
@@ -428,7 +428,7 @@ mod tests {
         // The project now has its own shadow override; the mode is inherited.
         let (effective, _) = load_routing(&graph, Some("proj")).await.unwrap();
         assert_eq!(effective.stage, LearningStage::Shadow);
-        assert_eq!(effective.mode, ProviderRoutingMode::Mixed);
+        assert_eq!(effective.mode, ProviderRoutingMode::ExecutorsOnly);
         assert_eq!(effective.demote_after, 7);
         // The global document is untouched.
         let global = stored_routing(&graph, GLOBAL).await.unwrap().unwrap();
