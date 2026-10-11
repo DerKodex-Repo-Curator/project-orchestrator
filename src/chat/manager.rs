@@ -3910,6 +3910,14 @@ impl ChatManager {
         self
     }
 
+    /// A fixed answer to "is the Claude Code CLI on this server?": tests that must not
+    /// depend on the machine they run on (CI has no `claude`).
+    #[cfg(test)]
+    pub(crate) fn with_claude_cli_present(mut self, present: bool) -> Self {
+        self.claude_cli = super::cli_version::ClaudeCliProbe::Fixed(present);
+        self
+    }
+
     /// Whether the built-in Claude Code instance can open a session here: its CLI is on
     /// the server (the configured path, else the usual places). Cached for a minute.
     pub async fn claude_code_usable(&self) -> bool {

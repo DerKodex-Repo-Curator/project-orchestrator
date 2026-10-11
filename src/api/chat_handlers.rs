@@ -2170,7 +2170,24 @@ mod tests {
 
     /// Build an OrchestratorState with mock backends (no ChatManager)
     async fn mock_server_state() -> OrchestratorState {
+        mock_server_state_with(None).await
+    }
+
+    /// [`mock_server_state`] with a chat manager whose answer to "is the Claude Code CLI on
+    /// this server?" is fixed (`Some(present)`): the listing's default does not depend on
+    /// the machine the tests run on.
+    async fn mock_server_state_with(claude_cli: Option<bool>) -> OrchestratorState {
         let app_state = mock_app_state();
+        let chat_manager = claude_cli.map(|present| {
+            Arc::new(
+                crate::chat::ChatManager::new_without_memory(
+                    app_state.neo4j.clone(),
+                    app_state.meili.clone(),
+                    crate::chat::ChatConfig::default(),
+                )
+                .with_claude_cli_present(present),
+            )
+        });
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2178,7 +2195,7 @@ mod tests {
         Arc::new(ServerState {
             orchestrator,
             watcher,
-            chat_manager: None,
+            chat_manager,
             event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
                 crate::events::EventBus::default(),
             ))),
@@ -2314,7 +2331,8 @@ mod tests {
 
     #[tokio::test]
     async fn providers_lists_the_builtin_instance_with_the_documented_fields() {
-        let app = test_app().await;
+        // The CLI is declared present: the default does not depend on the machine.
+        let app = create_router(mock_server_state_with(Some(true)).await);
         let resp = app
             .oneshot(auth_get("/api/chat/providers?project_slug=p"))
             .await
@@ -2333,6 +2351,48 @@ mod tests {
         assert_eq!(p["credential"], "none");
         assert!(p["health"]["state"].is_string());
         assert!(p["models"][0]["capabilities"].is_object());
+    }
+
+    #[tokio::test]
+    async fn without_the_claude_cli_the_listing_has_no_default_until_an_instance_is_allowed() {
+        // B2 on the listing: CLI absent → claude-code is listed (unhealthy) but is not the
+        // default; nothing else usable → null; the only allowed instance → that instance.
+        let app = create_router(mock_server_state_with(Some(false)).await);
+        let (status, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["default_provider"].is_null(), "{json}");
+        assert_eq!(json["providers"][0]["id"], "claude-code");
+        assert_eq!(json["providers"][0]["is_default"], false);
+
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        let (_, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        assert!(
+            json["default_provider"].is_null(),
+            "not allowed yet: {json}"
+        );
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consents/deepseek",
+                serde_json::json!({"origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        assert_eq!(json["default_provider"], "deepseek", "{json}");
+        // Another project has not allowed it: still no default there.
+        let (_, json) = call_json(&app, auth_get("/api/chat/providers?project_slug=q")).await;
+        assert!(json["default_provider"].is_null(), "{json}");
     }
 
     /// The listing no longer forces `images` for Claude Code: nexus declares it,
