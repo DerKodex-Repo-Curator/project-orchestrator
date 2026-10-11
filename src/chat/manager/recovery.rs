@@ -134,14 +134,37 @@ fn count_resumes(tail: &[ChatEventRecord]) -> usize {
     resumes + usize::from(open_marker)
 }
 
-/// Whether the `spawned_by` JSON string identifies a session managed by an orchestrator
-/// (plan runner, pipeline engine, gate-retry, or delegation). Those sessions are relaunched
-/// by their orchestrator at boot; recovery leaving them alone avoids a double-resume.
+/// Whether the `spawned_by` JSON string identifies a session whose work is relaunched by
+/// whoever owns it: a plan runner, the pipeline engine, a gate-retry, a delegation — or the
+/// `Agent` tool call of a parent chat session. Those sessions are relaunched by their owner
+/// at boot; recovery leaving them alone avoids a double-resume.
 ///
-/// `SpawnedBy::Conversation` and `SpawnedBy::Trigger` are NOT orchestrator-managed:
-/// conversation sub-sessions have no orchestrator, and external triggers do not
-/// automatically re-fire after a restart.
+/// A `SpawnedBy::Conversation` child carrying a `tool_use_id` is a sub-agent hosted by the
+/// `Agent` tool (P18, `chat::subagents`): its parent's own resume re-issues that call, so
+/// resuming the child too would run the same work twice (two agents editing the same files),
+/// its answer would reach nobody, and it would hold one of the parent's
+/// [`MAX_LIVE_CHILDREN`](crate::chat::envelope::MAX_LIVE_CHILDREN) slots for nothing (P18b,
+/// fix 3). A `Conversation` child WITHOUT a `tool_use_id` was opened by
+/// `chat(send_message)`: nothing re-issues it, so it is resumed like any other session.
+/// `SpawnedBy::Trigger` is not owned either: external triggers do not re-fire after a
+/// restart.
 fn is_orchestrator_child(spawned_by: &str) -> bool {
+    is_agent_tool_child(spawned_by) || is_owned_by_a_run(spawned_by)
+}
+
+/// A sub-agent of the `Agent` tool: a `SpawnedBy::Conversation` carrying a `tool_use_id`.
+fn is_agent_tool_child(spawned_by: &str) -> bool {
+    matches!(
+        crate::chat::types::SpawnedBy::from_json_str(spawned_by),
+        Some(crate::chat::types::SpawnedBy::Conversation {
+            tool_use_id: Some(_),
+            ..
+        })
+    )
+}
+
+/// A session a run drives: runner, pipeline, gate retry, delegation.
+fn is_owned_by_a_run(spawned_by: &str) -> bool {
     use crate::chat::types::SpawnedBy;
     matches!(
         SpawnedBy::from_json_str(spawned_by),
@@ -361,7 +384,7 @@ pub(crate) struct PendingResume {
 pub(crate) const MAX_TRANSIENT_RETRIES: u32 = 3;
 
 /// Why a cut turn of a session recovery does not resume was closed.
-const CLOSED_LEFT_TO_OWNER: &str = "The server restarted while this turn was running. This session is driven by its orchestrator (plan run, pipeline, delegation), which relaunches the task itself: it is not resumed here.";
+const CLOSED_LEFT_TO_OWNER: &str = "The server restarted while this turn was running. This session is driven by its owner (plan run, pipeline, delegation, or the `Agent` call of a parent session), which relaunches the work itself: it is not resumed here.";
 const CLOSED_LEGACY: &str = "The server restarted while this turn was running, and this session is not resumed automatically: send your message again to continue.";
 const CLOSED_CLAUDE_CODE: &str = "The server restarted while this Claude Code turn was running. It is not resumed without you (it could run tools unattended): send your message again to continue.";
 const CLOSED_STALE: &str = "The server restarted while this turn was running, too long ago to resume it automatically: send your message again to continue.";
@@ -445,9 +468,9 @@ impl ChatManager {
             // Claude Code CLI); a Claude Code session of the agent engine, unless this server
             // was told otherwise (M2: unattended, its CLI could run tools in `acceptEdits` or
             // `bypassPermissions` with nobody there; kept closed until decided explicitly);
-            // an orchestrator-managed one (runner, pipeline,
-            // gate-retry, delegation) is relaunched by its orchestrator. Conversation
-            // sub-sessions and trigger-spawned sessions have no orchestrator: resumed.
+            // an owner-managed one (runner, pipeline, gate-retry, delegation, or a sub-agent
+            // of an `Agent` call) is relaunched by its owner. A `chat(send_message)`
+            // sub-session and a trigger-spawned session have no owner: resumed.
             let left_alone = if !node.opened_on_agent() {
                 Some(CLOSED_LEGACY)
             } else if node.served_by_claude_code() && !self.recovery_resumes_claude_code {
@@ -492,14 +515,14 @@ impl ChatManager {
             match judge(&tail) {
                 Verdict::Settled => {}
                 Verdict::Close(reason) => {
-                    self.close_cut_turn(node.id, reason).await;
+                    self.close_cut_session(&node, reason).await;
                     report.closed += 1;
                 }
                 Verdict::Resume { dangling_tool } => {
                     let closed_because =
                         left_alone.or((last_event_at < since).then_some(CLOSED_STALE));
                     if let Some(reason) = closed_because {
-                        self.close_cut_turn(node.id, reason).await;
+                        self.close_cut_session(&node, reason).await;
                         report.closed += 1;
                         continue;
                     }
@@ -514,6 +537,19 @@ impl ChatManager {
             }
         }
         Ok((pending, report))
+    }
+
+    /// [`Self::close_cut_turn`] for the session `node`. A sub-agent of an `Agent` call first
+    /// refuses the permission requests its thread leaves undecided, through the helper the
+    /// live path runs before closing a child (`deny_waiting_permissions`): nobody will ever
+    /// answer them (its parent re-issues the call in a new child), and since round 3 the
+    /// child has an owner, in whose attention they would stay pending for 30 days (lot
+    /// review of #721, finding 4).
+    async fn close_cut_session(&self, node: &ChatSessionNode, reason: &str) {
+        if node.spawned_by.as_deref().is_some_and(is_agent_tool_child) {
+            self.deny_waiting_permissions(&node.id.to_string()).await;
+        }
+        self.close_cut_turn(node.id, reason).await;
     }
 
     /// Ends a cut turn on the thread, so it shows and is not judged again. The event goes
@@ -1015,6 +1051,33 @@ mod tests {
         )));
         assert!(!is_orchestrator_child("not json"));
         assert!(!is_orchestrator_child("{}"));
+    }
+
+    /// P18b, fix 3: a `conversation` child carrying a `tool_use_id` is a sub-agent of the
+    /// `Agent` tool. Its parent re-issues the call when it is resumed, so the child must be
+    /// left to its owner (closed), never resumed on its own — otherwise a SECOND child runs
+    /// the same work and the old one holds one of the parent's four slots.
+    #[test]
+    fn an_agent_tool_child_is_left_to_its_parent_a_send_message_child_is_not() {
+        let parent = Uuid::nil().to_string();
+        assert!(is_orchestrator_child(&format!(
+            r#"{{"type":"conversation","parent_session_id":"{parent}","tool_use_id":"toolu_1"}}"#
+        )));
+        // Written by `SpawnedBy` itself, so the test follows the serialisation.
+        assert!(is_orchestrator_child(
+            &crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::nil(),
+                tool_use_id: Some("toolu_1".into()),
+            }
+            .to_json_string()
+        ));
+        assert!(!is_orchestrator_child(
+            &crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::nil(),
+                tool_use_id: None,
+            }
+            .to_json_string()
+        ));
     }
 
     #[test]

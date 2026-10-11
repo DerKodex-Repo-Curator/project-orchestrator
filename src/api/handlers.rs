@@ -7014,6 +7014,30 @@ mod tests {
         assert_eq!(req.project_slug.as_deref(), Some("demo"));
     }
 
+    /// P18b round 3, fix D: a delegation by a chat session inherits that session's
+    /// workspace (`ParentEnvelope::apply`), so its child goes through the same clamp of
+    /// `add_dirs` as an `Agent` child. A delegation by a person has no envelope and names no
+    /// workspace (unchanged).
+    #[test]
+    fn a_session_delegation_inherits_the_parents_workspace() {
+        let mut env = parent_envelope("default");
+        env.workspace_slug = Some("ws".to_string());
+        let req = delegation_chat_request(
+            "/work/repo".into(),
+            None,
+            Uuid::new_v4(),
+            "t",
+            Some(&env),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(req.workspace_slug.as_deref(), Some("ws"));
+        let by_a_person =
+            delegation_chat_request("/a".into(), None, Uuid::new_v4(), "t", None, "default")
+                .unwrap();
+        assert_eq!(by_a_person.workspace_slug, None);
+    }
+
     #[test]
     fn a_bypass_parent_still_delegates_in_bypass() {
         let env = parent_envelope("bypassPermissions");

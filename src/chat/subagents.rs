@@ -13,12 +13,38 @@
 //!   permission mode never wider than the parent's, the parent's project and directories;
 //! * `spawned_by = conversation { parent_session_id, tool_use_id }`: the child is in the
 //!   parent's session tree, and its token is restricted (H6: its parent is a third party);
-//! * the parent's provider and model, the parent's claims;
+//! * the parent's provider and model, the parent's claims — and, when the parent has none
+//!   (reopened by the restart recovery, which keeps no claims), the parent's stored OWNER:
+//!   the child belongs to the same person (P18b round 3, fix A). No claims mints no token,
+//!   so the child's MCP access stays as restricted as before;
+//! * the parent's workspace (inherited by the envelope), with its directories clamped to
+//!   what the parent could already see (P18b round 2, fix 1);
 //! * the prompt as an inert message (no reference block may ride on a model's text).
 //!
 //! The call waits for the child's first `result` and answers its text; the child is then
 //! closed (it stays resumable and visible). A dropped call (the parent's turn interrupted or
-//! the call cancelled) closes the child too.
+//! the call cancelled) closes the child too — at ANY point of the call, the opening
+//! included: [`ChatManager::run_subagent`] opens, awaits and closes the child in a task of
+//! its own and only AWAITS that task, so a drop cannot cut the opening halfway. That matters
+//! because `create_session` runs as long as the provider's open timeout and has already sent
+//! the child's first message when it returns: a future dropped inside it used to leave a
+//! child running that nobody knew the id of. The caller's drop closes a one-shot channel the
+//! task watches; the task then closes the child as soon as the opening gives its id.
+//!
+//! The child's answer is read from its live event stream, and from its stored thread
+//! whenever the stream cannot be trusted: before the first wait (a turn that ended before
+//! the subscription), once the stream is closed, and — from the first `Lagged` on — every
+//! second until the thread shows the `result` or the close, the live stream still watched
+//! alongside (P18b round 3, fix C: the `result` may have been among the dropped events and
+//! reach the thread arbitrarily later; a fixed number of re-reads left the parent waiting
+//! until its turn timeout). The tick spaces the re-reads: a child that lags again and again
+//! costs one tail read per second. What is kept from the stream is bounded
+//! ([`keep_for_answer`]): a chatty child cannot grow it.
+//!
+//! The close of the child is backed by a guard armed from the moment the child exists
+//! until its explicit `close_session` has RETURNED (round 3, fix E: a panic in the close
+//! itself is covered; a second close is a harmless "not found or inactive"); the guard
+//! owns the parent's slot, so a panic gives it back only after the detached close.
 //!
 //! Depth is held three times: the backend gives [`SubagentHooks`] only to a native session
 //! whose record has no `spawned_by` (`ChatManager::build_agent_spec_with_access`); a spawned
@@ -27,19 +53,35 @@
 //! `spawned_by` when it moves to another provider (relay).
 //!
 //! The cap of live children holds under parallel calls (the harness runs the calls of one step
-//! concurrently): a slot of the parent is taken BEFORE the envelope counts its children and is
-//! held until the sub-agent ends ([`MAX_LIVE_CHILDREN`](super::envelope::MAX_LIVE_CHILDREN)
-//! slots per parent). The ceiling is the parent's CURRENT mode: a native session's mode changes
-//! are kept live and persisted (`set_session_permission_mode`).
+//! concurrently): a slot of the parent is taken BEFORE the envelope counts its children, in
+//! [`ChatManager::run_subagent`], and held by [`ChatManager::open_wait_close`]'s OWN task —
+//! not by `run_subagent`'s frame — until the sub-agent actually ends, right alongside its
+//! `close_session` ([`MAX_LIVE_CHILDREN`](super::envelope::MAX_LIVE_CHILDREN) slots per
+//! parent; P18b round 2, fix 2: a dropped `run_subagent` future used to free the slot as soon
+//! as it was dropped, which could be well before the task it spawned had even learned the
+//! child's id, let alone closed it). The ceiling is the parent's CURRENT mode: a native
+//! session's mode changes are kept live and persisted (`set_session_permission_mode`).
 //!
 //! What a child may not do: ask the user (`AskUserQuestion` is denied to a spawned native
-//! session; a question seen anyway fails the call); return more than [`MAX_ANSWER_CHARS`]
-//! characters (the rest is cut, and said). The call waits as long as the child works, bounded
-//! by the parent's turn timeout; a child in a mode that asks for permissions shows its request
-//! in its own session, where nobody may be watching: it then waits until that timeout. Budget
-//! and cost of the children are not counted in the parent's (task B36).
+//! session; a question seen anyway fails the call at once); wait for a permission (round 3,
+//! fix B, made deterministic by the review of #724: a request the backend does not answer
+//! itself — no grant of the child, no lasting rule of its owner covers it, which the child's
+//! session decides BEFORE it shows the request — fails the call at once; the child's waiting
+//! requests are then answered `deny` through the path a user's answer takes, so none is
+//! left in its owner's cockpit, and the child is closed like on every other end — the request
+//! would otherwise hold the parent until its 30-minute turn timeout. A person who opens the
+//! child (its run is listed, its state live) sees the request but cannot answer it: that is
+//! the choice made, not an oversight); return more than [`MAX_ANSWER_CHARS`] characters (the rest is
+//! cut, and said). Failing fast was chosen over opening the child with a
+//! deny-instead-of-ask policy: the harness has no such mode (`PolicyMode` is plan / ask /
+//! auto-edits / trust), and a fail needs no new policy plumbing and no new prompt — the
+//! parent's model reads why and does the step itself. A covered request never fails the
+//! call, however long its automatic answer takes (unless that answer fails).
+//! The call otherwise waits as long as the child works, bounded by the parent's turn
+//! timeout. Budget and cost of the children are not counted in the parent's (task B36).
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nexus_claude::agent::{
@@ -120,27 +162,6 @@ impl SessionHooks for SubagentHooks {
     }
 }
 
-/// Closes the child session if the call ends before the child did (the future dropped).
-struct CloseOnDrop {
-    manager: Weak<ChatManager>,
-    child: Option<String>,
-}
-
-impl Drop for CloseOnDrop {
-    fn drop(&mut self) {
-        let (Some(child), Some(manager)) = (self.child.take(), self.manager.upgrade()) else {
-            return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(e) = manager.close_session(&child).await {
-                    tracing::debug!(child = %child, error = %e, "sub-agent close after a cut call");
-                }
-            });
-        }
-    }
-}
-
 /// One running sub-agent of a parent (module documentation): taken before the envelope
 /// counts the parent's live children, given back when the sub-agent ends or its call is dropped.
 pub(crate) struct SubagentSlot {
@@ -187,6 +208,44 @@ impl Drop for SubagentSlot {
     }
 }
 
+/// A backstop for exactly one window: between a resource existing and the END of the
+/// explicit code that releases it. [`Self::new`] arms it with what to run if it is ever
+/// dropped armed; [`Self::disarm`] is called right AFTER that explicit release returned, so
+/// a panic inside the release itself is still covered (the release must then be safe to
+/// run twice). Used by [`ChatManager::open_wait_close`] (P18b round 2, fix 3; round 3,
+/// fix E) for the window between `create_session` succeeding and the child's explicit
+/// `close_session` having returned: a panic there (none today) would otherwise leave the
+/// child open with nothing left to close it until the next restart's recovery scan.
+struct ClosePanicGuard {
+    armed: bool,
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ClosePanicGuard {
+    fn new(on_drop: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            armed: true,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    /// The ordinary path took over: this guard's backstop must not run any more.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClosePanicGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
+    }
+}
+
 /// Longest answer of a sub-agent given back to its parent, in characters: a sub-agent that
 /// copies a whole file must not fill the parent's context.
 pub(crate) const MAX_ANSWER_CHARS: usize = 64 * 1024;
@@ -204,13 +263,49 @@ fn bounded(text: String) -> String {
     )
 }
 
+/// A question the child asked: the call fails on it.
+fn is_question(event: &ChatEvent) -> bool {
+    matches!(event, ChatEvent::AskUserQuestion { .. })
+}
+
+/// Something the child said in its own voice (not inside one of its own tool calls).
+fn is_said(event: &ChatEvent) -> bool {
+    matches!(
+        event,
+        ChatEvent::AssistantText {
+            parent_tool_use_id: None,
+            ..
+        }
+    )
+}
+
+/// The end of the child's turn.
+fn is_result(event: &ChatEvent) -> bool {
+    matches!(event, ChatEvent::Result { .. })
+}
+
+/// Adds `event` to what [`answer_of`] will be given, keeping only what it actually reads:
+/// the first question, the LAST thing said, and the first `result` — at most three events,
+/// whatever the child emits. Without this bound a chatty child (thousands of deltas and
+/// tool results) grew the parent's vector for the whole call.
+fn keep_for_answer(seen: &mut Vec<ChatEvent>, event: ChatEvent) {
+    if is_said(&event) {
+        // `answer_of` falls back to the LAST thing said: replace it in place.
+        match seen.iter_mut().find(|e| is_said(e)) {
+            Some(held) => *held = event,
+            None => seen.push(event),
+        }
+    } else if (is_question(&event) && !seen.iter().any(is_question))
+        || (is_result(&event) && !seen.iter().any(is_result))
+    {
+        seen.push(event);
+    }
+}
+
 /// The answer of a sub-agent from its `result`: the result text, else what it said. A
 /// sub-agent that asked the user a question fails the call: nobody sees a child's question.
 fn answer_of(events: &[ChatEvent]) -> Option<Result<String, String>> {
-    if events
-        .iter()
-        .any(|e| matches!(e, ChatEvent::AskUserQuestion { .. }))
-    {
+    if events.iter().any(is_question) {
         return Some(Err(
             "the sub-agent asked the user a question; a sub-agent cannot ask: give it what it needs in the prompt".to_owned(),
         ));
@@ -282,8 +377,12 @@ impl ChatManager {
             .await
             .map_err(|e| refused(e.to_string()))?
             .ok_or_else(|| refused("the parent session is unknown".to_owned()))?;
-        // Held for the whole call: parallel calls cannot all pass the count below (A17).
-        let _slot = SubagentSlot::take(&self, parent_session_id).ok_or_else(|| {
+        // Taken before the envelope counts the parent's children (A17); moved into
+        // `open_wait_close`'s own task below and held there for the child's whole real
+        // lifetime, NOT in this frame — a drop of this future (the parent's turn
+        // interrupted) must not free the slot before the spawned task has actually
+        // closed the child (P18b round 2, fix 2).
+        let slot = SubagentSlot::take(&self, parent_session_id).ok_or_else(|| {
             refused(format!(
                 "envelope_too_many_children (at most {} sub-agents of one session run at once)",
                 envelope::MAX_LIVE_CHILDREN
@@ -315,64 +414,479 @@ impl ChatManager {
             }
             .to_json_string(),
         );
+        // The opening must not be droppable (module documentation): it is done in a task of
+        // its own, and this future only awaits that task. `alive` is dropped with this
+        // future — whether it ends normally (the task is over by then) or is cut — and that
+        // is how the task learns nobody awaits the child any more.
+        let (alive, cancelled) = tokio::sync::oneshot::channel::<std::convert::Infallible>();
+        let opening = {
+            let manager = Arc::clone(&self);
+            let parent = parent_session_id.to_string();
+            let tool_use_id = request.tool_call_id.clone();
+            tokio::spawn(async move {
+                manager
+                    .open_wait_close(child, cancelled, &parent, &tool_use_id, slot)
+                    .await
+            })
+        };
+        let _alive = alive;
+        opening
+            .await
+            .unwrap_or_else(|e| Err(refused(format!("the sub-agent's opening ended: {e}"))))
+    }
+
+    /// Opens the child of one sub-agent call, waits for its answer and closes it. Runs in a
+    /// task of its own ([`Self::run_subagent`]) so no drop can cut the opening halfway;
+    /// `cancelled` resolves when nobody awaits the call any more, and the child is then
+    /// closed as soon as the opening has given its id. `slot` is the parent's reservation
+    /// (module documentation): held by this task, then by its close guard, so it is given
+    /// back only once the child this task owns is actually closed — on the ordinary path,
+    /// on a dropped caller (P18b round 2, fix 2) and on a panic (round 3, fix E).
+    async fn open_wait_close(
+        self: Arc<Self>,
+        child: ChatRequest,
+        cancelled: tokio::sync::oneshot::Receiver<std::convert::Infallible>,
+        parent_session_id: &str,
+        tool_use_id: &str,
+        slot: SubagentSlot,
+    ) -> Result<String, String> {
         let opened = self
             .create_session(&child)
             .await
-            .map_err(|e| refused(format!("{e:#}")))?;
+            .map_err(|e| format!("the sub-agent could not start: {e:#}"))?;
         let child_id = opened.session_id;
-        let mut guard = CloseOnDrop {
-            manager: Arc::downgrade(&self),
-            child: Some(child_id.clone()),
+        tracing::info!(parent = %parent_session_id, child = %child_id, tool_use_id = %tool_use_id, "sub-agent started");
+        // The child exists from here: whatever ends this task, it is closed first (it stays
+        // resumable and visible). Nothing between here and the end of the explicit close
+        // below panics today, but nothing rules one out after this module grows — `guard`
+        // is the backstop for exactly that window, the close call itself INCLUDED: it is
+        // disarmed only once `close_session` has returned (P18b round 3, fix E; a second
+        // close of the same child is a harmless "not found or inactive"). The guard owns the
+        // slot: a panic gives it back only after the detached close, never before.
+        let manager = Arc::clone(&self);
+        let backstop_id = child_id.clone();
+        let mut guard = ClosePanicGuard::new(move || {
+            tokio::spawn(async move {
+                if let Err(e) = manager.close_session(&backstop_id).await {
+                    tracing::debug!(child = %backstop_id, error = %e, "sub-agent close");
+                }
+                drop(slot);
+            });
+        });
+        let answer = tokio::select! {
+            biased;
+            _ = cancelled => Err("the sub-agent's call was cancelled".to_owned()),
+            answer = self.wait_for_answer(&child_id) => answer,
         };
-        tracing::info!(parent = %parent_session_id, child = %child_id, tool_use_id = %request.tool_call_id, "sub-agent started");
-        let answer = self.wait_for_answer(&child_id).await;
-        // The child ended: close it (it stays resumable); the guard has nothing left to do.
-        guard.child = None;
+        #[cfg(test)]
+        panic_injection::panic_if_injected(parent_session_id);
+        self.deny_waiting_permissions(&child_id).await;
         if let Err(e) = self.close_session(&child_id).await {
             tracing::debug!(child = %child_id, error = %e, "sub-agent close");
         }
+        // The child is closed: the backstop is not needed any more, and dropping the guard
+        // gives the slot back — after the close, as on every other path.
+        guard.disarm();
+        drop(guard);
         answer
+    }
+
+    /// Answers `deny` to every permission request the child `sid` still waits on, through
+    /// the path a user's answer takes ([`ChatManager::route_permission_response`]): its
+    /// `permission_decision` lands on the child's thread, so a request nobody will ever
+    /// answer (the call failed on it, fix B) is no orphan in the cockpit of the child's
+    /// owner for 30 days once the child is closed (review of #724, point 1). The requests
+    /// are the live session's, and those its stored thread shows undecided.
+    ///
+    /// Every request named ends DECIDED on the thread (lot review of #721): when the child
+    /// is not live on this server (the restart recovery closing it), or when its provider
+    /// refuses the deny (a request it no longer knows), the refusal is written on the
+    /// thread by this server, with a warning naming why — the child is closed right after,
+    /// so nothing of it can run the call any more. It used to write nothing then, and the
+    /// request stayed pending in the owner's attention.
+    pub(crate) async fn deny_waiting_permissions(&self, sid: &str) {
+        let live = self.agent_runtime.get(sid).await;
+        let mut ids: Vec<String> = match &live {
+            Some(handle) => handle.waiting_permission_ids(),
+            None => Vec::new(),
+        };
+        let persisted = self.persisted_events(sid).await;
+        let mut decided = std::collections::HashSet::new();
+        for event in &persisted {
+            if let ChatEvent::PermissionDecision { id, .. } = event {
+                decided.insert(id.clone());
+            }
+        }
+        for event in &persisted {
+            if let ChatEvent::PermissionRequest { id, .. } = event {
+                if !decided.contains(id) && !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        let routable = live.is_some() || self.is_session_active(sid).await;
+        for id in ids {
+            if routable {
+                match self
+                    .route_permission_response(
+                        sid,
+                        &id,
+                        false,
+                        super::types::PermissionAnswerScope::Once,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(_) => continue,
+                    Err(e) => tracing::warn!(
+                        child = %sid, request = %id, error = %e,
+                        "the provider did not take the sub-agent's deny: the refusal is written on its thread, and it is closed"
+                    ),
+                }
+            } else {
+                tracing::info!(
+                    child = %sid, request = %id,
+                    "sub-agent not live here: its undecided permission request is refused on its thread"
+                );
+            }
+            self.deny_on_thread_if_undecided(sid, &id, live.as_deref())
+                .await;
+        }
+    }
+
+    /// The fallback refusal of [`Self::deny_waiting_permissions`]: writes
+    /// `permission_decision {allow: false}` for `id` on the thread of `sid` ONLY if the
+    /// request is still undecided right now (review nexus-41 of #727, finding 2, and the
+    /// second review's finding 2). Between the collection of the requests and this write,
+    /// an allow may have won the race — the automatic answer of a grant, or the user's
+    /// answer whose decision is stored only after its lasting rule is written — and that
+    /// is the very reason the provider refused the deny: a refusal written then would
+    /// leave two contradictory decisions on the thread for a call that ran. Undecided
+    /// means: the live session (when there is one) neither answers it itself nor had an
+    /// answer to it taken (`answers_itself`, marked the moment the provider takes it), and
+    /// the thread, read again, holds no decision for it. Returns whether it was written.
+    pub(super) async fn deny_on_thread_if_undecided(
+        &self,
+        sid: &str,
+        id: &str,
+        live: Option<&super::agent_runtime::AgentSessionHandle>,
+    ) -> bool {
+        if live.is_some_and(|handle| handle.answers_itself(id)) {
+            tracing::info!(
+                child = %sid, request = %id,
+                "the sub-agent's request was answered meanwhile: no refusal written"
+            );
+            return false;
+        }
+        let decided = self.persisted_events(sid).await.iter().any(|event| {
+            matches!(event, ChatEvent::PermissionDecision { id: decided, .. } if decided == id)
+        });
+        if decided {
+            tracing::info!(
+                child = %sid, request = %id,
+                "the sub-agent's request is decided on its thread already: no refusal written"
+            );
+            return false;
+        }
+        self.emit_on_session(
+            sid,
+            ChatEvent::PermissionDecision {
+                id: id.to_owned(),
+                allow: false,
+                scope: None,
+                rule: None,
+            },
+        )
+        .await;
+        true
     }
 
     /// The first `result` of the session `sid`, live or already persisted.
     async fn wait_for_answer(&self, sid: &str) -> Result<String, String> {
-        let mut rx = self
+        let rx = self
             .subscribe(sid)
             .await
             .map_err(|e| format!("the sub-agent cannot be followed: {e:#}"))?;
-        let mut seen: Vec<ChatEvent> = Vec::new();
+        let initial = self.agent_runtime.get(sid).await;
+        let answers_itself = live_answers_itself(Arc::clone(&self.agent_runtime), sid, initial);
+        self.answer_from(sid, rx, &answers_itself).await
+    }
+
+    /// [`Self::wait_for_answer`] on a subscription already taken — the seam the tests of a
+    /// lagged subscription and of a permission request drive. `answers_itself` says whether
+    /// the backend answers a request of the child itself (a grant or a lasting rule covers
+    /// it).
+    pub(super) async fn answer_from(
+        &self,
+        sid: &str,
+        mut rx: tokio::sync::broadcast::Receiver<ChatEvent>,
+        answers_itself: &(dyn Fn(&str) -> bool + Send + Sync),
+    ) -> Result<String, String> {
+        let mut watch = Watch::default();
         // A turn that ended before the subscription is in the store.
-        if let Ok(uuid) = Uuid::parse_str(sid) {
-            let persisted: Vec<ChatEvent> = self
-                .graph
-                .get_chat_events(uuid, 0, 5_000)
-                .await
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|r| serde_json::from_str(&r.data).ok())
-                .collect();
-            if let Some(answer) = answer_of(&persisted) {
-                return answer;
+        if let Some(end) = self.read_back(sid, &mut watch).await {
+            return end;
+        }
+        // Once a `Lagged` was seen, the stream alone cannot be trusted any more: the thread
+        // is re-read on every tick until it shows the end (P18b round 3, fix C) — no fixed
+        // number of attempts, since the child's events may land on its thread long after
+        // the drop (a verbose child is exactly the one that lags). The tick spaces those
+        // reads one second apart however often the stream lags, so a chatty child does not
+        // make the parent hammer the store; it also wakes the loop while a request the
+        // backend answers itself waits for that answer (its answer may fail: then nobody
+        // answers it).
+        let mut tick = tokio::time::interval(READ_BACK_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut lagged = false;
+        loop {
+            if let Some(end) = watch.unanswered_ask(answers_itself) {
+                return end;
+            }
+            tokio::select! {
+                received = rx.recv() => match received {
+                    Ok(event) => {
+                        if let Some(end) = watch.observe(event) {
+                            return end;
+                        }
+                    }
+                    // Events were dropped, and the child's `result` may have been among
+                    // them: waiting on the stream alone could last until the parent's
+                    // 30-minute turn timeout. The thread is the truth (P18b, fix 4).
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                        if !lagged {
+                            tracing::warn!(child = %sid, dropped, "sub-agent events dropped: its thread is read back until it ends");
+                        }
+                        lagged = true;
+                    }
+                    // The stream is over: what it did not carry, the thread may still hold.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return self.read_back(sid, &mut watch).await.unwrap_or_else(|| {
+                            Err("the sub-agent's session ended before it answered".into())
+                        });
+                    }
+                },
+                _ = tick.tick(), if lagged || watch.is_asking() => {
+                    if lagged {
+                        if let Some(end) = self.read_back(sid, &mut watch).await {
+                            return end;
+                        }
+                    }
+                }
             }
         }
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let done = matches!(event, ChatEvent::Result { .. });
-                    let closed = matches!(event, ChatEvent::SessionClosed { .. });
-                    seen.push(event);
-                    if done {
-                        return answer_of(&seen).unwrap_or_else(|| Ok(String::new()));
-                    }
-                    if closed {
-                        return Err("the sub-agent's session was closed before it answered".into());
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err("the sub-agent's session ended before it answered".into())
-                }
+    }
+
+    /// The end of `sid` as its STORED thread tells it — its answer, or its close — and
+    /// what it still asks for there, into `watch` (a decision the stream dropped is seen
+    /// here). `None` while the thread shows no end.
+    async fn read_back(&self, sid: &str, watch: &mut Watch) -> Option<Result<String, String>> {
+        let persisted = self.persisted_events(sid).await;
+        watch.reconcile(&persisted);
+        if let Some(answer) = answer_of(&persisted) {
+            return Some(answer);
+        }
+        persisted
+            .iter()
+            .any(|e| matches!(e, ChatEvent::SessionClosed { .. }))
+            .then(|| Err(CLOSED_BEFORE_ANSWER.to_owned()))
+    }
+
+    /// The answer of `sid` as its STORED thread tells it, when its `result` is already
+    /// there.
+    #[cfg(test)]
+    async fn persisted_answer(&self, sid: &str) -> Option<Result<String, String>> {
+        answer_of(&self.persisted_events(sid).await)
+    }
+
+    /// The most recent events of `sid`'s STORED thread. Reads the TAIL of the thread, not
+    /// the head (P18b round 2, fix 5): a long child's `result` can land after more than
+    /// [`PERSISTED_READ_WINDOW`] events, and `get_chat_events` only reads forward from
+    /// `after_seq` — starting at 0 would never reach it.
+    async fn persisted_events(&self, sid: &str) -> Vec<ChatEvent> {
+        let Ok(uuid) = Uuid::parse_str(sid) else {
+            return Vec::new();
+        };
+        let latest_seq = self
+            .graph
+            .get_latest_chat_event_seq(uuid)
+            .await
+            .unwrap_or(0);
+        let after_seq = (latest_seq - PERSISTED_READ_WINDOW).max(0);
+        self.graph
+            .get_chat_events(uuid, after_seq, PERSISTED_READ_WINDOW)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| serde_json::from_str(&r.data).ok())
+            .collect()
+    }
+}
+
+/// What the parent's wait on one child holds: what [`answer_of`] will read, and the
+/// permission requests of the child still waiting for an answer (P18b round 3, fix B).
+#[derive(Default)]
+struct Watch {
+    seen: Vec<ChatEvent>,
+    /// Request id → (tool, order in which the parent first saw it waiting).
+    asks: std::collections::HashMap<String, (String, usize)>,
+    /// How many requests were seen: the order of the next one.
+    asked: usize,
+}
+
+impl Watch {
+    /// Takes one live event; the end of the call when this event ends it.
+    fn observe(&mut self, event: ChatEvent) -> Option<Result<String, String>> {
+        match &event {
+            ChatEvent::PermissionRequest { id, tool, .. } => self.ask(id, tool),
+            ChatEvent::PermissionDecision { id, .. } => {
+                self.asks.remove(id);
             }
+            _ => {}
+        }
+        let done = is_result(&event);
+        let asked = is_question(&event);
+        let closed = matches!(event, ChatEvent::SessionClosed { .. });
+        keep_for_answer(&mut self.seen, event);
+        if done || asked {
+            // A question fails the call at once: nobody would ever answer it.
+            return Some(answer_of(&self.seen).unwrap_or_else(|| Ok(String::new())));
+        }
+        if closed {
+            // A child can also close without this event reaching the parent: when it was
+            // dropped, the read-back after the `Lagged` sees the close on the thread; when
+            // the stream just ends, the read-back on `Closed` does. A close the stream never
+            // carried while it stays open (a clone of `events_tx` alive) and never lags is
+            // NOT caught: the parent then waits until its turn timeout.
+            return Some(Err(CLOSED_BEFORE_ANSWER.into()));
+        }
+        None
+    }
+
+    /// Brings the waiting requests in line with the stored thread: what it shows decided
+    /// is not waiting any more, what it shows asked and undecided is.
+    ///
+    /// Contract with `answers_itself` (review nexus-41 of #727, nit 3; second review,
+    /// finding 3): a request the live session saw asked and whose answer it took counts
+    /// as answered even before its decision is stored; one it never saw — asked before a
+    /// resume under the same id — does NOT: nobody here will answer it, so
+    /// [`Self::unanswered_ask`] fails the call on it at once, as on any undecided request.
+    fn reconcile(&mut self, persisted: &[ChatEvent]) {
+        for event in persisted {
+            if let ChatEvent::PermissionRequest { id, tool, .. } = event {
+                self.ask(id, tool);
+            }
+        }
+        for event in persisted {
+            if let ChatEvent::PermissionDecision { id, .. } = event {
+                self.asks.remove(id);
+            }
+        }
+    }
+
+    /// A request of the child waits from now on (a second sight of it changes nothing).
+    fn ask(&mut self, id: &str, tool: &str) {
+        if !self.asks.contains_key(id) {
+            self.asks
+                .insert(id.to_owned(), (tool.to_owned(), self.asked));
+            self.asked += 1;
+        }
+    }
+
+    fn is_asking(&self) -> bool {
+        !self.asks.is_empty()
+    }
+
+    /// The failure of the call when a permission request of the child waits that the
+    /// backend does not answer itself (`answers_itself`: no grant, no lasting rule covers
+    /// it, or its automatic answer failed): a sub-agent does not wait for a person, and an
+    /// unanswered request would hold the parent until its turn timeout. Decided at once, with no grace
+    /// (review of #724): the backend knows whether it answers a request before the request
+    /// is shown. Several such requests: the first one seen names the tool.
+    fn unanswered_ask(
+        &self,
+        answers_itself: &(dyn Fn(&str) -> bool + Send + Sync),
+    ) -> Option<Result<String, String>> {
+        let (tool, _) = self
+            .asks
+            .iter()
+            .filter(|(id, _)| !answers_itself(id))
+            .map(|(_, ask)| ask)
+            .min_by_key(|(_, order)| *order)?;
+        Some(Err(format!(
+            "the sub-agent needed a permission for `{tool}`, and a sub-agent cannot ask for one \
+             (nobody answers in its session): do that step yourself, or give it a task that \
+             needs no permission"
+        )))
+    }
+}
+
+/// Whether the backend answers a request of the child `sid` itself, read from the child's
+/// LIVE session each time it is asked (`AgentSessionHandle::answers_itself`, decided before
+/// the request is broadcast). The handle used to be captured once, when the wait began
+/// (lot review of #721, nit (a) of the follow-up review of #724): a child whose session was
+/// replaced in the runtime meanwhile (re-adopted under the same id: a resume) was judged
+/// on the OLD handle, whose sets never see the new session's requests — a covered request
+/// then failed the call, or one still waiting looked answered. The runtime is read without
+/// waiting; at the instant it is being written, the handle last seen answers.
+fn live_answers_itself(
+    runtime: Arc<super::agent_runtime::AgentRuntime>,
+    sid: &str,
+    initial: Option<Arc<super::agent_runtime::AgentSessionHandle>>,
+) -> impl Fn(&str) -> bool + Send + Sync {
+    let sid = sid.to_owned();
+    let last = std::sync::Mutex::new(initial);
+    move |id: &str| {
+        let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(now) = runtime.try_get(&sid) {
+            *last = now;
+        }
+        last.as_ref().is_some_and(|h| h.answers_itself(id))
+    }
+}
+
+/// What the call answers when the child closed before its `result`.
+const CLOSED_BEFORE_ANSWER: &str = "the sub-agent's session was closed before it answered";
+
+/// How often the parent re-reads the thread of a child whose stream lagged, and checks the
+/// permission requests of the child the backend answers itself (P18b round 3, fix C).
+const READ_BACK_EVERY: Duration = Duration::from_secs(1);
+
+/// How many of a child's most recent persisted events `ChatManager::persisted_events`
+/// reads back (P18b round 2, fix 5): enough for `answer_of` to find a `result` that is
+/// not buried under a very chatty child's thread, without reading the whole thing.
+const PERSISTED_READ_WINDOW: i64 = 5_000;
+
+/// A panic injected into [`ChatManager::open_wait_close`] between the child's answer and
+/// its explicit close, keyed by parent session id (unique per test): the proof that the
+/// close guard is wired into the real task, not just that the struct works (P18b round 3,
+/// fix E). That point is the one the guard did NOT cover before: it was disarmed there.
+#[cfg(test)]
+pub(crate) mod panic_injection {
+    static BEFORE_CLOSE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// The next sub-agent of `parent` panics right before its child's `close_session`.
+    pub(crate) fn before_close(parent: &str) {
+        BEFORE_CLOSE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(parent.to_string());
+    }
+
+    pub(super) fn panic_if_injected(parent: &str) {
+        let hit = {
+            let mut armed = BEFORE_CLOSE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match armed.iter().position(|p| p == parent) {
+                Some(i) => {
+                    armed.remove(i);
+                    true
+                }
+                None => false,
+            }
+        };
+        if hit {
+            panic!("injected panic before the sub-agent's close (test)");
         }
     }
 }
@@ -380,6 +894,290 @@ impl ChatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::GraphStore;
+
+    fn bare_manager() -> (Arc<crate::neo4j::mock::MockGraphStore>, Arc<ChatManager>) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let manager = Arc::new(ChatManager::new_without_memory(
+            dyn_graph,
+            crate::test_helpers::mock_app_state().meili,
+            Default::default(),
+        ));
+        (graph, manager)
+    }
+
+    fn said(t: &str) -> ChatEvent {
+        ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: None,
+        }
+    }
+
+    fn asked(id: &str) -> ChatEvent {
+        ChatEvent::PermissionRequest {
+            id: id.into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "rm -rf build"}),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: None,
+            tool_use_id: None,
+            always: None,
+        }
+    }
+
+    /// P18b round 3, fix C: the stream lags, and the child's `result` reaches its thread
+    /// only 6 s later — past the ~4–5 s the round-2 poll gave it. The parent still gets the
+    /// answer, about when it is stored, not at its turn timeout. Red before the fix: after
+    /// its 5 reads the poll went back to `recv()` for good, and the stream (still open,
+    /// quiet) never said anything again.
+    #[tokio::test(start_paused = true)]
+    async fn a_result_stored_long_after_a_lag_still_reaches_the_parent() {
+        let (graph, manager) = bare_manager();
+        let uuid = Uuid::new_v4();
+        let sid = uuid.to_string();
+        let (tx, rx) = tokio::sync::broadcast::channel::<ChatEvent>(2);
+        tx.send(said("working")).unwrap();
+        let started = tokio::time::Instant::now();
+        let waiting = {
+            let manager = manager.clone();
+            let sid = sid.clone();
+            tokio::spawn(async move { manager.answer_from(&sid, rx, &|_| false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Overrun: eight events into two slots, without yielding to the reader.
+        for i in 0..8 {
+            tx.send(said(&format!("chatter {i}"))).unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!waiting.is_finished(), "nothing stored yet: it still waits");
+        graph
+            .store_chat_events(
+                uuid,
+                vec![crate::neo4j::models::ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: 1,
+                    event_type: "result".into(),
+                    data: serde_json::json!({
+                        "type": "result", "session_id": sid, "duration_ms": 1,
+                        "subtype": "success", "is_error": false, "result_text": "LATE-ANSWER",
+                    })
+                    .to_string(),
+                    created_at: chrono::Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+        // The stream stays open and quiet: only the read-back can end the wait.
+        let out = tokio::time::timeout(Duration::from_secs(60), waiting)
+            .await
+            .expect("the parent must not wait for its turn timeout")
+            .unwrap();
+        assert_eq!(out, Ok("LATE-ANSWER".to_string()));
+        assert!(
+            started.elapsed() < Duration::from_secs(9),
+            "answered about when stored: {:?}",
+            started.elapsed()
+        );
+        drop(tx);
+    }
+
+    /// P18b round 3, fix B, made deterministic by the review of #724: a permission request
+    /// of the child the backend does not answer itself fails the call AT ONCE, not after a
+    /// grace nor at the parent's turn timeout; one it answers itself (a grant or a lasting
+    /// rule covers it) never fails it, however late its `permission_decision` comes —
+    /// unless that automatic answer fails, and then the request fails the call too. Red
+    /// before: an uncovered request waited 3 s, and a covered one whose answer took longer
+    /// than that failed the call.
+    #[tokio::test(start_paused = true)]
+    async fn an_uncovered_permission_fails_the_call_at_once_and_a_covered_one_never() {
+        let (_graph, manager) = bare_manager();
+        let sid = Uuid::new_v4().to_string();
+
+        // Uncovered: failed at once (paused time: no tick, no grace elapsed).
+        let (tx, rx) = tokio::sync::broadcast::channel::<ChatEvent>(16);
+        let started = tokio::time::Instant::now();
+        let waiting = {
+            let manager = manager.clone();
+            let sid = sid.clone();
+            tokio::spawn(async move { manager.answer_from(&sid, rx, &|_| false).await })
+        };
+        tx.send(asked("p1")).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(60), waiting)
+            .await
+            .expect("an unanswered permission must not hold the parent")
+            .unwrap();
+        assert!(
+            out.as_ref()
+                .is_err_and(|e| e.contains("permission") && e.contains("Bash")),
+            "{out:?}"
+        );
+        assert!(
+            started.elapsed() < READ_BACK_EVERY,
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Covered: its automatic answer is late (30 s, ten times the old grace); the call
+        // waits, then the child goes on and answers.
+        let covered = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, rx) = tokio::sync::broadcast::channel::<ChatEvent>(16);
+        let waiting = {
+            let manager = manager.clone();
+            let sid = sid.clone();
+            let covered = covered.clone();
+            tokio::spawn(async move {
+                let answers_itself =
+                    move |id: &str| id == "p2" && covered.load(std::sync::atomic::Ordering::SeqCst);
+                manager.answer_from(&sid, rx, &answers_itself).await
+            })
+        };
+        tx.send(asked("p2")).unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!waiting.is_finished(), "a covered request does not fail it");
+        tx.send(ChatEvent::PermissionDecision {
+            id: "p2".into(),
+            allow: true,
+            scope: None,
+            rule: None,
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!waiting.is_finished(), "a decided request does not fail it");
+        tx.send(ChatEvent::Result {
+            session_id: sid.clone(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: Some("DONE".into()),
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        })
+        .unwrap();
+        assert_eq!(waiting.await.unwrap(), Ok("DONE".to_string()));
+
+        // Covered, but its automatic answer failed: nobody answers it any more.
+        let (tx, rx) = tokio::sync::broadcast::channel::<ChatEvent>(16);
+        let waiting = {
+            let manager = manager.clone();
+            let sid = sid.clone();
+            let covered = covered.clone();
+            tokio::spawn(async move {
+                let answers_itself =
+                    move |id: &str| id == "p2" && covered.load(std::sync::atomic::Ordering::SeqCst);
+                manager.answer_from(&sid, rx, &answers_itself).await
+            })
+        };
+        tx.send(asked("p2")).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!waiting.is_finished());
+        covered.store(false, std::sync::atomic::Ordering::SeqCst);
+        let out = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("a request whose automatic answer failed fails the call")
+            .unwrap();
+        assert!(out.is_err_and(|e| e.contains("Bash")));
+        drop(tx);
+    }
+
+    /// Lot review of #721 (nit (a) of the follow-up review of #724): what the parent asks
+    /// about a child's request is read from the child's LIVE session, not from the handle
+    /// seen when the wait began. The child is re-adopted under the same id (a resume); its
+    /// new session holds a grant and answers a covered request itself: the parent must not
+    /// see it as unanswered. Red before: the handle captured at the start never saw the
+    /// request, so the call failed with "needed a permission".
+    #[tokio::test]
+    async fn whether_a_child_answers_itself_is_read_from_its_live_session() {
+        use super::super::agent_runtime::{fake::FakeProvider, AgentRuntime};
+        use super::super::types::PermissionAnswerScope;
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = Arc::new(AgentRuntime::new(graph));
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes = vec![
+            nexus_claude::agent::PermissionScope::Once,
+            nexus_claude::agent::PermissionScope::Session,
+        ];
+        let adopt = || {
+            runtime.adopt(
+                "child",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+        };
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+            tool_use_id: None,
+            always: None,
+        };
+        let first = adopt().await;
+        let answers_itself = live_answers_itself(Arc::clone(&runtime), "child", Some(first));
+        let second = adopt().await;
+        second.emit(write("w0")).await;
+        assert!(!answers_itself("w0"), "the live session waits on its user");
+        second
+            .answer_permission_scoped("w0", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        second.emit(write("w1")).await;
+        assert!(
+            answers_itself("w1"),
+            "the live session answered it itself (its grant covers it)"
+        );
+        second.emit(asked("bash-1")).await;
+        assert!(!answers_itself("bash-1"), "nothing covers it: it waits");
+        // The child is gone from the runtime: nothing answers for it.
+        let _ = runtime.close("child").await;
+        assert!(!answers_itself("w1"));
+    }
+
+    /// P18b round 2, fix 3: a guard still armed when it drops runs its backstop exactly
+    /// once. Forcing a real panic through the whole `create_session` → `close_session`
+    /// async chain is not clean to set up, so this drives the guard's own `Drop` directly —
+    /// the seam `open_wait_close` relies on.
+    #[test]
+    fn an_armed_guard_runs_its_backstop_on_drop() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        {
+            let _guard = ClosePanicGuard::new(move || {
+                tx.send(()).unwrap();
+            });
+            // Dropped here, still armed: the backstop must run.
+        }
+        rx.try_recv().expect("the backstop ran on drop");
+    }
+
+    /// The ordinary path (`disarm` before the guard drops, exactly what `open_wait_close`
+    /// does right before its own explicit `close_session`) must not ALSO run the backstop:
+    /// the child would be closed twice.
+    #[test]
+    fn a_disarmed_guard_does_not_run_its_backstop() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        {
+            let mut guard = ClosePanicGuard::new(move || {
+                tx.send(()).unwrap();
+            });
+            guard.disarm();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a disarmed guard must not run its backstop"
+        );
+    }
 
     #[test]
     fn the_answer_is_the_result_text_else_the_last_thing_said() {
@@ -470,5 +1268,126 @@ mod tests {
         };
         let out = answer_of(&[asked, ok_result("asked")]).unwrap();
         assert!(out.is_err_and(|e| e.contains("cannot ask")));
+    }
+
+    /// P18b, fix 4: what the parent holds of a child's stream is bounded — at most the
+    /// question, the last thing said and the `result` — and `answer_of` still reads the
+    /// same answer out of it.
+    #[test]
+    fn what_is_kept_of_a_chatty_child_is_bounded() {
+        let said = |t: &str| ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: None,
+        };
+        let inside = ChatEvent::AssistantText {
+            content: "inside a tool call".into(),
+            parent_tool_use_id: Some("toolu_1".into()),
+        };
+        let mut seen = Vec::new();
+        for i in 0..5_000 {
+            keep_for_answer(&mut seen, said(&format!("line {i}")));
+            keep_for_answer(&mut seen, inside.clone());
+            keep_for_answer(
+                &mut seen,
+                ChatEvent::ToolUse {
+                    id: "t".into(),
+                    tool: "Read".into(),
+                    input: serde_json::json!({}),
+                    parent_tool_use_id: None,
+                    category: None,
+                    canonical: None,
+                },
+            );
+        }
+        assert_eq!(seen.len(), 1, "only the last thing said is held: {seen:?}");
+        keep_for_answer(&mut seen, ok_result("FINAL"));
+        keep_for_answer(&mut seen, ok_result("A SECOND RESULT"));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(answer_of(&seen), Some(Ok("FINAL".into())));
+
+        // Without a result text, the fallback is the LAST thing said, not the first.
+        let mut seen = Vec::new();
+        keep_for_answer(&mut seen, said("first"));
+        keep_for_answer(&mut seen, said("last"));
+        keep_for_answer(
+            &mut seen,
+            ChatEvent::Result {
+                session_id: "s".into(),
+                duration_ms: 1,
+                cost_usd: None,
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
+            },
+        );
+        assert_eq!(answer_of(&seen), Some(Ok("last".into())));
+
+        // A question is kept once, whatever follows.
+        let question = ChatEvent::AskUserQuestion {
+            id: "q".into(),
+            tool_call_id: "cq".into(),
+            questions: serde_json::json!([{"question": "Which?"}]),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+            synthetic: Some(true),
+        };
+        let mut seen = Vec::new();
+        keep_for_answer(&mut seen, question.clone());
+        keep_for_answer(&mut seen, question);
+        keep_for_answer(&mut seen, ok_result("whatever"));
+        assert_eq!(seen.len(), 2);
+        assert!(answer_of(&seen)
+            .unwrap()
+            .is_err_and(|e| e.contains("cannot ask")));
+    }
+
+    /// P18b round 2, fix 5: a child's `result` landing well past
+    /// [`PERSISTED_READ_WINDOW`] events is still found — `persisted_answer` reads the
+    /// TAIL of the thread. Red before the fix: `get_chat_events(uuid, 0, 5_000)` reads
+    /// forward from the head and never reaches a `result` stored at seq 6001.
+    #[tokio::test]
+    async fn persisted_answer_reads_the_tail_not_the_head() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let manager = ChatManager::new_without_memory(
+            dyn_graph,
+            crate::test_helpers::mock_app_state().meili,
+            Default::default(),
+        );
+        let sid = Uuid::new_v4();
+        let said = |t: &str| ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: None,
+        };
+        let mut events: Vec<crate::neo4j::models::ChatEventRecord> = (1..=6_000i64)
+            .map(|i| crate::neo4j::models::ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: sid,
+                seq: i,
+                event_type: "assistant_text".into(),
+                data: serde_json::to_string(&said(&format!("line {i}"))).unwrap(),
+                created_at: chrono::Utc::now(),
+            })
+            .collect();
+        events.push(crate::neo4j::models::ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: sid,
+            seq: 6_001,
+            event_type: "result".into(),
+            data: serde_json::json!({
+                "type": "result", "session_id": sid.to_string(), "duration_ms": 1,
+                "subtype": "success", "is_error": false, "result_text": "TAIL-ANSWER",
+            })
+            .to_string(),
+            created_at: chrono::Utc::now(),
+        });
+        graph.store_chat_events(sid, events).await.unwrap();
+        let answer = manager.persisted_answer(&sid.to_string()).await;
+        assert_eq!(answer, Some(Ok("TAIL-ANSWER".to_string())));
     }
 }
