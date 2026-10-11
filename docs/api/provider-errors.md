@@ -26,7 +26,7 @@ an identifier or a secret.
 | 410 | `closed` | The session is closed. |
 | 404 | `provider_unknown` | No such instance. |
 | 409 | `provider_conflict` | A session never changes provider. |
-| 403 | `endpoint_not_allowed` | No consent holds for this origin and credential here, or the endpoint guard refused it. `consent_scope` says which consent is missing: `project` (a person allows it for the project: `PUT /api/projects/{slug}/llm-consents/{provider_id}` with `{origin}`) or `no_project` (a chat outside any project: `PUT /api/chat/llm-consents/{provider_id}` with `{origin}`). A project never inherits the no-project consent. |
+| 403 | `endpoint_not_allowed` | No consent holds for this origin and credential here, or the endpoint guard refused it (then no `consent_scope`: change the URL, no consent helps). `consent_scope` says which consent is missing: `project` (a person allows it for the project: `PUT /api/projects/{slug}/llm-consents/{provider_id}` with `{origin}`) or `no_project` (a chat outside any project: `PUT /api/chat/llm-consents/{provider_id}` with `{origin}`, root account only). A project never inherits the no-project consent. |
 | 503 | `provider_unavailable` | The instance cannot open sessions now. |
 | 409 | `engine_unavailable` | The session was opened on the agent engine, now switched off (`CHAT_PROVIDER_PATH`). |
 | 409 | `no_provider` | Nothing usable: no role or request names a provider, the Claude Code CLI is not on the server, and no other instance is allowed here. Install the CLI or configure (and allow) a provider. |
@@ -40,6 +40,7 @@ an identifier or a secret.
 | 409 | `security_gate_closed` | Creating a third-party instance needs authentication on. |
 | 409 | `origin_mismatch` | The origin you consented to is no longer the instance's. |
 | 403 | `provider settings can only be changed by a signed-in user` | An agent token tried a human-only route. |
+| 403 | `root_required` | A signed-in person other than the root account tried a server-wide routing setting: the global pilot role (`PUT /api/chat/roles`) or the consent for the chats outside any project (`PUT`/`DELETE /api/chat/llm-consents[/{provider_id}]`). |
 | 403 | `tool_not_in_profile` | The route is behind a tool the restricted profile withholds. |
 | 403 | `envelope_*` | A delegated session left its envelope (`unbound_token`, `parent_not_found`, `depth_exceeded`, `too_many_children`, `cwd_outside_parent`, `add_dir_outside_parent`, `project_mismatch`, `workspace_mismatch`, `not_a_child`). |
 | 400 | `credential_ref ...` | A malformed reference, a pasted secret, or an undeclared `env:` variable. |

@@ -1258,15 +1258,14 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         use nexus_claude::{ClaudeCodeOptions, InteractiveClient, PermissionMode};
 
-        // The CLI the server is set to use (CLAUDE_CLI_PATH), else the one on the machine;
+        // The CLI the server is set to use (CLAUDE_CLI_PATH, else chat.claude_cli_path), else the one on the machine;
         // without Claude Code there is nothing to ask, and that is not an error (M1).
-        let configured_cli = std::env::var("CLAUDE_CLI_PATH")
-            .ok()
-            .filter(|p| !p.trim().is_empty());
-        if !crate::chat::cli_version::claude_cli_present(configured_cli.as_deref()) {
+        let configured_cli = crate::chat::cli_version::configured_cli_path();
+        let Some(cli) = crate::chat::cli_version::locate_claude_cli(configured_cli.as_deref())
+        else {
             tracing::info!("Claude Code absent: feature graph proposal skipped");
             return None;
-        }
+        };
 
         #[allow(deprecated)]
         let mut builder = ClaudeCodeOptions::builder()
@@ -1276,8 +1275,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .max_turns(1)
             // Same clean environment as every other agent process (A33).
             .env_policy(crate::chat::manager::child_env_policy());
-        if let Some(cli) = &configured_cli {
-            builder = builder.cli_path(cli);
+        if configured_cli.is_some() {
+            // The configured CLI, resolved like a spawn would (a bare name through the PATH).
+            builder = builder.cli_path(&cli);
         }
         let options = builder.build();
 

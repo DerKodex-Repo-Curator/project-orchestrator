@@ -418,6 +418,10 @@ async fn the_endpoint_guard_runs_before_any_connection() {
         .await
         .unwrap_err();
     assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    // The consent exists: the refusal must not ask for one (review of #722, finding 3).
+    let f = super::provider::errors::classify_open_error(&err, None).expect("typed");
+    assert_eq!(f.consent_scope, None);
+    assert_eq!(f.provider_id.as_deref(), Some("internal"));
 }
 
 #[tokio::test]

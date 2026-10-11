@@ -235,6 +235,9 @@ pub enum ResolveError {
     /// Outside any project, no person allowed this instance for the sessions without one
     /// (`PUT /api/chat/llm-consents/{provider_id}`, B3).
     NotAllowedOutsideProject(String),
+    /// The endpoint guard refused the instance's URL (A36): no consent would change that,
+    /// so the refusal names no consent scope (review of #722, finding 3).
+    EndpointRefused(String),
     /// The instance cannot open sessions and no fallback applies.
     Unavailable {
         /// Instance identifier.
@@ -273,7 +276,9 @@ impl ResolveError {
         match self {
             Self::ProviderConflict { .. } => "provider_conflict",
             Self::UnknownProvider(_) => "provider_unknown",
-            Self::NotAllowed(_) | Self::NotAllowedOutsideProject(_) => "endpoint_not_allowed",
+            Self::NotAllowed(_) | Self::NotAllowedOutsideProject(_) | Self::EndpointRefused(_) => {
+                "endpoint_not_allowed"
+            }
             Self::Unavailable { .. } => "provider_unavailable",
             Self::NoProvider => "no_provider",
             Self::ProviderNotChosen { .. } => "provider_not_chosen",
@@ -295,6 +300,9 @@ impl fmt::Display for ResolveError {
             }
             Self::NotAllowedOutsideProject(id) => {
                 write!(f, "provider '{id}' is not allowed outside a project")
+            }
+            Self::EndpointRefused(id) => {
+                write!(f, "the endpoint of provider '{id}' is refused by the endpoint guard")
             }
             Self::Unavailable { provider_id, role } => write!(
                 f,

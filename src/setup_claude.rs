@@ -98,19 +98,44 @@ pub fn setup_claude_code_at_boot(
     cli: Option<String>,
 ) -> Result<SetupResult> {
     if cli.is_none() {
+        // An entry written earlier (the CLI was there, or will be again) still points at
+        // this server: refresh it if it went stale, never create anything (review of #722).
+        let (mcp_path, env_vars) = expected_entry(config);
+        if let ConfigStatus::Stale = check_existing_config(home, &mcp_path, &env_vars)? {
+            let path = configure_via_file(home, &mcp_path, &env_vars)?;
+            return Ok(SetupResult::Updated {
+                path,
+                allowed_tools_configured: false,
+            });
+        }
         return Ok(SetupResult::SkippedCliAbsent);
     }
     setup_claude_code_in(config, home, cli)
 }
 
 /// [`setup_claude_code`] in `home`, `cli` being the Claude Code CLI found (if any).
+/// The `project-orchestrator` entry this server wants in `mcp.json`: the command and its env.
+fn expected_entry(config: &SetupConfig) -> (String, std::collections::HashMap<String, String>) {
+    let mut env_vars = std::collections::HashMap::new();
+    env_vars.insert(
+        "PO_SERVER_URL".to_string(),
+        format!("http://127.0.0.1:{}", config.server_port),
+    );
+    if let Some(ref secret) = config.jwt_secret {
+        env_vars.insert("PO_JWT_SECRET".to_string(), secret.clone());
+    }
+    (
+        config.mcp_server_path.to_string_lossy().to_string(),
+        env_vars,
+    )
+}
+
 fn setup_claude_code_in(
     config: &SetupConfig,
     home: &Path,
     cli: Option<String>,
 ) -> Result<SetupResult> {
-    let server_url = format!("http://127.0.0.1:{}", config.server_port);
-    let mcp_path = config.mcp_server_path.to_string_lossy().to_string();
+    let (mcp_path, env_vars) = expected_entry(config);
 
     // Always try to configure allowed tools (idempotent — safe to call multiple times)
     let allowed_tools_ok = match configure_allowed_tools_at(&settings_json_path_in(home)) {
@@ -123,13 +148,6 @@ fn setup_claude_code_in(
             false
         }
     };
-
-    // Build the expected env vars
-    let mut env_vars = std::collections::HashMap::new();
-    env_vars.insert("PO_SERVER_URL".to_string(), server_url.clone());
-    if let Some(ref secret) = config.jwt_secret {
-        env_vars.insert("PO_JWT_SECRET".to_string(), secret.clone());
-    }
 
     // Check if already configured and up-to-date
     match check_existing_config(home, &mcp_path, &env_vars)? {
@@ -610,6 +628,49 @@ mod tests {
         assert!(
             !home.path().join(".claude").exists(),
             "no ~/.claude for a server that never runs Claude Code"
+        );
+    }
+
+    #[test]
+    fn without_claude_code_the_boot_only_refreshes_an_entry_it_wrote_before() {
+        // Review of #722, finding 4: a stale `project-orchestrator` entry (old port) is
+        // brought up to date; nothing else is created or touched.
+        let home = TempDir::new().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let stale = serde_json::json!({"mcpServers": {
+            "project-orchestrator": {"command": "/opt/po/mcp_server",
+                                     "env": {"PO_SERVER_URL": "http://127.0.0.1:9999"}},
+            "other": {"command": "x"}
+        }});
+        std::fs::write(claude.join("mcp.json"), stale.to_string()).unwrap();
+        let result = setup_claude_code_at_boot(&boot_config(), home.path(), None).unwrap();
+        assert!(matches!(result, SetupResult::Updated { .. }), "{result:?}");
+        let mcp: Value =
+            serde_json::from_str(&std::fs::read_to_string(claude.join("mcp.json")).unwrap())
+                .unwrap();
+        let entry = &mcp["mcpServers"]["project-orchestrator"];
+        assert_eq!(entry["env"]["PO_SERVER_URL"], "http://127.0.0.1:18080");
+        assert_eq!(mcp["mcpServers"]["other"]["command"], "x", "others kept");
+        assert!(!claude.join("settings.json").exists(), "nothing new");
+        // Up to date now: the next boot changes nothing.
+        let again = setup_claude_code_at_boot(&boot_config(), home.path(), None).unwrap();
+        assert!(matches!(again, SetupResult::SkippedCliAbsent), "{again:?}");
+
+        // An mcp.json without our entry is left alone.
+        let other_home = TempDir::new().unwrap();
+        let other = other_home.path().join(".claude");
+        std::fs::create_dir_all(&other).unwrap();
+        let theirs = serde_json::json!({"mcpServers": {"other": {"command": "x"}}}).to_string();
+        std::fs::write(other.join("mcp.json"), &theirs).unwrap();
+        let result = setup_claude_code_at_boot(&boot_config(), other_home.path(), None).unwrap();
+        assert!(
+            matches!(result, SetupResult::SkippedCliAbsent),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.join("mcp.json")).unwrap(),
+            theirs
         );
     }
 

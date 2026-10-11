@@ -369,6 +369,15 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
             Some(id.clone()),
             false,
         ),
+        ResolveError::EndpointRefused(id) => (
+            403,
+            "This provider's endpoint is refused by the server's endpoint guard (scheme, \
+             private address or unresolvable host): change the instance's URL; no consent \
+             changes that."
+                .to_string(),
+            Some(id.clone()),
+            false,
+        ),
         ResolveError::NotAllowedOutsideProject(id) => (
             403,
             "This provider is not allowed for chats outside a project: a person allows it \
@@ -771,6 +780,15 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("outside a project"));
+        // A refusal of the endpoint guard asks for no consent: none would fix it.
+        let guard = assert_resolved(
+            ResolveError::EndpointRefused("local".into()),
+            403,
+            "endpoint_not_allowed",
+            Some("local"),
+        );
+        assert_eq!(guard.consent_scope, None);
+        assert!(guard.to_json().get("consent_scope").is_none());
         // Any other refusal carries neither field.
         let other = resolve_failure(&ResolveError::NoProvider).to_json();
         assert!(other.get("consent_scope").is_none() && other.get("candidates").is_none());
@@ -925,6 +943,7 @@ mod tests {
             },
             ResolveError::NoProvider,
             ResolveError::NotAllowedOutsideProject("a".into()),
+            ResolveError::EndpointRefused("a".into()),
             ResolveError::ProviderNotChosen {
                 candidates: vec!["a".into(), "b".into()],
             },

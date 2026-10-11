@@ -640,6 +640,14 @@ pub async fn oidc_callback(
     ))
 }
 
+/// Whether `user_id` is the root account of this server: the deterministic UUID of the
+/// configured root email. No root account configured → nobody is root.
+pub(crate) fn is_root_user(auth_config: Option<&AuthConfig>, user_id: Uuid) -> bool {
+    auth_config
+        .and_then(|c| c.root_account.as_ref())
+        .is_some_and(|root| Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes()) == user_id)
+}
+
 /// GET /auth/me — Returns the authenticated user's info.
 ///
 /// Requires a valid JWT token (via `require_auth` middleware + `AuthUser` extractor).
@@ -650,13 +658,7 @@ pub async fn get_me(
     user: AuthUser,
 ) -> Result<Json<UserResponse>, AppError> {
     // Check if this user is the root account (deterministic UUID from email)
-    let is_root = state
-        .auth_config
-        .as_ref()
-        .and_then(|c| c.root_account.as_ref())
-        .is_some_and(|root| {
-            Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes()) == user.user_id
-        });
+    let is_root = is_root_user(state.auth_config.as_ref(), user.user_id);
 
     // Try to fetch full user from Neo4j (may have updated picture, etc.)
     match state

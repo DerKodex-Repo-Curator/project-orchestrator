@@ -1647,21 +1647,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             jwt_secret: config.auth_config.as_ref().map(|a| a.jwt_secret.clone()),
         };
         // The CLI the server is set to use, else the one on the machine.
-        let cli = match config
-            .chat_claude_cli_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            Some(configured) => std::path::Path::new(configured)
-                .is_file()
-                .then(|| configured.to_string()),
-            None => setup_claude::detect_claude_cli().or_else(|| {
-                nexus_claude::find_claude_cli()
-                    .ok()
-                    .map(|p| p.display().to_string())
-            }),
-        };
+        chat::cli_version::set_configured_cli_path(config.chat_claude_cli_path.clone());
+        let cli = chat::cli_version::locate_claude_cli(config.chat_claude_cli_path.as_deref());
         let setup = match dirs::home_dir() {
             Some(home) => setup_claude::setup_claude_code_at_boot(&setup_config, &home, cli),
             None => Err(anyhow::anyhow!("Cannot determine home directory")),

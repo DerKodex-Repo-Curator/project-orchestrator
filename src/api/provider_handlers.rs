@@ -43,6 +43,40 @@ pub(crate) fn require_human(state: &OrchestratorState, claims: &Claims) -> Resul
     }
 }
 
+/// A server-wide routing decision that applies to OTHER people's chats (the global pilot
+/// role, the consent for the chats outside any project): the root account only. Any other
+/// signed-in person gets 403 — they could otherwise send everyone's content to an endpoint
+/// of their choosing. Without authentication there is one user and no third party anyway.
+pub(crate) fn require_root(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
+    require_human(state, claims)?;
+    if state.auth_config.is_none() {
+        return Ok(());
+    }
+    let is_root = uuid::Uuid::parse_str(&claims.sub)
+        .is_ok_and(|id| super::auth_handlers::is_root_user(state.auth_config.as_ref(), id));
+    if is_root {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "root_required: only the root account can change this server-wide setting".to_string(),
+        ))
+    }
+}
+
+/// Who may write a consent of `scope`: any person for a project (as before), the root
+/// account for the chats outside any project (a server-wide default, review of #722).
+fn require_scope_writer(
+    state: &OrchestratorState,
+    claims: &Claims,
+    scope: &str,
+) -> Result<(), AppError> {
+    if scope == st::NO_PROJECT_SCOPE {
+        require_root(state, claims)
+    } else {
+        require_human(state, claims)
+    }
+}
+
 /// The security gate (A32): a third-party instance is refused while session
 /// tokens cannot be bound to a signing key, i.e. while authentication is off.
 fn security_gate(state: &OrchestratorState) -> Result<(), AppError> {
@@ -122,23 +156,21 @@ pub async fn allowed_here(
         .collect())
 }
 
-/// The stored instances as listing entries, consent evaluated for a project.
+/// The stored instances as listing entries, consent evaluated for the asked scope (a project,
+/// or the chats outside any project).
 pub async fn stored_entries(
     graph: &dyn GraphStore,
     project_slug: Option<&str>,
 ) -> Result<Vec<ProviderEntry>, AppError> {
-    let consents = match project_slug {
-        Some(slug) => Some(load_scope_consents(graph, &st::project_scope(slug)).await?),
-        None => None,
-    };
+    // The consents of the asked scope: the project's, or with no project those of the chats
+    // outside any project (the scope those chats are opened in, B3).
+    let consents = load_scope_consents(graph, &st::consent_scope(project_slug)).await?;
     let aliases = load_aliases(graph).await?;
     Ok(load_instances(graph)
         .await?
         .into_iter()
         .map(|i| {
-            let allowed = consents
-                .as_ref()
-                .map(|cs| cs.iter().any(|c| st::consent_holds(c, &i)));
+            let allowed = Some(consents.iter().any(|c| st::consent_holds(c, &i)));
             // What the provider of this instance declares, before any session: an
             // instance listed with EMPTY capabilities made the interface claim it
             // could not ask for approval ("policy only") when it can.
@@ -797,7 +829,7 @@ async fn put_consent(
     provider_id: &str,
     origin: &str,
 ) -> Result<Json<st::ConsentView>, AppError> {
-    require_human(state, claims)?;
+    require_scope_writer(state, claims, scope)?;
     if provider_id == CLAUDE_CODE {
         return Err(AppError::BadRequest(
             "claude-code is always allowed: it needs no consent".to_string(),
@@ -933,7 +965,7 @@ async fn delete_consent(
     scope: &str,
     provider_id: &str,
 ) -> Result<StatusCode, AppError> {
-    require_human(state, claims)?;
+    require_scope_writer(state, claims, scope)?;
     let removed = graph(state)
         .delete_llm_setting(scope, &format!("{CONSENT_PREFIX}{provider_id}"))
         .await
@@ -996,6 +1028,8 @@ pub async fn put_roles(
     Extension(claims): Extension<Claims>,
     Json(roles): Json<RoleAssignments>,
 ) -> Result<Json<RoleAssignments>, AppError> {
+    // The global pilot routes every user's chats that name no provider: root only.
+    require_root(&state, &claims)?;
     write_roles(&state, &claims, GLOBAL, roles).await
 }
 

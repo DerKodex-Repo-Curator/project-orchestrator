@@ -144,7 +144,9 @@ pub struct ProviderEntry {
     pub builtin: bool,
     /// Is the configured default.
     pub is_default: bool,
-    /// Consent given for the asked project; `null` when no project was asked.
+    /// Consent given in the asked scope: the project, or with no project the chats outside
+    /// any project (`/api/chat/llm-consents`). Always set by the listing route; `None` only
+    /// for an entry built without a scope.
     pub allowed_for_project: Option<bool>,
     /// Origin (scheme, host, port) of the endpoint, never a path or a credential.
     pub endpoint_origin: Option<String>,

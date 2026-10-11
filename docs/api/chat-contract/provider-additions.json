@@ -153,7 +153,7 @@
             "label": "string",
             "builtin": "boolean",
             "is_default": "boolean",
-            "allowed_for_project": "boolean | null (null sans project_slug)",
+            "allowed_for_project": "boolean (sans project_slug : consentement des chats hors projet, GET /api/chat/llm-consents ; claude-code toujours true) | null (entree construite hors route)",
             "endpoint_origin": "string | null (jamais d'identifiant ; origine seule)",
             "credential": "string (vault:<nom> | env:<VAR> | none) — la référence, jamais la valeur",
             "remote": "object? (claude_code_remote seulement) {host, ssh_user?, ssh_port, host_key_fingerprint ('SHA256:...'), remote_cwd?, allow_trust} — jamais la clé privée ni la clé d'hôte brute",
@@ -262,11 +262,11 @@
       "PUT /api/projects/{slug}/llm-consent[s]/{provider_id}": "corps {origin}",
       "DELETE /api/projects/{slug}/llm-consent[s]/{provider_id}": "204 ; 404 sans consentement",
       "GET /api/chat/llm-consents": "B3 : les consentements des chats HORS de tout projet (portee no_project), meme forme que ceux d'un projet ; un projet n'en herite jamais",
-      "PUT /api/chat/llm-consents": "corps {provider_id, origin} -> 200 ligne ; memes regles qu'un projet (jeton humain, 404 instance inconnue, 400 claude-code, 409 origin_mismatch, lie a l'origine ET a la reference d'identifiant)",
+      "PUT /api/chat/llm-consents": "corps {provider_id, origin} -> 200 ligne ; memes regles qu'un projet MAIS compte root seulement (403 root_required : decide pour les chats de TOUS les utilisateurs ; revue de #722), puis 404 instance inconnue, 400 claude-code, 409 origin_mismatch, lie a l'origine ET a la reference d'identifiant)",
       "PUT /api/chat/llm-consents/{provider_id}": "corps {origin}",
-      "DELETE /api/chat/llm-consents/{provider_id}": "204 ; 404 sans consentement"
+      "DELETE /api/chat/llm-consents/{provider_id}": "204 ; 404 sans consentement ; root seulement (403 root_required)"
     },
-    "roles": "GET/PUT /api/chat/roles et /api/projects/{slug}/llm-roles : {pilot?:{provider,model?,alias?}, executor?:...} ; role absent = herite / fournisseur unique ; 404 instance inconnue ; 400 model ET alias ensemble ; STOCKE mais pas encore lu par le resolveur",
+    "roles": "GET/PUT /api/chat/roles et /api/projects/{slug}/llm-roles : PUT /api/chat/roles (role global) = compte root seulement (403 root_required) ; {pilot?:{provider,model?,alias?}, executor?:...} ; role absent = herite / fournisseur unique ; 404 instance inconnue ; 400 model ET alias ensemble ; STOCKE mais pas encore lu par le resolveur",
     "aliases": "GET/PUT /api/chat/model-aliases : [{alias,provider,model}] ; alias = minuscules/chiffres/tirets, uniques ; 404 instance inconnue",
     "policy": "GET/PUT /api/chat/model-policy : {mode: off|shadow|enforce, rules:{role:alias}, fallback:[alias], caps:{per_task_usd?,per_run_usd?,per_task_tokens?,per_run_tokens?}} ; livre `off` ; roles de regle et alias valides (400) ; STOCKEE, pas encore appliquee",
     "routing": {

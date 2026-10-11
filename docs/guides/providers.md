@@ -45,10 +45,12 @@ the answer is `409 engine_unavailable`.
    you were shown. The consent is tied to the origin **and** the credential reference: change either
    and it stops holding. A project never inherits another scope's consent.
    For the conversations outside any project (the welcome chat, a chat with no `project_slug` and
-   no project cwd), a person allows the instance for those: `PUT /api/chat/llm-consents/{provider_id}`
-   with `{origin}` (same rules; list with `GET /api/chat/llm-consents`, withdraw with `DELETE`).
+   no project cwd), the **root account** allows the instance for those: `PUT /api/chat/llm-consents/{provider_id}`
+   with `{origin}` (same rules; list with `GET /api/chat/llm-consents`, withdraw with `DELETE`; any
+   other person gets `403 root_required`, since it decides for every user's chats). The global pilot
+   role (`PUT /api/chat/roles`) is root-only for the same reason.
    A refused opening says which consent is missing (`403 endpoint_not_allowed`, `consent_scope`:
-   `project` or `no_project`).
+   `project` or `no_project`; none when the endpoint guard refused the URL).
 6. **Open a session** with `provider: "deepseek"`, or set a role (`/api/chat/roles`,
    `/api/projects/{slug}/llm-roles`) so the project uses it by default.
 

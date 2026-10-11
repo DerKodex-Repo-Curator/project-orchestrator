@@ -3897,6 +3897,7 @@ impl ChatManager {
 
     /// Update the explicit Claude CLI binary path.
     pub async fn update_claude_cli_path(&self, path: Option<String>) {
+        super::cli_version::set_configured_cli_path(path.clone());
         self.env_config.write().await.claude_cli_path = path;
         self.claude_cli.forget();
     }
@@ -14275,7 +14276,7 @@ impl ChatManager {
                 code = refusal.code(),
                 "endpoint refused by the guard"
             );
-            return Err(refuse(resolver::ResolveError::NotAllowed(
+            return Err(refuse(resolver::ResolveError::EndpointRefused(
                 provider_id.into(),
             )));
         }
