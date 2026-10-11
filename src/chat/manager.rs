@@ -41,6 +41,9 @@ use uuid::Uuid;
 
 use crate::expand_tilde;
 
+mod recovery;
+pub use recovery::{RecoveryReport, ScanReport};
+
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
 
@@ -3014,6 +3017,12 @@ impl ChatManager {
                 provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
+                // Auto, or two models ticked or more: the user's choice for THIS
+                // conversation, decided at the `auto` stage (decision R-S1).
+                conversation_routes: super::provider::cognitive::conversation_routes(
+                    turn.routing_mode,
+                    turn.routing_pool.as_ref().map_or(0, Vec::len),
+                ),
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
                 moved_in: turn.moved_in,
@@ -3044,6 +3053,11 @@ impl ChatManager {
             {
                 warn!(session_id, error = %error, "turn routing could not change the model");
                 router.forget_change(&before);
+                // The stored decision says the change did not go out (as a refused move).
+                if let Some(decision) = router.decision_of_turn(ctx.turn_index) {
+                    self.record_refused_change(decision, "set_model_failed")
+                        .await;
+                }
             }
         }
     }
@@ -3139,6 +3153,26 @@ impl ChatManager {
         decision.reason = format!("{}; not_moved: {code}", decision.reason);
         if let Err(error) = store.put_decision(&decision).await {
             warn!(decision_id = %decision.id, %error, "the refused move was not recorded on its decision");
+        }
+    }
+
+    /// The decision of a model change that could not be sent says so: not applied, and why.
+    async fn record_refused_change(
+        &self,
+        mut decision: super::provider::cognitive::decision::CognitiveDecision,
+        code: &str,
+    ) {
+        let Some(store) = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.store.clone())
+        else {
+            return;
+        };
+        decision.applied = false;
+        decision.reason = format!("{}; not_changed: {code}", decision.reason);
+        if let Err(error) = store.put_decision(&decision).await {
+            warn!(decision_id = %decision.id, %error, "the refused change was not recorded on its decision");
         }
     }
 
@@ -4678,13 +4712,17 @@ impl ChatManager {
                 }
             }
         }
-        // The agent engine's sessions are live too (their permissions and background
-        // tasks are not tracked here: P11 / P4).
+        // The agent engine's sessions are live too, with the background tasks their
+        // provider reports running (P4); their permissions are not tracked here (P11).
         for handle in self.agent_runtime.handles().await {
             if let Ok(id) = handle.session_id.parse::<Uuid>() {
                 snap.live.insert(id);
                 if handle.is_streaming.load(Ordering::SeqCst) {
                     snap.streaming.insert(id);
+                }
+                let counts = count_background_tasks(&handle.active_background_tasks().await);
+                if counts != (0, 0) {
+                    snap.background_tasks.insert(id, counts);
                 }
             }
         }
@@ -5500,6 +5538,20 @@ impl ChatManager {
         // The menu's ticks, read once: one model ticked is strict, an empty pool is none.
         let settled = request.settled_routing();
         let request = settled.as_ref().unwrap_or(request);
+        // A delegation (an agent caller, a spawned session) follows the settings' stage: it
+        // cannot hand its own routing to PO (decision R-S1). Its Auto or pool is dropped, not
+        // refused: the delegation still opens, routed as a session that asked nothing.
+        let delegated = (request.spawned_by.is_some()
+            && (request.routing_mode.is_some() || request.routing_pool.is_some()))
+        .then(|| {
+            warn!("a delegated session cannot choose its routing: routing_mode and routing_pool dropped");
+            ChatRequest {
+                routing_mode: None,
+                routing_pool: None,
+                ..request.clone()
+            }
+        });
+        let request = delegated.as_ref().unwrap_or(request);
         let session_id = Uuid::new_v4();
         if !request.cwd.trim().is_empty() {
             return self
@@ -12708,6 +12760,15 @@ impl ChatManager {
             || request.run_provider.is_some();
         // The conversation's own mode replaces the settings' (the chat menu: Auto = full).
         let mut settings = settings;
+        // Auto, or two models ticked or more: the user's choice for THIS conversation is
+        // decided at the `auto` stage, whatever the settings' stage (decision R-S1).
+        settings.stage = super::provider::cognitive::conversation_stage(
+            settings.stage,
+            super::provider::cognitive::conversation_routes(
+                request.routing_mode,
+                Self::routing_pool_of(request).map_or(0, <[_]>::len),
+            ),
+        );
         if let Some(mode) = request.routing_mode {
             settings.mode = mode;
         }
@@ -14126,24 +14187,7 @@ impl ChatManager {
                         );
                     }
                 }
-                // The agent engine's sessions, by the same rule: a running turn or a
-                // background task its provider still reports running (P4) keeps it.
-                for handle in manager.agent_runtime.handles().await {
-                    let idle = handle.idle_for();
-                    let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
-                    let background_tasks = handle.active_background_tasks().await.len();
-                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
-                        expired.push(handle.session_id.clone());
-                    } else if idle > timeout {
-                        debug!(
-                            session_id = %handle.session_id,
-                            idle_secs = idle.as_secs(),
-                            is_streaming,
-                            background_tasks,
-                            "Idle agent session kept alive: work still in progress"
-                        );
-                    }
-                }
+                expired.extend(manager.expired_agent_sessions(timeout).await);
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -14153,6 +14197,30 @@ impl ChatManager {
                 }
             }
         });
+    }
+
+    /// The agent engine's sessions the idle cleanup closes, by the rule of the
+    /// Claude Code engine ([`session_is_expired`]): a running turn or a background
+    /// task its provider still reports running (P4) keeps an idle session.
+    async fn expired_agent_sessions(&self, timeout: Duration) -> Vec<String> {
+        let mut expired = Vec::new();
+        for handle in self.agent_runtime.handles().await {
+            let idle = handle.idle_for();
+            let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
+            let background_tasks = handle.active_background_tasks().await.len();
+            if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+                expired.push(handle.session_id.clone());
+            } else if idle > timeout {
+                debug!(
+                    session_id = %handle.session_id,
+                    idle_secs = idle.as_secs(),
+                    is_streaming,
+                    background_tasks,
+                    "Idle agent session kept alive: work still in progress"
+                );
+            }
+        }
+        expired
     }
 
     /// Get the number of currently active sessions, on both engines.
@@ -18484,6 +18552,175 @@ mod tests {
         manager.close_session(&ok).await.unwrap();
     }
 
+    /// A session of the agent engine opened by a first manager, whose last events are `tail`
+    /// (type, data), and a SECOND manager over the same graph: the server after a restart.
+    async fn restarted_with_tail(
+        tail: &[(&str, &str)],
+    ) -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+        Uuid,
+    ) {
+        let (before, graph, _fake) = agent_manager();
+        let created = before
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        let sid = Uuid::parse_str(&created.session_id).unwrap();
+        before.close_session(&created.session_id).await.unwrap();
+        graph.delete_chat_events(sid).await.unwrap();
+        for (i, (event_type, data)) in tail.iter().enumerate() {
+            graph
+                .store_chat_events(
+                    sid,
+                    vec![ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: sid,
+                        seq: i as i64 + 1,
+                        event_type: event_type.to_string(),
+                        data: data.to_string(),
+                        created_at: chrono::Utc::now(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let after = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        (after, graph, fake, sid)
+    }
+
+    #[tokio::test]
+    async fn a_turn_cut_by_a_restart_is_resumed_and_the_model_is_told() {
+        let (manager, _graph, fake, _sid) = restarted_with_tail(&[
+            ("user_message", r#"{"type":"user_message","content":"go"}"#),
+            (
+                "assistant_text",
+                r#"{"type":"assistant_text","content":"I start"}"#,
+            ),
+        ])
+        .await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.scanned, scan.closed, pending.len()), (1, 0, 1));
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!(report.resumed, 1);
+        let turns = fake.state.turns_started.lock().unwrap().clone();
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].starts_with(recovery::RESUME_MARKER),
+            "{}",
+            turns[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_is_not_resumed_at_boot() {
+        let (manager, _graph, fake, _sid) = restarted_with_tail(&[
+            ("user_message", "{}"),
+            ("assistant_text", "{}"),
+            ("result", "{}"),
+        ])
+        .await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.scanned, scan.closed, pending.len()), (1, 0, 0));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_waiting_for_an_answer_is_closed_once_and_not_judged_again() {
+        let (manager, graph, _fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("permission_request", "{}")]).await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.closed, pending.len()), (1, 0));
+        let events = graph.get_chat_events(sid, 0, 50).await.unwrap();
+        assert_eq!(events.last().unwrap().event_type, "error");
+        // The next boot finds it settled.
+        let (_, again) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(again.closed, 0, "closed once");
+    }
+
+    #[tokio::test]
+    async fn a_session_the_user_wrote_to_meanwhile_is_not_resumed_twice() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        graph
+            .store_chat_events(
+                sid,
+                vec![ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: sid,
+                    seq: 3,
+                    event_type: "user_message".into(),
+                    data: "{}".into(),
+                    created_at: chrono::Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(1))
+            .await;
+        assert_eq!((report.resumed, report.skipped), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_recovery_waits_while_the_vault_is_locked_then_resumes() {
+        let (manager, _graph, fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let vault = crate::vault::VaultService::ephemeral();
+        let manager = manager.with_vault(vault.clone());
+        assert!(
+            !vault.is_unlocked(chrono::Utc::now()),
+            "a fresh vault is locked"
+        );
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let manager = Arc::new(manager);
+        let driving = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .drive_recovery(pending, Duration::from_millis(20), Duration::from_secs(10))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            fake.state.turns_started.lock().unwrap().is_empty(),
+            "nothing resumes while the vault is locked"
+        );
+        vault
+            .init("a long passphrase".into(), chrono::Duration::seconds(600))
+            .await
+            .unwrap();
+        let report = driving.await.unwrap();
+        assert_eq!(report.resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_that_waits_for_ever_gives_up_and_says_so() {
+        let (manager, _graph, _fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let manager = manager.with_vault(crate::vault::VaultService::ephemeral());
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(
+                pending,
+                Duration::from_millis(10),
+                Duration::from_millis(60),
+            )
+            .await;
+        assert_eq!((report.resumed, report.abandoned), (0, 1));
+    }
+
     /// A third-party instance (`acp`) a project consented to, played by the fake.
     async fn consented_acp_instance(
         graph: &crate::neo4j::mock::MockGraphStore,
@@ -18792,6 +19029,7 @@ mod tests {
         fake.state.end_turn();
         manager.close_session(&sid).await.unwrap();
     }
+
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
         use nexus_claude::agent::{AgentEvent, StopReason};
@@ -21698,6 +21936,112 @@ mod tests {
         let untouched = graph.get_chat_session(live.id).await.unwrap().unwrap();
         assert_eq!(untouched.message_count, 1, "a live session is its handle's");
         assert_eq!(untouched.total_cost_usd, None);
+    }
+
+    fn native_bg_task(
+        id: &str,
+        kind: nexus_claude::agent::BackgroundTaskKind,
+        status: nexus_claude::agent::BackgroundTaskStatus,
+    ) -> nexus_claude::agent::BackgroundTask {
+        nexus_claude::agent::BackgroundTask {
+            id: id.into(),
+            kind,
+            description: "cargo build".into(),
+            status,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: Some(format!("tool-{id}")),
+            parent: None,
+            pid: None,
+        }
+    }
+
+    /// Adopts a native agent session on a fake provider, idle for `idle`.
+    async fn idle_agent_session(
+        manager: &ChatManager,
+        idle: Duration,
+    ) -> Arc<crate::chat::agent_runtime::AgentSessionHandle> {
+        let provider = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let handle = manager
+            .agent_runtime
+            .adopt(
+                &Uuid::new_v4().to_string(),
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        handle.backdate_activity(idle);
+        handle
+    }
+
+    /// The idle cleanup keeps an agent session whose provider still reports a
+    /// background task running (P4), as it keeps a Claude Code session with one;
+    /// the same idle session with no task left (or only ended ones) is closed,
+    /// and past the hard cap even a busy one is.
+    #[tokio::test]
+    async fn the_idle_cleanup_keeps_an_agent_session_with_a_background_task_running() {
+        use nexus_claude::agent::{BackgroundTaskKind as Kind, BackgroundTaskStatus as Status};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let timeout = Duration::from_secs(60);
+
+        let busy = idle_agent_session(&manager, timeout * 2).await;
+        busy.set_background_tasks(vec![native_bg_task("nt-1", Kind::Shell, Status::Running)])
+            .await;
+        let done = idle_agent_session(&manager, timeout * 2).await;
+        done.set_background_tasks(vec![native_bg_task("nt-2", Kind::Shell, Status::Killed)])
+            .await;
+        let quiet = idle_agent_session(&manager, timeout * 2).await;
+        let fresh = idle_agent_session(&manager, Duration::ZERO).await;
+
+        let mut expired = manager.expired_agent_sessions(timeout).await;
+        expired.sort();
+        let mut want = vec![done.session_id.clone(), quiet.session_id.clone()];
+        want.sort();
+        assert_eq!(expired, want, "busy and fresh sessions are kept");
+        assert!(!expired.contains(&fresh.session_id));
+
+        busy.backdate_activity(timeout * (IDLE_HARD_CAP_FACTOR + 1));
+        assert!(
+            manager
+                .expired_agent_sessions(timeout)
+                .await
+                .contains(&busy.session_id),
+            "past the hard cap, a background task no longer keeps the session"
+        );
+    }
+
+    /// The cockpit's snapshot counts the background tasks an agent session's
+    /// provider reports running, by kind, as it does for a Claude Code session.
+    #[tokio::test]
+    async fn the_live_snapshot_lists_the_background_tasks_of_an_agent_session() {
+        use nexus_claude::agent::{BackgroundTaskKind as Kind, BackgroundTaskStatus as Status};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let busy = idle_agent_session(&manager, Duration::ZERO).await;
+        busy.set_background_tasks(vec![
+            native_bg_task("nt-1", Kind::Shell, Status::Running),
+            native_bg_task("nt-2", Kind::Monitor, Status::Running),
+            native_bg_task("nt-3", Kind::Shell, Status::Running),
+            native_bg_task("nt-4", Kind::Shell, Status::Killed),
+        ])
+        .await;
+        let quiet = idle_agent_session(&manager, Duration::ZERO).await;
+
+        let snap = manager.live_session_snapshot().await;
+        let busy_id: Uuid = busy.session_id.parse().unwrap();
+        let quiet_id: Uuid = quiet.session_id.parse().unwrap();
+        assert!(snap.live.contains(&busy_id) && snap.live.contains(&quiet_id));
+        assert_eq!(
+            snap.background_tasks.get(&busy_id),
+            Some(&(1, 2)),
+            "one monitor, two running commands; the killed one is not counted"
+        );
+        assert_eq!(snap.background_tasks.get(&quiet_id), None);
     }
 
     // ====================================================================
