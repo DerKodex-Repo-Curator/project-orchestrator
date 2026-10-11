@@ -5595,7 +5595,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
         let chat_config = ChatConfig {
-            provider_path: Default::default(),
+            provider_path: crate::chat::config::ProviderPath::Legacy,
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
             nexus_tools_path: None,
             nexus_browser_path: None,
@@ -6200,7 +6200,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = mock_graph.clone();
         let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
         let chat_config = ChatConfig {
-            provider_path: Default::default(),
+            provider_path: crate::chat::config::ProviderPath::Legacy,
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
             nexus_tools_path: None,
             nexus_browser_path: None,

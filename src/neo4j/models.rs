@@ -250,6 +250,12 @@ pub struct ChatSessionNode {
     /// Capability snapshot frozen at open (A4), JSON.
     #[serde(default)]
     pub capabilities: Option<String>,
+    /// Engine the session was opened on, `agent` or `legacy`, written at creation BEFORE
+    /// the provider opens (M2): a resume routes on it, never on whether the capability
+    /// snapshot (a non-fatal write after the open) made it to the graph. Absent on a node
+    /// written before it existed: `ChatSessionNode::opened_on_agent`.
+    #[serde(default)]
+    pub engine: Option<String>,
     /// Opaque provider resume token (A3), JSON.
     #[serde(default)]
     pub resume_token: Option<String>,
@@ -275,6 +281,33 @@ impl ChatSessionNode {
     /// or anyone on a session that has none.
     pub fn answerable_by(&self, sub: &str) -> bool {
         self.owner.as_deref().is_none_or(|owner| owner == sub)
+    }
+
+    /// The `engine` a node is written with (M2).
+    pub const ENGINE_AGENT: &'static str = "agent";
+    /// See [`Self::ENGINE_AGENT`].
+    pub const ENGINE_LEGACY: &'static str = "legacy";
+
+    /// Whether this session was opened on the agent engine, and so resumes there.
+    ///
+    /// The explicit [`Self::engine`] decides, written before the open (M2); any value but
+    /// `agent` is the historical engine. A node written before that field existed is legacy
+    /// unless it carries the capability snapshot only the agent engine stored (the routing
+    /// of its time; a provider other than Claude Code without one stays refused on resume,
+    /// `provider_unavailable`).
+    pub fn opened_on_agent(&self) -> bool {
+        match self.engine.as_deref() {
+            Some(engine) => engine == Self::ENGINE_AGENT,
+            None => self.capabilities.is_some(),
+        }
+    }
+
+    /// Whether the built-in Claude Code serves this session (`provider_id` absent on a
+    /// node written before the harness).
+    pub fn served_by_claude_code(&self) -> bool {
+        self.provider_id
+            .as_deref()
+            .is_none_or(|p| p.is_empty() || p == "claude-code")
     }
 }
 
@@ -3513,6 +3546,7 @@ mod tests {
             provider_id: None,
             routed_by: None,
             capabilities: None,
+            engine: None,
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -3550,6 +3584,7 @@ mod tests {
             provider_id: None,
             routed_by: None,
             capabilities: None,
+            engine: None,
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),

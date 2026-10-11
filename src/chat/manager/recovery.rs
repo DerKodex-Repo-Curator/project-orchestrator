@@ -386,6 +386,7 @@ pub(crate) const MAX_TRANSIENT_RETRIES: u32 = 3;
 /// Why a cut turn of a session recovery does not resume was closed.
 const CLOSED_LEFT_TO_OWNER: &str = "The server restarted while this turn was running. This session is driven by its owner (plan run, pipeline, delegation, or the `Agent` call of a parent session), which relaunches the work itself: it is not resumed here.";
 const CLOSED_LEGACY: &str = "The server restarted while this turn was running, and this session is not resumed automatically: send your message again to continue.";
+const CLOSED_CLAUDE_CODE: &str = "The server restarted while this Claude Code turn was running. It is not resumed without you (it could run tools unattended): send your message again to continue.";
 const CLOSED_STALE: &str = "The server restarted while this turn was running, too long ago to resume it automatically: send your message again to continue.";
 const CLOSED_ABANDONED: &str = "The server restarted while this turn was running, and the vault stayed locked, so it could not be resumed: send your message again.";
 const CLOSED_FAILED: &str = "The server restarted while this turn was running, and the session could not be resumed: send your message again.";
@@ -463,13 +464,17 @@ impl ChatManager {
             if node.updated_at < started - CLOSE_HORIZON {
                 continue;
             }
-            // Not resumed here, closed when cut: a session without a capability snapshot
-            // is a Claude Code CLI session; an owner-managed one (runner, pipeline,
-            // gate-retry, delegation, or a sub-agent of an `Agent` call) is relaunched by
-            // its owner. A `chat(send_message)` sub-session and a trigger-spawned session
-            // have no owner: resumed.
-            let left_alone = if node.capabilities.is_none() {
+            // Not resumed here, closed when cut: a session of the historical engine (the
+            // Claude Code CLI); a Claude Code session of the agent engine, unless this server
+            // was told otherwise (M2: unattended, its CLI could run tools in `acceptEdits` or
+            // `bypassPermissions` with nobody there; kept closed until decided explicitly);
+            // an owner-managed one (runner, pipeline, gate-retry, delegation, or a sub-agent
+            // of an `Agent` call) is relaunched by its owner. A `chat(send_message)`
+            // sub-session and a trigger-spawned session have no owner: resumed.
+            let left_alone = if !node.opened_on_agent() {
                 Some(CLOSED_LEGACY)
+            } else if node.served_by_claude_code() && !self.recovery_resumes_claude_code {
+                Some(CLOSED_CLAUDE_CODE)
             } else if node
                 .spawned_by
                 .as_deref()

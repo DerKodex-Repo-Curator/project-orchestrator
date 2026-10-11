@@ -747,18 +747,21 @@ async fn an_opening_error_names_the_instance_it_happened_on_not_claude_code() {
 
 #[tokio::test]
 async fn a_third_party_runs_on_the_agent_engine_without_any_flag() {
-    // CHAT_PROVIDER_PATH is at its default (`legacy`): a registered instance still opens,
-    // because the agent engine serves third parties by design; only claude-code stays on legacy.
+    // A registered instance opens on the agent engine whatever CHAT_PROVIDER_PATH says (the
+    // agent engine serves third parties by design); here the flag is set to `legacy`, which
+    // only keeps Claude Code on the historical engine.
     let fake = FakeOpenAi::start(script());
     let graph = Arc::new(MockGraphStore::new());
     store_instance(&graph, &instance(&fake, "none")).await;
     consent(&graph, "proj", "local", &fake.origin()).await;
     let state = mock_app_state();
     let dyn_graph: Arc<dyn GraphStore> = graph.clone();
-    let mut config = super::config::ChatConfig::default();
-    assert_eq!(config.provider_path, ProviderPath::Legacy, "the default");
-    config.mcp_server_path = fake_bin("fake_mcp");
-    config.jwt_secret = Some("test-secret-test-secret-test-secret".to_string());
+    let config = super::config::ChatConfig {
+        provider_path: ProviderPath::Legacy,
+        mcp_server_path: fake_bin("fake_mcp"),
+        jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+        ..Default::default()
+    };
     let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
     let created = manager
         .create_session(&request(Some("local"), Some("proj"), "default"))
@@ -6211,6 +6214,167 @@ mod claude_code_resume_token {
     }
 }
 
+/// M2, "no conversation broken by the upgrade": the default engine of Claude Code moved to
+/// the agent engine. A conversation opened on the historical engine BEFORE (no capability
+/// snapshot) is resumed AFTER, by a server on the new default, on the historical engine:
+/// the same CLI session (`--resume`), never handed to the agent engine. The CLI is
+/// `fake_claude`, one transcript per spawn.
+mod legacy_conversation_after_the_switch {
+    use super::*;
+
+    const CLI_SESSION: &str = "legacy-cli-session-1";
+
+    fn turn(answer: &str) -> String {
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": CLI_SESSION,
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": answer}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": CLI_SESSION, "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": answer}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// `fake_claude` behind a wrapper: `--version` probes pass through; spawn `n` plays
+    /// `transcript.<n>.jsonl` and records its argv in `args.<n>.json`.
+    fn wrapper(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = fake_bin("fake_claude");
+        let path = dir.join("claude");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do if [ \"$a\" = \"--version\" ]; then exec \"{fake}\" \"$@\"; fi; done\n\
+             n=$(cat \"{dir}/count\" 2>/dev/null || echo 0)\n\
+             echo $((n+1)) > \"{dir}/count\"\n\
+             FAKE_CLAUDE_TRANSCRIPT=\"{dir}/transcript.$n.jsonl\" \
+             FAKE_CLAUDE_ARGS_OUT=\"{dir}/args.$n.json\" \
+             FAKE_CLAUDE_MAX_RUNTIME_MS=60000 \
+             exec \"{fake}\" \"$@\"\n",
+            fake = fake.display(),
+            dir = dir.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn config(cli: &std::path::Path, path: ProviderPath) -> super::super::config::ChatConfig {
+        super::super::config::ChatConfig {
+            provider_path: path,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            claude_cli_path: Some(cli.display().to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        }
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str, at_least: usize) -> usize {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        let mut n = 0;
+        for _ in 0..400 {
+            n = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if n >= at_least {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn a_legacy_conversation_resumes_on_the_legacy_engine_after_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("transcript.0.jsonl"), turn("before")).unwrap();
+        std::fs::write(dir.path().join("transcript.1.jsonl"), turn("after")).unwrap();
+        let cli = wrapper(dir.path());
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+
+        // Before the upgrade: Claude Code on the historical engine.
+        let before = ChatManager::new_without_memory(
+            dyn_graph.clone(),
+            mock_app_state().meili,
+            config(&cli, ProviderPath::Legacy),
+        );
+        let mut req = request(None, None, "default");
+        req.message = "first".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = before.create_session(&req).await.unwrap().session_id;
+        assert!(
+            !before.agent_runtime.owns(&sid).await,
+            "the historical engine"
+        );
+        assert_eq!(results(&graph, &sid, 1).await, 1, "the first turn answered");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            node.capabilities.is_none(),
+            "no agent snapshot: a legacy session"
+        );
+
+        // After the upgrade: the server runs on the new default, the agent engine.
+        let after = ChatManager::new_without_memory(
+            dyn_graph,
+            mock_app_state().meili,
+            config(&cli, ProviderPath::default()),
+        );
+        assert_eq!(after.config.provider_path, ProviderPath::Agent);
+        after.resume_session(&sid, "second", None).await.unwrap();
+        assert!(
+            !after.agent_runtime.owns(&sid).await,
+            "a legacy conversation stays on the historical engine"
+        );
+        let args = dir.path().join("args.1.json");
+        for _ in 0..200 {
+            if args.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(&args).expect("the CLI respawned"))
+                .unwrap();
+        let argv: Vec<String> = recorded["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect();
+        let at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the same CLI conversation: {argv:?}"));
+        assert_eq!(argv.get(at + 1).map(String::as_str), Some(CLI_SESSION));
+        assert_eq!(
+            results(&graph, &sid, 2).await,
+            2,
+            "the resumed turn answered"
+        );
+        after.close_session(&sid).await.unwrap();
+    }
+}
+
 /// P13: a permission of a legacy Claude Code session granted from ANOTHER instance
 /// (NATS RPC) reaches the CLI as the same `control_response` as a local answer —
 /// subtype, request_id, behavior —, exactly once, while the turn waits for it.
@@ -9185,6 +9349,7 @@ mod permission_scopes {
             routing_mode: None,
             routing_pool: None,
             capabilities: None,
+            engine: None,
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -12601,8 +12766,12 @@ mod native_subagents {
 
         // The server after the restart, over the same graph: neither child is live for it.
         let graph: Arc<dyn GraphStore> = r.graph.clone();
+        // The rig's fake provider answers as `claude-code`; since #726 such a session is
+        // closed at boot unless the server resumes Claude Code. This test is about the
+        // Agent-tool child vs a chat(send_message) child, not that policy.
         let next =
-            ChatManager::new_without_memory(graph, mock_app_state().meili, Default::default());
+            ChatManager::new_without_memory(graph, mock_app_state().meili, Default::default())
+                .resuming_claude_code_at_boot();
         let (pending, scan) = next.scan_interrupted_turns().await.unwrap();
         let resumed: Vec<String> = pending.iter().map(|p| p.node.id.to_string()).collect();
         assert!(

@@ -167,6 +167,8 @@ pub struct MockGraphStore {
     pub plan_third_party_writes: RwLock<HashMap<Uuid, chrono::DateTime<chrono::Utc>>>,
     /// Makes `plan_third_party_written_at` fail (a graph error).
     pub fail_mark_read: std::sync::atomic::AtomicBool,
+    /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
+    pub fail_harness_writes: std::sync::atomic::AtomicBool,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -389,6 +391,7 @@ impl MockGraphStore {
             trigger_reservations: RwLock::new(HashMap::new()),
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
+            fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -8106,6 +8109,12 @@ impl GraphStore for MockGraphStore {
         capabilities: Option<&str>,
         resume_token: Option<&str>,
     ) -> Result<()> {
+        if self
+            .fail_harness_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the capability snapshot write failed");
+        }
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {
             if let Some(c) = capabilities {
