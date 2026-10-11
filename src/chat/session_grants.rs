@@ -89,6 +89,10 @@ const EXACT_TOOLS: &[&str] = &[
     "WebSearch",
 ];
 
+/// The file tools that read where they are pointed (a relative or missing path is the
+/// working directory's): see [`SessionGrants::cwd_bound`].
+const READ_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS", "NotebookRead"];
+
 /// Built-in tools that run a command line (`command`): granted for the identical line when
 /// it only runs [`SAFE_PROGRAMS`].
 const COMMAND_BUILTINS: &[&str] = &["Bash", "Monitor"];
@@ -449,7 +453,8 @@ impl SessionGrant {
                         let extras: Vec<String> = fields
                             .iter()
                             .filter(|(k, _)| k.as_str() != "command")
-                            .map(|(k, v)| format!("{k}={v}"))
+                            // The key as a JSON string too: two inputs never read the same.
+                            .map(|(k, v)| format!("{}={v}", Value::String(k.clone())))
                             .collect();
                         if extras.is_empty() {
                             format!("{tool}: {command}")
@@ -876,7 +881,7 @@ pub async fn cover(grants: &std::sync::Mutex<SessionGrants>, call: &AskedCall) -
                 }
             }
         }
-        if grants.shell_moved && call.is_command() {
+        if grants.cwd_bound(call) {
             return None;
         }
         (grants.lasting.clone()?, grants.read_only_mcp.clone())
@@ -1035,10 +1040,66 @@ impl SessionGrants {
     /// [`lasting_grant_for`] with this session's declared read-only MCP tools; `None` when
     /// the session keeps no lasting rule.
     pub fn lasting_grant_for(&self, call: &AskedCall) -> Option<SessionGrant> {
-        if !self.keeps_lasting(call.asker) {
+        if !self.keeps_lasting(call.asker) || self.cwd_bound(call) {
             return None;
         }
         lasting_grant_with(call, &self.read_only_mcp)
+    }
+
+    /// What an `always` answer to `call` keeps: its lasting grant (`true`), or, when only
+    /// the shell's possible move stands in the way ([`Self::cwd_bound`]), its SESSION grant
+    /// (`false`: the decision then says `session`, nothing is written). `None`: `always`
+    /// is refused, typed.
+    pub fn always_grant(&self, call: &AskedCall) -> Option<(SessionGrant, bool)> {
+        if let Some(grant) = self.lasting_grant_for(call) {
+            return Some((grant, true));
+        }
+        let only_the_move = self.keeps_lasting(call.asker)
+            && self.cwd_bound(call)
+            && lasting_grant_with(call, &self.read_only_mcp).is_some();
+        if only_the_move {
+            return self.grant_for(call).map(|g| (g, false));
+        }
+        None
+    }
+
+    /// Whether, in this session, what `call` touches may depend on the shell's directory,
+    /// which may have left the project's root ([`Self::observe_tool_use`]): then no lasting
+    /// rule answers it, and `always` is neither offered nor kept for it (review of #714,
+    /// A and B). Once the shell moved:
+    /// - a command always depends on it;
+    /// - a file tool (`Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, their `nexus`
+    ///   built-ins) does unless every path it names (`file_path`, `path`, `notebook_path`)
+    ///   is absolute and resolves inside the project's root; a pathless one (`Grep` with
+    ///   no `path` searches the working directory) always does;
+    /// - any other tool (web, a declared MCP tool) does not name a place of the shell.
+    ///
+    /// Applied on both engines alike (the native file tools resolve against a fixed root,
+    /// but one rule is simpler and only ever refuses more).
+    pub fn cwd_bound(&self, call: &AskedCall) -> bool {
+        if !self.shell_moved {
+            return false;
+        }
+        if call.is_command() {
+            return true;
+        }
+        let name = call.nexus_builtin().unwrap_or(call.tool.as_str());
+        if !READ_TOOLS.contains(&name) {
+            return false;
+        }
+        let paths: Vec<&str> = ["file_path", "path", "notebook_path"]
+            .iter()
+            .filter_map(|k| call.input.get(*k).and_then(Value::as_str))
+            .collect();
+        let Some(root) = self.lasting.as_ref().map(|l| l.root().to_path_buf()) else {
+            return true;
+        };
+        paths.is_empty()
+            || paths.iter().any(|p| {
+                let path = std::path::Path::new(p);
+                !path.is_absolute()
+                    || !std::fs::canonicalize(path).is_ok_and(|real| real.starts_with(&root))
+            })
     }
 
     /// A tool call of the session (a `tool_use`, or its resolved input): a command whose
@@ -2463,7 +2524,7 @@ mod tests {
         assert!(lasting_grant_for(&unsandboxed).is_none());
         assert_eq!(
             grant_for(&unsandboxed).unwrap().describe(),
-            "Bash: ls [dangerouslyDisableSandbox=true]"
+            "Bash: ls [\"dangerouslyDisableSandbox\"=true]"
         );
         let sandboxed = call(
             Asker::ClaudeCode,

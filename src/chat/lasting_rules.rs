@@ -339,6 +339,11 @@ impl LastingScope {
             && resolved(&self.cwd).as_ref() == Some(&self.root)
     }
 
+    /// The project's root (canonical) this session's rules are bound to.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn root_text(&self) -> String {
         self.root.display().to_string()
     }
@@ -723,7 +728,23 @@ mod tests {
         let b = keep(&alice, &bash("ls"));
         assert_ne!(a.id, b.id);
         assert_ne!(a.rule, b.rule, "they read differently");
-        assert_eq!(a.rule, "Bash: ls [timeout=5000]");
+        assert_eq!(a.rule, "Bash: ls [\"timeout\"=5000]");
+        // Keys read as JSON strings (review of #714, nit C): a key holding `=` or `, `
+        // never reads like two fields.
+        let forged = AskedCall {
+            input: json!({ "command": "ls", "a=1, b": 2 }),
+            ..bash("ls")
+        };
+        let honest = AskedCall {
+            input: json!({ "command": "ls", "a": 1, "b": 2 }),
+            ..bash("ls")
+        };
+        let read = |c: &AskedCall| {
+            super::super::session_grants::grant_for(c)
+                .unwrap()
+                .describe()
+        };
+        assert_ne!(read(&forged), read(&honest));
         assert!(covered(&alice, &bash("ls")));
         assert!(covered(&alice, &timed));
         assert_eq!(store.rules("alice").len(), 2);
@@ -907,11 +928,13 @@ mod tests {
         use super::super::session_grants::{cover, SessionGrants};
         let (_d, store) = store();
         let alice = scope(&store, "alice", "proj");
+        let inside = project_root(&store).join("notes.txt");
+        std::fs::write(&inside, "n").unwrap();
         let read = AskedCall {
             asker: Asker::ClaudeCode,
             tool: "Read".into(),
             canonical: None,
-            input: json!({ "file_path": "/etc/hosts" }),
+            input: json!({ "file_path": inside.display().to_string() }),
         };
         keep(&alice, &bash("cat README.md"));
         keep(&alice, &read);
@@ -934,5 +957,93 @@ mod tests {
         assert!(grants.lock().unwrap().shell_moved());
         assert!(cover(&grants, &bash("cat README.md")).await.is_none());
         assert!(lasting(cover(&grants, &read).await));
+    }
+
+    /// Review of #714, A and B: once the shell may have moved, `always` is neither offered
+    /// nor kept for a call whose target depends on the working directory (a command, a
+    /// pathless or relative file tool, an absolute path outside the root); an `always`
+    /// answer then keeps a SESSION grant only. A file tool naming an absolute path inside
+    /// the root stays eligible and covered.
+    #[tokio::test]
+    async fn after_the_shell_moved_nothing_that_depends_on_the_cwd_is_offered_kept_or_covered() {
+        use super::super::session_grants::{cover, SessionGrants};
+        let (d, store) = store();
+        let alice = scope(&store, "alice", "proj");
+        let root = project_root(&store);
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let outside = d.path().join("payments.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let tool = |name: &str, input: serde_json::Value| AskedCall {
+            asker: Asker::ClaudeCode,
+            tool: name.into(),
+            canonical: None,
+            input,
+        };
+        let pathless_grep = tool("Grep", json!({ "pattern": "AWS_SECRET" }));
+        let relative_glob = tool("Glob", json!({ "pattern": "**/.env", "path": "sub" }));
+        let outside_read = tool(
+            "Read",
+            json!({ "file_path": outside.display().to_string() }),
+        );
+        let inside_read = tool(
+            "Read",
+            json!({ "file_path": root.join("a.txt").display().to_string() }),
+        );
+        let inside_grep = tool(
+            "Grep",
+            json!({ "pattern": "x", "path": root.display().to_string() }),
+        );
+        for c in [
+            &pathless_grep,
+            &relative_glob,
+            &outside_read,
+            &inside_read,
+            &inside_grep,
+        ] {
+            keep(&alice, c);
+        }
+        let grants =
+            std::sync::Mutex::new(SessionGrants::declaring(Vec::new()).with_lasting(Some(alice)));
+        let lasting = |c: Option<super::super::session_grants::Cover>| c.is_some_and(|c| c.lasting);
+        // Before any move: all covered, all offered.
+        for c in [
+            &pathless_grep,
+            &relative_glob,
+            &outside_read,
+            &inside_read,
+            &inside_grep,
+        ] {
+            assert!(lasting(cover(&grants, c).await), "{:?}", c.input);
+            assert!(grants.lock().unwrap().lasting_grant_for(c).is_some());
+        }
+        grants
+            .lock()
+            .unwrap()
+            .observe_tool_use(&bash("cd /src/payments"));
+        // After: what depends on the cwd is neither covered nor offered; `always` keeps a
+        // session grant only.
+        for c in [
+            &pathless_grep,
+            &relative_glob,
+            &outside_read,
+            &bash("cat README.md"),
+        ] {
+            assert!(cover(&grants, c).await.is_none(), "{:?}", c.input);
+            let g = grants.lock().unwrap();
+            assert!(g.lasting_grant_for(c).is_none(), "{:?}", c.input);
+            assert!(
+                matches!(g.always_grant(c), Some((_, false))),
+                "{:?}: a session grant, never a lasting one",
+                c.input
+            );
+        }
+        // An absolute path inside the root: unchanged.
+        for c in [&inside_read, &inside_grep] {
+            assert!(lasting(cover(&grants, c).await), "{:?}", c.input);
+            assert!(matches!(
+                grants.lock().unwrap().always_grant(c),
+                Some((_, true))
+            ));
+        }
     }
 }

@@ -1462,6 +1462,9 @@ impl AgentSessionHandle {
             .unwrap_or_else(|p| p.into_inner())
             .get(request_id)
             .cloned();
+        // `always` kept as a lasting rule (`false`: as a session grant, the shell having
+        // possibly left the project's root; review of #714, A).
+        let mut for_good = false;
         let grant = match (allow, scope) {
             (false, _) | (true, PermissionAnswerScope::Once) => None,
             (true, PermissionAnswerScope::Session) => {
@@ -1488,13 +1491,16 @@ impl AgentSessionHandle {
                 {
                     return Err(PermissionDeliveryError::ScopeUnsupported(scope));
                 }
-                let grant = asked.as_ref().and_then(|call| {
+                let kept = asked.as_ref().and_then(|call| {
                     self.session_grants
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .lasting_grant_for(call)
+                        .always_grant(call)
                 });
-                Some(grant.ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?)
+                let (grant, lasting) =
+                    kept.ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?;
+                for_good = lasting;
+                Some(grant)
             }
         };
         let decision = if allow {
@@ -1519,14 +1525,17 @@ impl AgentSessionHandle {
         // Kept only now that the provider took the answer.
         let mut kept = scope;
         match (&grant, &asked, scope) {
-            (Some(grant), Some(call), PermissionAnswerScope::Always) => {
+            (Some(grant), Some(call), PermissionAnswerScope::Always) if for_good => {
                 let place = {
                     let mut grants = self
                         .session_grants
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
                     grants.begin_lasting(grant.clone());
-                    grants.lasting_scope()
+                    // The shell may have moved since: then nothing is written.
+                    (!grants.cwd_bound(call))
+                        .then(|| grants.lasting_scope())
+                        .flatten()
                 };
                 let written =
                     super::lasting_rules::keep(place, call, grant, &self.session_id).await;
@@ -1538,11 +1547,15 @@ impl AgentSessionHandle {
                     kept = PermissionAnswerScope::Session;
                 }
             }
-            (Some(grant), _, _) => self
-                .session_grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .add(grant.clone()),
+            (Some(grant), _, _) => {
+                if scope == PermissionAnswerScope::Always {
+                    kept = PermissionAnswerScope::Session;
+                }
+                self.session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .add(grant.clone())
+            }
             (None, _, _) => {}
         }
         self.asked_calls

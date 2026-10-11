@@ -9175,6 +9175,9 @@ impl ChatManager {
                 }
             }
         };
+        // `always` kept as a lasting rule (`false`: as a session grant, the shell having
+        // possibly left the project's root; review of #714, A).
+        let mut for_good = false;
         // How long the approval lasts is the backend's business: `session` is a grant kept
         // here, `always` a lasting rule of the backend (P11b). Never a narrower or wider answer.
         let grant = match (allow, scope) {
@@ -9202,10 +9205,13 @@ impl ChatManager {
                     session_grants
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .lasting_grant_for(&legacy_asked_call(c))
+                        .always_grant(&legacy_asked_call(c))
                 });
                 match grant {
-                    Some(grant) => Some(grant),
+                    Some((grant, lasting)) => {
+                        for_good = lasting;
+                        Some(grant)
+                    }
                     None => {
                         restore_claim(claimed).await;
                         return Err(PermissionDeliveryError::ScopeUnsupported(scope));
@@ -9274,11 +9280,14 @@ impl ChatManager {
         // leaves the call granted for this session, and the decision says `session`.
         let mut kept = scope;
         match (&grant, &claimed, scope) {
-            (Some(grant), Some(c), super::types::PermissionAnswerScope::Always) => {
+            (Some(grant), Some(c), super::types::PermissionAnswerScope::Always) if for_good => {
                 let place = {
                     let mut grants = session_grants.lock().unwrap_or_else(|p| p.into_inner());
                     grants.begin_lasting(grant.clone());
-                    grants.lasting_scope()
+                    // The shell may have moved since: then nothing is written.
+                    (!grants.cwd_bound(&legacy_asked_call(c)))
+                        .then(|| grants.lasting_scope())
+                        .flatten()
                 };
                 let written =
                     super::lasting_rules::keep(place, &legacy_asked_call(c), grant, session_id)
@@ -9291,10 +9300,15 @@ impl ChatManager {
                     kept = super::types::PermissionAnswerScope::Session;
                 }
             }
-            (Some(grant), _, _) => session_grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .add(grant.clone()),
+            (Some(grant), _, _) => {
+                if scope == super::types::PermissionAnswerScope::Always {
+                    kept = super::types::PermissionAnswerScope::Session;
+                }
+                session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .add(grant.clone())
+            }
             (None, _, _) => {}
         }
 

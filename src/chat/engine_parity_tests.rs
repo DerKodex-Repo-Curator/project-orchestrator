@@ -2795,6 +2795,96 @@ async fn the_scenario() {
     wn.settle(ends, &manager).await;
     manager.set_auto_continue(&nid, false).await.unwrap();
 
+    // `always` (P11b): offered to a person's session on a project, kept by the BACKEND (the
+    // identical call is still asked by nexus, and answered from the lasting rule).
+    let offers_always = match &wn.system_init().await {
+        Some(ChatEvent::SystemInit { capabilities, .. }) => capabilities
+            .as_ref()
+            .and_then(|c| c.get("permission_scopes").cloned())
+            .is_some_and(|s| s.to_string().contains("always")),
+        _ => false,
+    };
+    std::fs::write(stage.dir.path().join("always.txt"), "ALWAYS-ONE").unwrap();
+    let (_, granted_always) = Box::pin(native_grant(
+        &manager,
+        &wn,
+        &fake,
+        kn.k("TURN-ALWAYS"),
+        "cat always.txt",
+        "answered always",
+        crate::chat::types::PermissionAnswerScope::Always,
+    ))
+    .await;
+    na_sent += 1;
+    let ends = wn.turn_ends();
+    manager
+        .send_message(&nid, &kn.k("TURN-ALWAYS2"))
+        .await
+        .unwrap();
+    na_sent += 1;
+    // The identical call is asked by nexus again (no rule was handed to it): wait for that
+    // second request, answered by the backend or left to the user.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let mut asked_always = wn.permission_ids("cat always.txt").await;
+    while asked_always.len() < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        asked_always = wn.permission_ids("cat always.txt").await;
+    }
+    // Leave the backend a moment to answer it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events = wn.all().await;
+    let always_by_backend = asked_always.len() == 2
+        && events.iter().any(|e| {
+            matches!(e, ChatEvent::PermissionDecision { id, scope: Some(s), .. }
+                if *id == asked_always[1]
+                    && *s == crate::chat::types::PermissionAnswerScope::Always)
+        });
+    for id in asked_always.iter().skip(1).filter(|_| !always_by_backend) {
+        let _ = manager
+            .route_permission_response(
+                &nid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
+    let ran_always = wait_body_nth(&fake, &kn.k("TURN-ALWAYS2"), 1, WAIT)
+        .await
+        .is_some();
+    wn.said(WAIT, "answered always two").await;
+    wn.settle(ends, &manager).await;
+    let na_kept = lasting_rules_of(&manager, "mcp__nexus__Bash: cat always.txt");
+    // Measured BEFORE this session runs a command that may move its shell (`echo
+    // FIVE-$((1+1))` below): from then on `always` is neither offered nor kept for a
+    // command here (review of #714, A). The identical call is answered by the backend in
+    // this session, and the next session of the person in the project's root is too.
+    let next_session = Box::pin(next_session_covers(
+        &manager,
+        &cwd,
+        crate::chat::session_grants::Asker::Native,
+        "mcp__nexus__Bash",
+        Some("Bash"),
+        "cat always.txt",
+    ))
+    .await;
+    na.check(
+        "permissions.always",
+        offers_always
+            && granted_always
+            && ran_always
+            && always_by_backend
+            && na_kept
+            && next_session,
+        Cause::Harness,
+        format!(
+            "portée offerte={offers_always}, accordée={granted_always}, règle gardée pour la \
+             personne et la racine du projet={na_kept}, appel identique répondu par le backend \
+             (always)={always_by_backend}, couvre la session suivante={next_session}"
+        ),
+    );
+
     // set_model, then a permission answered once.
     manager.set_session_model(&nid, "m2").await.unwrap();
     let changed = wn
@@ -2904,92 +2994,6 @@ async fn the_scenario() {
     );
     wn.said(WAIT, "answered perm3").await;
     wn.settle(ends, &manager).await;
-
-    // `always` (P11b): offered to a person's session on a project, kept by the BACKEND (the
-    // identical call is still asked by nexus, and answered from the lasting rule).
-    let offers_always = match &wn.system_init().await {
-        Some(ChatEvent::SystemInit { capabilities, .. }) => capabilities
-            .as_ref()
-            .and_then(|c| c.get("permission_scopes").cloned())
-            .is_some_and(|s| s.to_string().contains("always")),
-        _ => false,
-    };
-    std::fs::write(stage.dir.path().join("always.txt"), "ALWAYS-ONE").unwrap();
-    let (_, granted_always) = Box::pin(native_grant(
-        &manager,
-        &wn,
-        &fake,
-        kn.k("TURN-ALWAYS"),
-        "cat always.txt",
-        "answered always",
-        crate::chat::types::PermissionAnswerScope::Always,
-    ))
-    .await;
-    na_sent += 1;
-    let ends = wn.turn_ends();
-    manager
-        .send_message(&nid, &kn.k("TURN-ALWAYS2"))
-        .await
-        .unwrap();
-    na_sent += 1;
-    // The identical call is asked by nexus again (no rule was handed to it): wait for that
-    // second request, answered by the backend or left to the user.
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let mut asked_always = wn.permission_ids("cat always.txt").await;
-    while asked_always.len() < 2 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        asked_always = wn.permission_ids("cat always.txt").await;
-    }
-    // Leave the backend a moment to answer it.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let events = wn.all().await;
-    let always_by_backend = asked_always.len() == 2
-        && events.iter().any(|e| {
-            matches!(e, ChatEvent::PermissionDecision { id, scope: Some(s), .. }
-                if *id == asked_always[1]
-                    && *s == crate::chat::types::PermissionAnswerScope::Always)
-        });
-    for id in asked_always.iter().skip(1).filter(|_| !always_by_backend) {
-        let _ = manager
-            .route_permission_response(
-                &nid,
-                id,
-                true,
-                crate::chat::types::PermissionAnswerScope::Once,
-                false,
-            )
-            .await;
-    }
-    let ran_always = wait_body_nth(&fake, &kn.k("TURN-ALWAYS2"), 1, WAIT)
-        .await
-        .is_some();
-    wn.said(WAIT, "answered always two").await;
-    wn.settle(ends, &manager).await;
-    let na_kept = lasting_rules_of(&manager, "mcp__nexus__Bash: cat always.txt");
-    // This session's shell ran commands that may have moved it (`echo FIVE-$((1+1))`...):
-    // the backend no longer answers a COMMAND from a lasting rule here (review of #714, S2),
-    // the identical call was asked. The next session of the person in the project's root
-    // is answered: measured on what it obeys (its lasting scope, read at each request).
-    let moved_here = !always_by_backend;
-    let next_session = Box::pin(next_session_covers(
-        &manager,
-        &cwd,
-        crate::chat::session_grants::Asker::Native,
-        "mcp__nexus__Bash",
-        Some("Bash"),
-        "cat always.txt",
-    ))
-    .await;
-    na.check(
-        "permissions.always",
-        offers_always && granted_always && ran_always && na_kept && next_session,
-        Cause::Harness,
-        format!(
-            "portée offerte={offers_always}, accordée={granted_always}, règle gardée pour la \
-             personne et la racine du projet={na_kept}, couvre la session suivante={next_session} \
-             (dans cette session, shell possiblement déplacé : redemandé={moved_here})"
-        ),
-    );
 
     // cancel_tools.
     let ends = wn.turn_ends();
