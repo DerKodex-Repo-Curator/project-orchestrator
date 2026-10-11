@@ -558,7 +558,7 @@ fn server_examples() -> Vec<ServerExample> {
                 ),
                 policy_mode: Some(s("ask")),
                 engine: Some(s("agent")),
-                degraded_features: Some(vec![s("hooks"), s("message_queue")]),
+                degraded_features: Some(vec![s("hooks"), s("subagents")]),
             },
             ChatEvent::SystemInit {
                 cli_session_id: s("cli-session-0001"),

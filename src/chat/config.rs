@@ -246,11 +246,12 @@ pub const PERMISSION_RULES_DIR_VAR: &str = "CHAT_PERMISSION_RULES_DIR";
 
 /// Engine that drives Claude Code sessions (decision A18 / task B38).
 ///
-/// Routing is HYBRID: Claude Code stays on the historical engine (hooks, message
-/// queue, auto-continue, retry, compaction, NATS, images) by default, and every
-/// third-party provider is served by the agent engine whatever this says.
-/// `Agent` only FORCES Claude Code onto the agent engine, to try it: the session
-/// then says what it lost (`system_init.degraded_features`) and the server logs it.
+/// Routing is HYBRID: every third-party provider is served by the agent engine
+/// whatever this says; Claude Code stays on the historical engine by default, and
+/// `Agent` puts it on the agent engine too. That engine ports hooks, message queue,
+/// auto-continue, retry, compaction and NATS (`agent_runtime::degraded_features`):
+/// what a session still lacks is in its `system_init.degraded_features`, and the
+/// server logs it for a Claude Code session (`manager::forced_engine_warning`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProviderPath {
     /// The historical path: `InteractiveClient` straight on the Claude CLI.

@@ -894,9 +894,10 @@ pub enum ChatEvent {
         /// `legacy` (the historical Claude Code engine). Absent on an old frame.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         engine: Option<String>,
-        /// What this session does NOT do: hooks, message queue, auto-continue,
-        /// compaction, NATS fan-out, enrichment, images (the ones the engine or
-        /// the provider lacks). Empty on the legacy engine.
+        /// What this session does NOT do, as feature ids (`hooks`, `compaction`, `images`,
+        /// `subagents`, `project_orchestrator_tools`, `nexus_tools`...: what the provider,
+        /// the model or the installation lacks; `agent_runtime::degraded_features`,
+        /// `kind_degraded`, `manager::host_degraded`). Empty on the legacy engine.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         degraded_features: Option<Vec<String>>,
     },

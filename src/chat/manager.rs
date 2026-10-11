@@ -2608,6 +2608,19 @@ pub(crate) fn host_degraded(
     missing
 }
 
+/// The warning the server logs when a Claude Code session runs on the agent engine and
+/// lacks something (`degraded`, what its `system_init` announces): `None` for another
+/// provider, and `None` when nothing is missing — the old warning listed nothing and
+/// still said "these features are NOT available" (M2, gap D1 of M0).
+pub(crate) fn forced_engine_warning(provider_id: &str, degraded: &[String]) -> Option<String> {
+    (provider_id == super::provider::resolver::CLAUDE_CODE && !degraded.is_empty()).then(|| {
+        format!(
+            "Claude Code is running on the agent engine without: {}",
+            degraded.join(", ")
+        )
+    })
+}
+
 /// Whether `spec` carries the project-orchestrator server WITHOUT a session token while
 /// the server signs its tokens (`signing`): that server shows its tools and authorises
 /// none ([`spec_tool_profile`]). A session opened without its caller's identity (the
@@ -6550,9 +6563,10 @@ impl ChatManager {
 
         // The provider-neutral path takes over here: the session is persisted
         // and the system prompt built; what follows is the Claude CLI engine.
-        // Hybrid routing: Claude Code stays on the historical engine (hooks,
-        // queue, retry, compaction, NATS, images) unless the operator FORCES it
-        // onto the agent engine; every other provider is served by the agent engine.
+        // Hybrid routing: every provider but Claude Code is served by the agent engine;
+        // Claude Code stays on the historical engine unless `CHAT_PROVIDER_PATH=agent`
+        // (`engine_is_agent`). The agent engine ports hooks, queue, auto-continue,
+        // retry, compaction and NATS: what a session lacks is in its `system_init`.
         if self.engine_is_agent(&provider_choice.provider_id) {
             return self
                 .open_agent_session(AgentOpen {
@@ -13141,15 +13155,13 @@ impl ChatManager {
             || self.config.provider_path == super::config::ProviderPath::Agent
     }
 
-    /// The visible warning when Claude Code is FORCED onto the agent engine
-    /// (`CHAT_PROVIDER_PATH=agent`): the server logs what that session loses.
-    fn warn_if_forced(&self, provider_id: &str, session: &dyn nexus_claude::agent::AgentSession) {
-        if provider_id == super::provider::resolver::CLAUDE_CODE {
-            warn!(
-                features = ?super::agent_runtime::degraded_features(session.capabilities()),
-                "Claude Code is running on the AGENT engine (CHAT_PROVIDER_PATH=agent): \
-                 these features are NOT available for this session"
-            );
+    /// The server's warning when a Claude Code session on the agent engine lacks
+    /// something (`degraded`: the full list its `system_init` announces). Silent when it
+    /// lacks nothing: the engine ports hooks, queue, auto-continue, retry, compaction and
+    /// NATS, so a local Claude Code loses none of them ([`forced_engine_warning`]).
+    fn warn_if_forced(&self, provider_id: &str, degraded: &[String]) {
+        if let Some(message) = forced_engine_warning(provider_id, degraded) {
+            warn!(features = ?degraded, "{message}");
         }
     }
 
@@ -14945,13 +14957,26 @@ impl ChatManager {
         session: Arc<dyn nexus_claude::agent::AgentSession>,
         first_seq: i64,
         tool_policy: serde_json::Value,
-        host_missing: Vec<String>,
+        mut host_missing: Vec<String>,
         without_mcp: bool,
         project_dir: Option<std::path::PathBuf>,
         lasting: Option<super::lasting_rules::LastingScope>,
         resumed: bool,
     ) {
-        self.warn_if_forced(provider_id, session.as_ref());
+        // What the provider's kind tells beyond its capabilities (an unknown window on
+        // the native harness, no sub-agents and no fallback).
+        for feature in super::agent_runtime::kind_degraded(kind, session.capabilities()) {
+            if !host_missing.contains(&feature) {
+                host_missing.push(feature);
+            }
+        }
+        let mut announced = super::agent_runtime::degraded_features(session.capabilities());
+        for feature in &host_missing {
+            if !announced.contains(feature) {
+                announced.push(feature.clone());
+            }
+        }
+        self.warn_if_forced(provider_id, &announced);
         if let Some(router) = self.turn_routing.get(session_id) {
             router.set_model_live(session.capabilities().set_model_live);
         }
@@ -22018,7 +22043,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
             .with_provider_source(Arc::new(fake.clone()));
         // The Claude CLI is not there in tests: the call may fail, but it must
-        // NOT have gone through the agent engine (which has no hooks, queue, retry...).
+        // NOT have gone through the agent engine: the default keeps Claude Code legacy.
         let _ = manager.create_session(&agent_request("hello")).await;
         assert_eq!(manager.agent_runtime.len().await, 0);
         assert!(
@@ -22125,6 +22150,81 @@ mod tests {
         assert!(
             degraded.iter().any(|d| d == "images") && degraded.iter().any(|d| d == "compaction")
         );
+    }
+
+    /// M2, gaps D2 and D3 of M0: what the provider's KIND tells beyond its capabilities
+    /// reaches the `system_init`, not only a line in the server's log.
+    #[tokio::test]
+    async fn the_agent_system_init_says_compaction_and_subagents_where_nothing_provides_them() {
+        use nexus_claude::agent::{
+            ContextWindow, ContextWindowSource, ProviderKind, SubagentSupport,
+        };
+        let listed = |wire: &serde_json::Value, feature: &str| {
+            serde_json::from_value::<Vec<String>>(wire["degraded_features"].clone())
+                .unwrap_or_default()
+                .iter()
+                .any(|d| d == feature)
+        };
+        // A native model whose window nobody knows: it claims a compaction signal, and the
+        // harness never compacts (no window to compact against).
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = ProviderKind::Native;
+        fake.caps.lock().unwrap().compaction_signal = true;
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(listed(&wire, "compaction"), "{wire}");
+        assert!(
+            !listed(&wire, "subagents"),
+            "the host runs them as child sessions: {wire}"
+        );
+        // ...the same model with a known window compacts: nothing announced.
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = ProviderKind::Native;
+        {
+            let mut caps = fake.caps.lock().unwrap();
+            caps.compaction_signal = true;
+            caps.context_window = Some(ContextWindow {
+                value: 128_000,
+                source: ContextWindowSource::Probed,
+            });
+        }
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(!listed(&wire, "compaction"), "{wire}");
+        // An ACP agent: no sub-agents of its own, and no fallback for it.
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = ProviderKind::Acp;
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(listed(&wire, "subagents"), "{wire}");
+        // Claude Code reports its own (nested): nothing announced.
+        let (manager, _graph, fake) = agent_manager();
+        {
+            let mut caps = fake.caps.lock().unwrap();
+            caps.subagents = SubagentSupport::Nested;
+            caps.compaction_signal = true;
+        }
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert!(
+            !listed(&wire, "subagents") && !listed(&wire, "compaction"),
+            "{wire}"
+        );
+    }
+
+    /// M2, gap D1 of M0: the warning of a Claude Code session on the agent engine names
+    /// what it lacks, and is not logged when it lacks nothing.
+    #[test]
+    fn the_engine_warning_is_silent_when_a_claude_code_session_lacks_nothing() {
+        assert_eq!(
+            forced_engine_warning(crate::chat::provider::resolver::CLAUDE_CODE, &[]),
+            None
+        );
+        let warning = forced_engine_warning(
+            crate::chat::provider::resolver::CLAUDE_CODE,
+            &["hooks".to_string()],
+        )
+        .expect("something is missing");
+        assert!(warning.contains("hooks"), "{warning}");
+        // Another provider is always on the agent engine: no warning of its own.
+        assert_eq!(forced_engine_warning("local", &["hooks".to_string()]), None);
     }
 
     #[test]
