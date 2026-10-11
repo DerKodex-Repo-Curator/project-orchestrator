@@ -596,12 +596,18 @@ impl AgentSessionHandle {
         let Some((covered, rule)) = covered else {
             return;
         };
-        // On the tool clock BEFORE the provider has it, as for an answer of the user.
+        // On the tool clock BEFORE the provider has it, as for an answer of the user,
+        // and handed over alone among the answers to this request.
+        let answering = self.tool_clock.answering(&covered).await;
         let mark = self.tool_clock.decided(&covered, true, chrono::Utc::now());
         let answered = self
             .session
             .answer_permission(&covered, PermissionDecision::allow_once())
             .await;
+        if answered.is_err() {
+            self.tool_clock.undecided(&covered, mark);
+        }
+        drop(answering);
         match answered {
             Ok(()) => {
                 self.asked_calls
@@ -619,7 +625,6 @@ impl AgentSessionHandle {
             }
             // Left waiting: the user answers it.
             Err(e) => {
-                self.tool_clock.undecided(&covered, mark);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %e,
@@ -1090,7 +1095,10 @@ impl AgentSessionHandle {
                 Ok(opened) => turn = opened,
                 Err(error) => {
                     let event = AgentEvent::Error { error };
-                    for chat_event in self.mapper.lock().await.map(&event) {
+                    // Mapped under the lock, emitted without it (the cockpit's snapshot
+                    // reads the mapper).
+                    let chat_events = self.mapper.lock().await.map(&event);
+                    for chat_event in chat_events {
                         self.emit(chat_event).await;
                     }
                 }
@@ -1229,7 +1237,8 @@ impl AgentSessionHandle {
             {
                 // The turn ends as any stopped turn does: on its terminal event.
                 let stopped = interrupted_done();
-                for chat_event in self.mapper.lock().await.map(&stopped) {
+                let chat_events = self.mapper.lock().await.map(&stopped);
+                for chat_event in chat_events {
                     self.emit(chat_event).await;
                 }
                 break;
@@ -1238,7 +1247,8 @@ impl AgentSessionHandle {
                 Ok(next) => stream = next,
                 Err(e) => {
                     let ev = AgentEvent::Error { error: e };
-                    for chat_event in self.mapper.lock().await.map(&ev) {
+                    let chat_events = self.mapper.lock().await.map(&ev);
+                    for chat_event in chat_events {
                         self.emit(chat_event).await;
                     }
                     break;
@@ -1446,7 +1456,9 @@ impl AgentSessionHandle {
         // On the tool clock BEFORE the provider has it: a fast tool's result cannot
         // overtake it.
         // A second answer (double click, two tabs) the provider refuses takes back
-        // only its own mark, never the first answer's.
+        // only its own mark, never the first answer's; and it waits until the first
+        // was handed over, so the provider gets them in the order the clock kept.
+        let answering = self.tool_clock.answering(request_id).await;
         let mark = self
             .tool_clock
             .decided(request_id, allow, chrono::Utc::now());
@@ -1454,6 +1466,7 @@ impl AgentSessionHandle {
             self.tool_clock.undecided(request_id, mark);
             return Err(PermissionDeliveryError::Failed(anyhow::Error::new(e)));
         }
+        drop(answering);
         if let Some(grant) = &grant {
             self.session_grants
                 .lock()
@@ -2036,6 +2049,8 @@ pub(crate) mod fake {
         /// When set, `answer_permission` waits for this signal before it returns: the
         /// provider is slow to take the answer.
         pub hold_answers: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        /// The same, for the answers that allow only (a denial is taken at once).
+        pub hold_allows: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl FakeState {
@@ -2117,6 +2132,10 @@ pub(crate) mod fake {
         ) -> Result<(), ProviderError> {
             let hold = self.state.hold_answers.lock().unwrap().clone();
             if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            let hold_allow = self.state.hold_allows.lock().unwrap().clone();
+            if let (Some(hold), PermissionDecision::Allow { .. }) = (hold_allow, &decision) {
                 hold.notified().await;
             }
             let mut answers = self.state.permission_answers.lock().unwrap();
@@ -3910,6 +3929,91 @@ mod tool_timing_tests {
             1,
             "one timing per call: {types:?}"
         );
+    }
+
+    /// Two answers at once (allow in one tab, deny in another): the provider is slow
+    /// to take the allow, the deny would overtake it. The deny waits until the allow
+    /// was handed over, so the clock's outcome is the one the provider took.
+    #[tokio::test]
+    async fn two_answers_at_once_reach_the_provider_in_the_order_the_clock_keeps() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "req-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: Some("t1".into()),
+            })
+            .await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_allows.lock().unwrap() = Some(Arc::clone(&hold));
+        let allow = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("req-1", true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let deny = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("req-1", false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        hold.notify_one();
+        let _ = allow.await.unwrap();
+        let _ = deny.await.unwrap();
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: json!("a.rs"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+
+        let taken = provider.state.permission_answers.lock().unwrap().clone();
+        assert_eq!(taken.len(), 1, "one answer taken: {taken:?}");
+        let taken = match &taken[0].1 {
+            PermissionDecision::Allow { .. } => "allowed",
+            PermissionDecision::Deny { .. } => "denied",
+            other => panic!("an answer of another kind: {other:?}"),
+        };
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let timing = stored
+            .iter()
+            .find(|r| r.event_type == "tool_timing")
+            .expect("a timing");
+        let timing: serde_json::Value = serde_json::from_str(&timing.data).unwrap();
+        assert_eq!(timing["permission_outcome"], taken, "{timing}");
+        assert_eq!(taken, "allowed", "the first answer is the one handed over");
     }
 
     /// A double click (or two tabs): the provider refuses the second answer to the

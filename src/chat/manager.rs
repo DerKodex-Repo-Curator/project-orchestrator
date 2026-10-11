@@ -7608,7 +7608,7 @@ impl ChatManager {
                                                     // Regular permission: store original input for later response
                                                     if !id.is_empty() {
                                                         store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
-                                                        if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
+                                                        if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, &tool_clock, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
                                                             record_decision(decision.clone(), &mut events_to_persist, &next_seq);
                                                             granted_decision = Some(decision);
                                                         }
@@ -7676,7 +7676,7 @@ impl ChatManager {
                                                     } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                         if !id.is_empty() {
                                                             store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
-                                                        if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
+                                                        if let Some(decision) = answer_granted_request(&session_grants, &pending_perm_inputs, &tool_clock, stdin_tx_for_auto_allow.as_ref(), id, tool, input).await {
                                                             record_decision(decision.clone(), &mut events_to_persist, &next_seq);
                                                             granted_decision = Some(decision);
                                                         }
@@ -8968,6 +8968,11 @@ impl ChatManager {
         //   Deny:  { behavior: "deny",  message: <string> }
         // The `updatedInput` field REPLACES the original tool input in the CLI, so we
         // MUST pass back the original input — an empty {} would erase command/file_path/etc.
+        // The answers to one request are handed over one at a time, from the claim to the
+        // end of the write (`ToolClock::answering`): the CLI gets them in the order the
+        // tool clock kept them.
+        let tool_clock = super::tool_clock::ToolClock::for_session(session_id);
+        let answering = tool_clock.answering(request_id).await;
         let claimed = pending_perm_inputs.lock().await.remove(request_id);
         if require_pending && claimed.is_none() {
             return Err(PermissionDeliveryError::NotPending);
@@ -9060,7 +9065,6 @@ impl ChatManager {
         );
 
         // On the tool clock BEFORE the CLI has it: a fast tool's result cannot overtake it.
-        let tool_clock = super::tool_clock::ToolClock::for_session(session_id);
         let mark = tool_clock.decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = stdin_tx.send(json).await {
             tool_clock.undecided(request_id, mark);
@@ -9070,6 +9074,7 @@ impl ChatManager {
                 e
             )));
         }
+        drop(answering);
         if let Some(grant) = &grant {
             session_grants
                 .lock()
@@ -14768,10 +14773,12 @@ async fn store_pending_perm_input(
 /// A permission request of the CLI the session's grants cover (`chat::session_grants`):
 /// answered here, once, with its original input; the request leaves the pending map.
 /// Returns the decision to record, `None` when nothing covers it or the write failed
-/// (the user is then asked as usual).
+/// (the user is then asked as usual). The answer is on the session's tool clock before
+/// the CLI has it, taken back when the write fails, as for an answer of the user.
 async fn answer_granted_request(
     grants: &std::sync::Mutex<super::session_grants::SessionGrants>,
     pending: &tokio::sync::Mutex<std::collections::HashMap<String, PendingPermission>>,
+    clock: &super::tool_clock::ToolClock,
     stdin_tx: Option<&tokio::sync::mpsc::Sender<String>>,
     id: &str,
     tool: &str,
@@ -14801,11 +14808,15 @@ async fn answer_granted_request(
     // Claimed before the write, like an answer of the user: whoever claims first answers,
     // never two answers to one request (a request already claimed is left alone). Given
     // back if the write fails: the request then still waits for the user.
+    let answering = clock.answering(id).await;
     let claimed = pending.lock().await.remove(id)?;
+    let mark = clock.decided(id, true, chrono::Utc::now());
     if tx.send(line).await.is_err() {
+        clock.undecided(id, mark);
         pending.lock().await.insert(id.to_string(), claimed);
         return None;
     }
+    drop(answering);
     info!(request_id = %id, rule = %grant.describe(), "permission covered by a session grant: answered by the backend");
     Some(ChatEvent::PermissionDecision {
         id: id.to_string(),
@@ -28236,5 +28247,135 @@ mod image_turn_services_tests {
             "{}",
             stored[0].reason
         );
+    }
+}
+
+/// The backend's own answer to a request a session grant covers is on the tool clock
+/// like an answer of the user (Claude Code engine).
+#[cfg(test)]
+mod granted_answer_clock_tests {
+    use super::super::session_grants::{AskedCall, Asker, SessionGrants};
+    use super::super::tool_clock::ToolClock;
+    use super::*;
+    use serde_json::json;
+
+    fn granted() -> std::sync::Mutex<SessionGrants> {
+        let mut grants = SessionGrants::default();
+        let grant = grants
+            .grant_for(&AskedCall {
+                asker: Asker::ClaudeCode,
+                tool: "Read".into(),
+                canonical: None,
+                input: json!({"file_path": "/w/a.rs"}),
+            })
+            .expect("a Read can be granted for the session");
+        grants.add(grant);
+        std::sync::Mutex::new(grants)
+    }
+
+    fn asked(
+        clock: &ToolClock,
+        pending: &mut std::collections::HashMap<String, PendingPermission>,
+    ) {
+        clock.observe(
+            &ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Read".into(),
+                input: json!({"file_path": "/w/a.rs"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            },
+            chrono::Utc::now(),
+        );
+        clock.observe(
+            &ChatEvent::PermissionRequest {
+                id: "req-1".into(),
+                tool: "Read".into(),
+                input: json!({"file_path": "/w/a.rs"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: Some("t1".into()),
+            },
+            chrono::Utc::now(),
+        );
+        pending.insert(
+            "req-1".into(),
+            PendingPermission {
+                input: json!({"file_path": "/w/a.rs"}),
+                tool: "Read".into(),
+            },
+        );
+    }
+
+    fn timing(clock: &ToolClock) -> serde_json::Value {
+        let event = clock
+            .observe(
+                &ChatEvent::ToolResult {
+                    id: "t1".into(),
+                    result: json!("fn main() {}"),
+                    is_error: false,
+                    parent_tool_use_id: None,
+                },
+                chrono::Utc::now(),
+            )
+            .expect("a timing");
+        serde_json::to_value(event).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_answer_of_the_backend_is_on_the_clock_before_the_cli_has_it() {
+        let clock = ToolClock::default();
+        let mut pending = std::collections::HashMap::new();
+        asked(&clock, &mut pending);
+        let pending = tokio::sync::Mutex::new(pending);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let decision = answer_granted_request(
+            &granted(),
+            &pending,
+            &clock,
+            Some(&tx),
+            "req-1",
+            "Read",
+            &json!({"file_path": "/w/a.rs"}),
+        )
+        .await;
+        assert!(decision.is_some(), "the grant answers it");
+        assert!(rx.try_recv().unwrap().contains("req-1"), "the CLI got it");
+        let t = timing(&clock);
+        assert_eq!(t["permission_outcome"], "allowed", "{t}");
+        assert!(t["permission_resolved_at"].is_f64(), "{t}");
+        assert_eq!(t["run_started_at"], t["permission_resolved_at"], "{t}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_of_the_backend_the_cli_never_got_is_taken_back() {
+        let clock = ToolClock::default();
+        let mut pending = std::collections::HashMap::new();
+        asked(&clock, &mut pending);
+        let pending = tokio::sync::Mutex::new(pending);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
+        drop(rx);
+        let decision = answer_granted_request(
+            &granted(),
+            &pending,
+            &clock,
+            Some(&tx),
+            "req-1",
+            "Read",
+            &json!({"file_path": "/w/a.rs"}),
+        )
+        .await;
+        assert!(decision.is_none(), "the write failed");
+        assert!(
+            pending.lock().await.contains_key("req-1"),
+            "still waits for the user"
+        );
+        // The user answers it afterwards: that answer is the one on the clock.
+        let at = chrono::Utc::now();
+        assert!(clock.decided("req-1", false, at).is_some(), "pending again");
+        let t = timing(&clock);
+        assert_eq!(t["permission_outcome"], "denied", "{t}");
     }
 }
