@@ -5256,6 +5256,45 @@ impl ChatManager {
         Vec::new()
     }
 
+    /// `dirs` clamped to what `parent_session_id` could already see when it was
+    /// itself opened — its `cwd` and its `add_dirs` as STORED (frozen at its own
+    /// creation, never re-resolved) (P18b, fix 1). Called only for a request whose
+    /// `spawned_by` names a parent: a workspace added a project after the parent
+    /// opened must not widen what a later child of that parent is handed, even
+    /// though the workspace itself is validly inherited. A parent that cannot be
+    /// read grants nothing: refusing a directory is recoverable, leaking one is not.
+    async fn clamp_spawned_add_dirs(
+        &self,
+        dirs: Vec<String>,
+        parent_session_id: &str,
+    ) -> Vec<String> {
+        let roots = match Uuid::parse_str(parent_session_id) {
+            Ok(parent_uuid) => match self.graph.get_chat_session(parent_uuid).await {
+                Ok(Some(parent)) => {
+                    let mut roots = vec![parent.cwd];
+                    roots.extend(parent.add_dirs.unwrap_or_default());
+                    roots
+                }
+                _ => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+        let dropped: Vec<&String> = dirs
+            .iter()
+            .filter(|d| !roots.iter().any(|r| super::envelope::is_within(r, d)))
+            .collect();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                parent = %parent_session_id,
+                dropped = ?dropped,
+                "a spawned session's resolved add_dirs widened past its parent's roots; dropped"
+            );
+        }
+        dirs.into_iter()
+            .filter(|d| roots.iter().any(|r| super::envelope::is_within(r, d)))
+            .collect()
+    }
+
     /// The provider of the session `session_id` was spawned by
     /// (`spawned_by.parent_session_id`, read from the graph — a resume by a person
     /// still knows). A parent that cannot be read counts as third-party: refusing
@@ -6342,6 +6381,24 @@ impl ChatManager {
                 request.project_slug.as_deref(),
             )
             .await;
+        // A spawned session's workspace is inherited (`ParentEnvelope::apply`), but
+        // `resolve_add_dirs` above re-reads the workspace's CURRENT membership: if a
+        // project was added to it after the parent was itself opened, the resolution
+        // just above hands a later-spawned child a directory the parent's own envelope
+        // never granted it (P18b, fix 1). Clamp back to what the parent could already
+        // see, frozen on the parent's own node at ITS creation.
+        let resolved_add_dirs = match request
+            .spawned_by
+            .as_deref()
+            .and_then(parse_spawned_by)
+            .and_then(|ctx| ctx.parent_session_id)
+        {
+            Some(parent_id) => {
+                self.clamp_spawned_add_dirs(resolved_add_dirs, &parent_id)
+                    .await
+            }
+            None => resolved_add_dirs,
+        };
 
         // What the session may do: fixed here, persisted on the node, kept by every resume.
         let access = super::provider::policy::SessionAccess::for_open(
