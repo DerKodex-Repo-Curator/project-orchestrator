@@ -12476,6 +12476,19 @@ mod native_subagents {
         assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
         let children = r.children().await;
         assert_eq!(children.len(), 1);
+        // Not vacuous (P18b round 3, fix D): the Agent child DOES carry the parent's
+        // workspace (`ParentEnvelope::apply` inherits it, #720 fix 1), and its own `add_dirs`
+        // is `None` like the parent's, so `resolve_add_dirs` takes its workspace branch —
+        // the one that re-reads the CURRENT membership and would hand it project B.
+        assert_eq!(
+            children[0].workspace_slug.as_deref(),
+            Some("ws-widen"),
+            "the Agent child inherits the parent's workspace"
+        );
+        assert_eq!(
+            children[0].workspace_slug,
+            r.parent_node().await.workspace_slug
+        );
         let agent_child_dirs = children[0].add_dirs.clone().unwrap_or_default();
         assert!(
             !agent_child_dirs.iter().any(|d| d.contains("project-b")),
@@ -12505,6 +12518,120 @@ mod native_subagents {
             "a chat(send_message) child must not see project B either: {plain_dirs:?}"
         );
         let _ = r.manager.close_session(&plain_child).await;
+    }
+
+    /// P18b round 3, fix A: after a restart the parent is reopened WITHOUT its owner's
+    /// claims (the recovery keeps none), so its `Agent` calls reach `run_subagent` with no
+    /// claims — exactly what `Rig::run` passes. The child still belongs to the parent's
+    /// person. Red before the fix: `session_owner(None)` gave the child no owner at all.
+    #[tokio::test]
+    async fn a_child_opened_without_claims_belongs_to_its_parents_owner() {
+        let r = rig(answer("CHILD-ANSWER"), "default").await;
+        let mut parent = r.parent_node().await;
+        parent.owner = Some("person-behind-the-parent".into());
+        r.graph.create_chat_session(&parent).await.unwrap();
+
+        assert_eq!(r.run("ca1").await, Ok("CHILD-ANSWER".to_string()));
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].owner.as_deref(),
+            Some("person-behind-the-parent")
+        );
+    }
+
+    /// P18b round 3, fix B: a child that asks for a permission — nobody watches its
+    /// session — fails the parent's call within seconds, not at the parent's 30-minute turn
+    /// timeout, and the child ends closed. Red before the fix: the call waited only for a
+    /// `result` or a `session_closed`, neither of which ever came.
+    #[tokio::test]
+    async fn a_child_that_asks_for_a_permission_fails_the_call_fast_and_is_closed() {
+        let r = rig(
+            vec![
+                steps::permission_ask("perm-1", "Bash", None, &[]),
+                steps::await_permission("perm-1", answer("ALLOWED"), answer("DENIED")),
+            ],
+            "default",
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(Duration::from_secs(60), r.run("ca1"))
+            .await
+            .expect("a child's permission request must not hold the parent");
+        assert!(
+            out.as_ref()
+                .is_err_and(|e| e.contains("permission") && e.contains("Bash")),
+            "{out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        assert!(r.none_alive().await, "the child is closed");
+        let child = children[0].id.to_string();
+        let kinds: Vec<String> = r
+            .events_of(&child)
+            .await
+            .iter()
+            .map(|e| e.event_type.clone())
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "permission_request"),
+            "the child did ask: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "session_closed"),
+            "the close is on the child's thread: {kinds:?}"
+        );
+    }
+
+    /// P18b round 3, fix E: a panic in `open_wait_close` between the child's answer and its
+    /// explicit close — the point where the guard used to be already disarmed — still
+    /// closes the child, and the slot is given back only AFTER that close (the guard owns
+    /// it). The injection runs in the real task: this proves the guard is wired in, not
+    /// just that the struct works. Red before the fix: the guard was disarmed there, so the
+    /// child stayed live and the slot was freed at once by the unwind.
+    #[tokio::test]
+    async fn a_panic_before_the_close_still_closes_the_child_then_frees_the_slot() {
+        let r = rig(answer("CHILD-ANSWER"), "default").await;
+        crate::chat::subagents::panic_injection::before_close(&r.parent);
+        let out = r.run("ca1").await;
+        assert!(
+            out.as_ref().is_err_and(|e| e.contains("opening ended")),
+            "the panic reaches the caller as an error: {out:?}"
+        );
+        let children = r.children().await;
+        assert_eq!(children.len(), 1);
+        let child = children[0].id.to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while r
+            .manager
+            .subagent_slots
+            .lock()
+            .unwrap()
+            .get(&r.parent)
+            .is_some()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot was never freed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !r.manager.agent_runtime.owns(&child).await,
+            "the slot is freed only once the child is closed"
+        );
+        assert!(
+            r.events_of(&child)
+                .await
+                .iter()
+                .any(|e| e.event_type == "session_closed"),
+            "the backstop closed the child"
+        );
     }
 }
 

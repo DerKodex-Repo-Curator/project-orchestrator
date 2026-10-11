@@ -2050,7 +2050,24 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         super::message_attachments::load_images(&self.graph, &self.documents, shown).await
     }
 
+    /// Also tells the session lists (the CRUD bus) when the session starts and stops
+    /// streaming, as the Claude Code engine does at the start of a turn and in
+    /// `finalize_streaming_status` (P18b round 3, fix F): the runtime emits
+    /// `streaming_status` exactly there — `false` only once the queue is empty
+    /// (`AgentSessionHandle::next_queued`) — so the pending-queue semantics are the
+    /// runtime's own. Without it, a list (a parent's children) never learned that a
+    /// native session had finished.
     fn publish(&self, session_id: &str, event: &ChatEvent) {
+        if let (ChatEvent::StreamingStatus { is_streaming }, Some(emitter)) =
+            (event, &self.event_emitter)
+        {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                session_id,
+                serde_json::json!({ "is_streaming": is_streaming }),
+                None,
+            );
+        }
         if let Some(nats) = &self.nats {
             nats.publish_chat_event(session_id, event.clone());
         }
@@ -5268,17 +5285,29 @@ impl ChatManager {
         dirs: Vec<String>,
         parent_session_id: &str,
     ) -> Vec<String> {
-        let roots = match Uuid::parse_str(parent_session_id) {
-            Ok(parent_uuid) => match self.graph.get_chat_session(parent_uuid).await {
-                Ok(Some(parent)) => {
-                    let mut roots = vec![parent.cwd];
-                    roots.extend(parent.add_dirs.unwrap_or_default());
-                    roots
-                }
-                _ => Vec::new(),
-            },
-            Err(_) => Vec::new(),
+        let parent = match Uuid::parse_str(parent_session_id) {
+            Ok(parent_uuid) => self
+                .graph
+                .get_chat_session(parent_uuid)
+                .await
+                .ok()
+                .flatten(),
+            Err(_) => None,
         };
+        let Some(parent) = parent else {
+            // Fails closed, and says so: the warn below would otherwise blame a widening
+            // when the truth is that the parent could not be read at all.
+            if !dirs.is_empty() {
+                tracing::warn!(
+                    parent = %parent_session_id,
+                    dropped = ?dirs,
+                    "a spawned session's parent is unreadable: none of its resolved add_dirs is granted"
+                );
+            }
+            return Vec::new();
+        };
+        let mut roots = vec![parent.cwd];
+        roots.extend(parent.add_dirs.unwrap_or_default());
         let dropped: Vec<&String> = dirs
             .iter()
             .filter(|d| !roots.iter().any(|r| super::envelope::is_within(r, d)))
@@ -5328,6 +5357,24 @@ impl ChatManager {
             }
             _ => SpawnParent::ThirdParty,
         }
+    }
+
+    /// The owner of the session `request` names as its parent (`spawned_by.parent_session_id`),
+    /// read from the parent's node. `None` without a parent, or when it cannot be read: the
+    /// child is then left as it always was without claims (P18b round 3, fix A).
+    async fn spawning_parent_owner(&self, request: &ChatRequest) -> Option<String> {
+        let parent = request
+            .spawned_by
+            .as_deref()
+            .and_then(parse_spawned_by)?
+            .parent_session_id?;
+        let parent = Uuid::parse_str(&parent).ok()?;
+        self.graph
+            .get_chat_session(parent)
+            .await
+            .ok()
+            .flatten()?
+            .owner
     }
 
     /// Whether the session `session_id` is recorded and was spawned by nothing (no
@@ -6248,7 +6295,15 @@ impl ChatManager {
     ) -> Result<CreateSessionResponse> {
         // Who the session belongs to, settled before anything is opened: a refusal (no owner
         // can be named for a delegated session) leaves nothing behind.
-        let owner = self.session_owner(request.user_claims.as_ref()).await?;
+        let owner = match self.session_owner(request.user_claims.as_ref()).await? {
+            // No claims at all, and a parent named: the child of a parent that was itself
+            // reopened without its owner's claims (the restart recovery keeps none) belongs
+            // to the parent's person, not to nobody (P18b round 3, fix A). Only the owner
+            // is inherited: no claims means no token is minted, so the child's MCP access
+            // stays exactly as restricted as before (H6).
+            None if request.user_claims.is_none() => self.spawning_parent_owner(request).await,
+            owner => owner,
+        };
         // Check max sessions: both engines' live sessions count.
         {
             if self.active_session_count().await >= self.config.max_sessions {
@@ -20679,6 +20734,60 @@ mod tests {
         let event = rx.try_recv().expect("a session update");
         assert_eq!(event.entity_id, sid.to_string());
         assert_eq!(event.payload["is_streaming"], serde_json::json!(false));
+    }
+
+    /// P18b round 3, fix F: a turn of the agent engine tells the session lists (the CRUD
+    /// bus) that the session streams, then that it stopped — as the Claude Code engine
+    /// does. Red before the fix: only the session's own channel heard `streaming_status`,
+    /// so a parent's list of children showed a finished native sub-agent as running.
+    #[tokio::test]
+    async fn an_agent_turn_publishes_its_streaming_start_and_end_for_the_session_lists() {
+        let (manager, _graph, fake) = agent_manager();
+        let bus = Arc::new(crate::events::EventBus::new(64));
+        let mut crud = bus.subscribe();
+        let manager = manager.with_event_emitter(bus.clone());
+        let created = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        let sid = created.session_id.clone();
+        fake.state.push(nexus_claude::agent::AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: Some("done".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 5,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m".into()),
+            provider_session_id: Some("p-1".into()),
+            structured_output: None,
+            error: None,
+        });
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !seen.contains(&serde_json::json!(false)) {
+            let event = tokio::time::timeout_at(deadline, crud.recv())
+                .await
+                .expect("the end of the turn is published")
+                .unwrap();
+            if event.entity_type == crate::events::EntityType::ChatSession
+                && event.action == crate::events::CrudAction::Updated
+                && event.entity_id == sid
+            {
+                if let Some(streaming) = event.payload.get("is_streaming") {
+                    seen.push(streaming.clone());
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![serde_json::json!(true), serde_json::json!(false)],
+            "start, then end"
+        );
+        manager.close_session(&sid).await.unwrap();
     }
 
     /// Finding 8b of #697: a session reopened without its owner's identity, on a server
