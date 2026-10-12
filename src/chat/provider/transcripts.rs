@@ -10,7 +10,7 @@
 //! ```text
 //! <app dir>/native-transcripts/            0700
 //!     <instance id>/                       0700 (nexus)
-//!         <transcript id>.json             0600 (nexus), credential-shaped text masked
+//!         <transcript id>.json             0600 (nexus), the conversation byte for byte
 //! ```
 //!
 //! Lifetime: a transcript lives as long as its session. A CLOSED session stays
@@ -18,13 +18,20 @@
 //! ([`remove_for_token`], called by `ChatManager::delete_session`).
 //!
 //! What is written is the conversation itself, which the graph already holds as
-//! chat events: no new class of data, but owner-only files, and nexus masks the
-//! credential-shaped fragments before writing.
+//! chat events: no new class of data, in owner-only files. It is written BYTE FOR
+//! BYTE (decision CTX6): a resume replays the request the live session sent, so the
+//! endpoint's prefix cache still serves it and every tool-call argument is the JSON
+//! the model wrote. Masking by shape (a field named `max_tokens`, a long word)
+//! corrupted that history and is gone. The only masking is by VALUE: the keys the
+//! instance's resolver handed out ([`store_for`]'s `known`, fed by
+//! `KnownSecrets::recording` in `native_factory`) are replaced in contents and
+//! reasoning, never inside a tool-call argument. A native resume reloads THIS
+//! file (the token names it); it is never rebuilt from the graph's chat events.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nexus_claude::agent::{ProviderKind, ResumeToken};
+use nexus_claude::agent::{KnownSecrets, ProviderKind, ResumeToken};
 use nexus_claude::providers::native::FileTranscriptStore;
 
 const DIR_NAME: &str = "native-transcripts";
@@ -61,7 +68,12 @@ pub fn dir_for(root: &Path, instance_id: &str) -> Option<PathBuf> {
 
 /// The store of an instance. The root is made owner-only here (it lists the
 /// instances); nexus makes the instance directory `0700` and each file `0600`.
-pub fn store_for(root: &Path, instance_id: &str) -> std::io::Result<Arc<FileTranscriptStore>> {
+/// `known`: the secret values to mask (shared with the instance's resolver).
+pub fn store_for(
+    root: &Path,
+    instance_id: &str,
+    known: KnownSecrets,
+) -> std::io::Result<Arc<FileTranscriptStore>> {
     let dir = dir_for(root, instance_id).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -69,7 +81,9 @@ pub fn store_for(root: &Path, instance_id: &str) -> std::io::Result<Arc<FileTran
         )
     })?;
     create_private_dir(root)?;
-    Ok(Arc::new(FileTranscriptStore::new(dir)))
+    Ok(Arc::new(
+        FileTranscriptStore::new(dir).with_known_secrets(known),
+    ))
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -154,7 +168,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("native-transcripts");
-        let store = store_for(&root, "local").unwrap();
+        let store = store_for(&root, "local", KnownSecrets::new()).unwrap();
         store.save("t1", &[ChatMessage::user("hello")]).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&root), 0o700);
@@ -166,5 +180,37 @@ mod tests {
         assert!(!file.exists());
         assert!(!remove_for_token(&root, "local", &native_token("t1")).unwrap());
         assert!(!remove_for_token(&root, "local", "garbage").unwrap());
+    }
+
+    /// CTX6: the file is the conversation (a field named like a secret, a long
+    /// argument, all byte for byte); only a key the resolver handed out is masked,
+    /// and never inside a tool-call argument.
+    #[test]
+    fn the_store_keeps_the_conversation_and_masks_only_a_known_value() {
+        use nexus_claude::agent::Secret;
+        use nexus_claude::model::ToolCallChunk;
+        let tmp = tempfile::tempdir().unwrap();
+        let known = KnownSecrets::new();
+        let store = store_for(tmp.path(), "local", known.clone()).unwrap();
+        known.register(&Secret::new("vault-key-77e1b0"));
+        let long =
+            serde_json::json!({ "max_tokens": 4096, "path": "segment/".repeat(80) }).to_string();
+        let conversation = vec![
+            ChatMessage::user(r#"{"input_tokens":12} and vault-key-77e1b0"#),
+            ChatMessage::assistant_tool_calls(vec![ToolCallChunk {
+                id: "c1".into(),
+                name: "mcp__po__note".into(),
+                arguments: long.clone(),
+            }]),
+            ChatMessage::tool("c1", "ok"),
+        ];
+        store.save("t", &conversation).unwrap();
+        let back = store.load("t").unwrap().unwrap();
+        assert_eq!(
+            back[0].content.as_deref(),
+            Some(r#"{"input_tokens":12} and <redacted>"#)
+        );
+        assert_eq!(back[1].tool_calls[0].arguments, long);
+        assert_eq!(back[1..], conversation[1..]);
     }
 }
