@@ -168,7 +168,7 @@ pub struct ChatConfig {
     pub nexus_browser_path: Option<PathBuf>,
     /// Obscura (`dsh-obscura-nav`): the executable of the keyless `obscura` search engine
     /// (`--search-engine obscura:<path>`). Server configuration only, never a request's:
-    /// `OBSCURA_BIN`, overridden by `chat.obscura_path` in config.yaml, else found on the `PATH`
+    /// `OBSCURA_BIN`, else `chat.obscura_path` in config.yaml (the variable wins), else the `PATH`
     /// (`dsh-obscura-nav`, then `obscura`). With `chat.obscura_browser: true` it is also the
     /// browser (N23) when none named `obscura` was found.
     pub obscura_path: Option<PathBuf>,
