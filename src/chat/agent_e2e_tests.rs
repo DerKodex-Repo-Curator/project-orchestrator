@@ -8443,7 +8443,13 @@ mod native_transcripts {
         let sid = created.session_id;
         assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
         wait_results(&graph, &sid, 1).await;
-        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        // CTX6: text that only LOOKS like a secret (fields named `*_tokens`, a word of
+        // more than 400 bytes) must come back after the restart exactly as it was sent.
+        let second = format!(
+            "SECOND-TURN {{\"input_tokens\":12,\"max_tokens\":3}} /{}",
+            "segment/".repeat(60)
+        );
+        before.send_message(&sid, &second).await.unwrap();
         wait_results(&graph, &sid, 2).await;
         before.close_session(&sid).await.unwrap();
         drop(before);
@@ -8500,6 +8506,34 @@ mod native_transcripts {
                 "the resumed turn carries the history ({earlier}): {body}"
             );
         }
+
+        // CTX6: the history the resumed request replays is, message for message and
+        // byte for byte, the one the live session sent (the system prompt aside: the
+        // host rebuilds it at every opening). The native resume reloads the transcript
+        // FILE, never the graph's chat events.
+        let requests = fake.chat_requests();
+        let messages_of = |needle: &str, without: Option<&str>| {
+            requests
+                .iter()
+                .map(|r| r["body"].clone())
+                .find(|b| {
+                    let text = b.to_string();
+                    text.contains(needle) && without.is_none_or(|w| !text.contains(w))
+                })
+                .and_then(|b| b["messages"].as_array().cloned())
+                .expect("the request")
+        };
+        let live = messages_of("SECOND-TURN", Some("AFTER-RESTART"));
+        let resumed = messages_of("AFTER-RESTART", None);
+        assert!(resumed.len() > live.len(), "{resumed:?}");
+        assert_eq!(
+            &resumed[1..live.len()],
+            &live[1..],
+            "the resumed history departs from the live one"
+        );
+        assert!(!serde_json::to_string(&resumed)
+            .unwrap()
+            .contains("<redacted"));
 
         // Deleting the session removes its transcript, then the node.
         assert!(after.delete_session(uuid).await.unwrap());

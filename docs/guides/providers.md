@@ -248,6 +248,17 @@ would have chosen without applying it; `enforce` applies it.
 
 Two counters: *marginal* (reported or priced: real spend, the only one that can stop a run) and
 *notional* (subscription or free). An unknown price is never a zero. `GET /api/chat/runs/{run_id}/costs`.
+The run totals also carry `cache_read_tokens` and `cache_write_tokens`.
+
+Tokens and prompt cache of a conversation, turn by turn: `GET /api/chat/sessions/{id}/usage`. It returns:
+
+- `input_tokens`, the tokens NOT served from the cache;
+- `output_tokens`, `cache_read_tokens`, `cache_creation_tokens` and `reasoning_tokens`;
+- `cache_hit_ratio`, equal to `cache_read / (input + cache_read)`.
+
+The figures are read from the `result` events stored with the turns, for every provider.
+
+An OpenAI-compatible endpoint (DeepSeek, vLLM…) never reports a cache write, so `cache_creation_tokens` stays absent rather than zero. The native harness also writes one INFO line per model request (`native model request`, target `nexus_claude::native::request`): `host_session_id` is the conversation id, followed by `prompt_tokens`, `cached_tokens`, `latency_ms` and the prefix fingerprint.
 
 ## Server settings
 
