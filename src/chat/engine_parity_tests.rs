@@ -1148,6 +1148,19 @@ fn spawn_sleeper() -> Value {
     json!({"op": "spawn_child", "program": "sleep", "args": ["120"]})
 }
 
+/// The file whose creation lets the background process of TURN-BG start
+/// ([`spawn_sleeper_on`]); next to the session's directory, not in it.
+fn bg_go(cwd: &str) -> String {
+    format!("{}.parity-bg-go", cwd.trim_end_matches('/'))
+}
+
+/// A shell that waits for `go` to exist, then runs `sleep 120` as its child: the
+/// shell is there from the start, the sleeper is the newcomer the PID claim finds.
+fn spawn_sleeper_on(go: &str) -> Value {
+    json!({"op": "spawn_child", "program": "sh", "args": [
+        "-c", "while [ ! -e \"$0\" ]; do sleep 0.05; done; sleep 120", go]})
+}
+
 fn wait_children() -> Value {
     json!({"op": "wait_children_exit", "timeout_ms": 15000, "optional": true})
 }
@@ -1392,6 +1405,12 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
     ]);
     // TURN-BG: a background Bash; the process appears AFTER the tool_use (the PID
     // claim diffs the CLI's descendants around it); cancel_task stops it.
+    //
+    // The process is forked when the test says so (`bg_go`), once the backend has
+    // tracked the task, never at a fixed delay after the tool_use: the claim's first
+    // reading of the descendants comes after the engine has seen the tool_use, and a
+    // process forked before that reading is never claimed (task 39427f40: under Code
+    // Coverage the fixed 400 ms was overtaken; forked at once, neither engine claims it).
     t.extend(vec![
         await_in(&k.k("TURN-BG")),
         cc_tool_use(
@@ -1400,8 +1419,7 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
             json!({"command": "sleep 120", "run_in_background": true,
                    "description": "parity background"}),
         ),
-        sleep_ms(400),
-        spawn_sleeper(),
+        spawn_sleeper_on(&bg_go(cwd)),
         cc_tool_result("t7", "Command running in background with ID: bg1", false),
         text("answered bg"),
         result_ok("answered bg"),
@@ -2557,19 +2575,28 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Cause::Harness,
         format!("active_tasks_update avec t7={tracked}"),
     );
+    // The task is tracked. The claim reads the CLI's descendants, then again a second
+    // later: the process must start between the two readings. The legacy engine takes
+    // the first reading before it announces the task; the agent engine (nexus) takes it
+    // in a task of its own, started after the announcement, through `ps` (slow under
+    // Code Coverage: a fork at once was overtaken there). The process starts 400 ms
+    // after the announcement: after the first reading, well before the second.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    std::fs::write(bg_go(&cwd), b"").unwrap();
     w.said(WAIT, "answered bg").await;
-    // The PID claim runs about a second after the tool_use.
+    // The PID claim lands about a second after the process: waited on as such, with a
+    // wide deadline (the Code Coverage job is several times slower).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut claimed = false;
-    for _ in 0..60 {
+    while !claimed && tokio::time::Instant::now() < deadline {
         claimed = manager
             .get_active_background_tasks(&sid)
             .await
             .iter()
             .any(|t| t.id == "t7" && t.pid.is_some());
-        if claimed {
-            break;
+        if !claimed {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let stopped = manager.cancel_task(&sid, "t7").await.unwrap();
     cc.check(
@@ -2581,6 +2608,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
             stopped.killed_pids
         ),
     );
+    let _ = std::fs::remove_file(bg_go(&cwd));
     w.settle(ends, &manager).await;
 
     // NATS: a message from the other instance.
