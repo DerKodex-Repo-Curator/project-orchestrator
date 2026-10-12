@@ -5597,14 +5597,28 @@ mod parity {
         }
     }
 
-    /// H3 auto-continue: a turn that stops on its turn limit is announced
-    /// (`auto_continue`) and continued with the "continue" hint of the Claude Code
-    /// engine when the session's toggle is on.
+    /// Waits until `n` turns were sent and the session no longer streams, then a little
+    /// longer: a further continuation would have been sent by then.
+    async fn settled_after(r: &Rig, n: usize) -> Vec<String> {
+        for _ in 0..400 {
+            if r.sent().len() >= n && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(
+            crate::chat::post_stream::AUTO_CONTINUE_DELAY_MS + 300,
+        ))
+        .await;
+        r.sent()
+    }
+
+    /// Auto-continue is always on (decision 7b95342a): a NEW session, with no toggle
+    /// message at all, announces (`auto_continue`) and continues a turn that stopped on
+    /// its turn limit with the "continue" hint of the Claude Code engine.
     #[tokio::test]
-    async fn a_turn_stopped_on_its_limit_is_continued_when_auto_continue_is_on() {
+    async fn a_new_session_continues_a_turn_stopped_on_its_limit() {
         let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
-        assert!(!r.manager.get_auto_continue_state(&r.sid).await.unwrap());
-        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
         assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
         r.manager.send_message(&r.sid, "go").await.unwrap();
         let events = run_events(&mut r).await;
@@ -5623,11 +5637,58 @@ mod parity {
         assert!(sent[1].contains("Continue where you left off"), "{sent:?}");
     }
 
-    /// H3 auto-continue: toggle off (the default of an interactive session), the
-    /// turn stays stopped.
+    /// The cap still stops it: `MAX_AUTO_CONTINUES` continuations in a row, then the turn
+    /// stays stopped (auto-continue stays on). The next message starts a new chain.
     #[tokio::test]
-    async fn a_turn_stopped_on_its_limit_stays_stopped_when_auto_continue_is_off() {
-        let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
+    async fn the_cap_stops_a_chain_of_continuations_and_the_next_message_starts_a_new_one() {
+        let max = crate::chat::post_stream::MAX_AUTO_CONTINUES as usize;
+        // The message and its `max` continuations all stop on their limit; then the next
+        // message stops on it too and its continuation answers.
+        let mut turns: Vec<Vec<Step>> =
+            (0..=max + 1).map(|_| stopped_on_its_turn_limit()).collect();
+        turns.push(vec![steps::done(&caps())]);
+        let r = rig(ProviderKind::Native, turns).await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let sent = settled_after(&r, max + 1).await;
+        assert_eq!(
+            sent.len(),
+            max + 1,
+            "the message, then {max} continuations: {sent:#?}"
+        );
+        assert!(
+            sent[1..]
+                .iter()
+                .all(|s| s.contains("Continue where you left off")),
+            "{sent:#?}"
+        );
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+
+        r.manager.send_message(&r.sid, "again").await.unwrap();
+        let sent = settled_after(&r, max + 3).await;
+        assert_eq!(sent.len(), max + 3, "a new chain: {sent:#?}");
+        assert!(sent[max + 1].ends_with("again"), "{sent:#?}");
+        assert!(
+            sent[max + 2].contains("Continue where you left off"),
+            "{sent:#?}"
+        );
+    }
+
+    /// The operator's kill switch (`CHAT_AUTO_CONTINUE=false`): the turn stays stopped.
+    #[tokio::test]
+    async fn a_turn_stopped_on_its_limit_stays_stopped_under_the_kill_switch() {
+        let mut r = rig_tweaked(
+            ProviderKind::Native,
+            vec![stopped_on_its_turn_limit()],
+            None,
+            None,
+            false,
+            |mut m| {
+                m.config.auto_continue = false;
+                m
+            },
+        )
+        .await;
+        assert!(!r.manager.get_auto_continue_state(&r.sid).await.unwrap());
         r.manager.send_message(&r.sid, "go").await.unwrap();
         let events = run_events(&mut r).await;
         assert!(
@@ -5644,12 +5705,55 @@ mod parity {
     #[tokio::test]
     async fn a_stop_cancels_a_pending_auto_continue() {
         let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
-        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
         r.manager.send_message(&r.sid, "go").await.unwrap();
         next_event(&mut r.rx, |e| matches!(e, ChatEvent::AutoContinue { .. })).await;
         r.manager.interrupt(&r.sid).await.unwrap();
         r.turn_end().await;
         assert_eq!(r.sent().len(), 1, "{:?}", r.sent());
+    }
+
+    /// An older frontend's `set_auto_continue {enabled:false}`, relayed by another
+    /// instance (NATS RPC), is accepted and IGNORED: the session still continues.
+    #[tokio::test]
+    async fn an_older_frontends_set_auto_continue_off_is_ignored() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut r = rig_with(
+            ProviderKind::Native,
+            vec![stopped_on_its_turn_limit()],
+            Some(owner),
+        )
+        .await;
+        let other = NatsEmitter::new(broker.client().await, "events");
+        other.client().flush().await.unwrap();
+        // The listener may still be subscribing: ask again until it answers.
+        let mut answered = None;
+        for _ in 0..20 {
+            answered = other
+                .request_send_message(&r.sid, r#"{"enabled":false}"#, "set_auto_continue")
+                .await;
+            if answered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            answered.as_ref().is_some_and(|a| a.success),
+            "accepted: {answered:?}"
+        );
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let events = run_events(&mut r).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AutoContinue { .. })),
+            "{events:?}"
+        );
+        assert_eq!(r.sent().len(), 2, "{:?}", r.sent());
     }
 
     /// H3 NATS: another instance sees the session's events and reaches the session
@@ -11422,7 +11526,6 @@ mod post_turn {
             ],
         )
         .await;
-        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
         r.manager.send_message(&r.sid, "go").await.unwrap();
         for _ in 0..400 {
             if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
@@ -14041,5 +14144,198 @@ mod claude_code_mirror {
         assert_eq!(live_down, live_off, "the live stream");
         assert_eq!(stored_down, stored_off, "the stored thread");
         assert!(mirrors_of(graph.as_ref(), parent).await.is_empty());
+    }
+
+    /// A BACKGROUND sub-agent on the agent engine, from the CLI itself (`fake_claude`, the
+    /// real nexus façade), as Claude Code 2.1.296 prints it: the `Agent` call with
+    /// `run_in_background`, its `task_started`, the immediate "launched" result, the end of
+    /// the parent's turn; THEN, out of turn, the sub-agent's tool call and words (with
+    /// `parent_tool_use_id`) and the `task_notification` that names the call. The mirror
+    /// follows it past the turn (in the form a turn shows it) and is closed by the
+    /// notification, with its summary; the parent keeps showing the out-of-turn activity
+    /// flattened, as before. Before P18c-suite the mirror ended at the turn's end on "runs in
+    /// the background", without anything the sub-agent did after it.
+    #[tokio::test]
+    async fn a_background_sub_agent_is_mirrored_out_of_turn_until_its_notification() {
+        use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+        const BG: &str = "toolu_bg_agent";
+        let dir = tempfile::tempdir().unwrap();
+        let assistant = |content: Value, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude", "content": content,
+                "stop_reason": "end_turn"}, "parent_tool_use_id": parent}})
+        };
+        let tool_result = |id: &str, text: &str, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": id, "content": text, "is_error": false}
+                ]}, "parent_tool_use_id": parent}})
+        };
+        let system = |subtype: &str, uuid: &str, mut data: Value| {
+            data["type"] = json!("system");
+            data["subtype"] = json!(subtype);
+            data["uuid"] = json!(uuid);
+            data["session_id"] = json!("cli-bg-1");
+            json!({"op": "emit_json", "json": data})
+        };
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            system(
+                "init",
+                "u-init",
+                json!({"model": "fake-claude", "cwd": ".", "tools": ["Agent", "Bash"],
+                    "permissionMode": "default", "apiKeySource": "none"}),
+            ),
+            assistant(
+                json!([{"type": "tool_use", "id": BG, "name": "Agent", "input": {
+                    "description": "probe in the background", "prompt": "Run the probe",
+                    "subagent_type": "general-purpose", "run_in_background": true}}]),
+                None,
+            ),
+            system(
+                "task_started",
+                "u-started",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "description": "probe in the background",
+                    "is_backgrounded": true, "task_type": "local_agent"}),
+            ),
+            tool_result(BG, "Async agent launched successfully.", None),
+            assistant(json!([{"type": "text", "text": "launched"}]), None),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": "cli-bg-1", "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "launched"}}),
+            // The parent's turn is over: what follows is printed out of turn.
+            json!({"op": "sleep", "ms": 400}),
+            assistant(
+                json!([{"type": "tool_use", "id": "t-bg-bash", "name": "Bash",
+                    "input": {"command": "echo hello-from-bg"}}]),
+                Some(BG),
+            ),
+            system(
+                "task_progress",
+                "u-progress",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "description": "Running echo",
+                    "last_tool_name": "Bash"}),
+            ),
+            tool_result("t-bg-bash", "hello-from-bg", Some(BG)),
+            assistant(
+                json!([{"type": "text", "text": "it printed hello-from-bg"}]),
+                Some(BG),
+            ),
+            system(
+                "task_notification",
+                "u-notified",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "status": "completed",
+                    "output_file": "/nonexistent/a0bg.output",
+                    "summary": "The probe printed hello-from-bg."}),
+            ),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(fake_bin("fake_claude"));
+        let provider = super::claude_code_resume_token::FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                ("FAKE_CLAUDE_MAX_RUNTIME_MS".into(), "60000".into()),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let emitter = Arc::new(RecordingEmitter::default());
+        let chat_config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager =
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, chat_config)
+                .with_provider_source(Arc::new(provider))
+                .with_event_emitter(emitter.clone());
+        let mut req = request(None, None, "default");
+        req.message = "probe it in the background".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let parent = Uuid::parse_str(&sid).unwrap();
+
+        let mirror = closed_mirrors(graph.as_ref(), parent, 1).await[0].clone();
+        assert_eq!(mirror.title.as_deref(), Some("probe in the background"));
+        let events = thread(graph.as_ref(), mirror.id).await;
+        assert!(
+            matches!(&events[0], ChatEvent::UserMessage { content } if content == "Run the probe"),
+            "{events:?}"
+        );
+        // What the sub-agent did after the parent's turn, at the mirror's top level.
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::ToolUse { id, tool, parent_tool_use_id: None, .. }
+                    if id == "t-bg-bash" && tool == "Bash")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::ToolResult { id, parent_tool_use_id: None, .. } if id == "t-bg-bash")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::AssistantText { content, parent_tool_use_id: None }
+                    if content == "it printed hello-from-bg")),
+            "{events:?}"
+        );
+        // Closed by the notification, with its summary, as a success.
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result {
+                is_error: false, result_text: Some(t), stop_reason: Some(r), .. })
+                if t == "The probe printed hello-from-bg." && r == "completed"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ChatEvent::Result { .. }))
+                .count(),
+            1,
+            "one end: {events:?}"
+        );
+        // The CRUD bus: created, streaming, then not streaming once — at the notification.
+        let crud = emitter.of(&mirror.id.to_string());
+        assert_eq!(
+            crud.iter()
+                .filter(|(_, p)| *p == json!({"is_streaming": false}))
+                .count(),
+            1,
+            "{crud:?}"
+        );
+        let node = graph.get_chat_session(mirror.id).await.unwrap().unwrap();
+        assert!(node.updated_at > node.created_at, "the end is stamped");
+
+        // The parent: its turn as before, the out-of-turn activity flattened under the call.
+        let own = thread(graph.as_ref(), parent).await;
+        assert!(
+            own.iter().any(|e| matches!(e,
+                ChatEvent::BackgroundOutput { correlation_id: Some(c), content, .. }
+                    if c == BG && content.contains("hello-from-bg"))),
+            "{own:?}"
+        );
+        assert!(
+            !own.iter().any(|e| matches!(e,
+                ChatEvent::ToolUse { id, .. } if id == "t-bg-bash")),
+            "the parent's own thread is unchanged: {own:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
     }
 }

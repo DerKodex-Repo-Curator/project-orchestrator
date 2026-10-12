@@ -505,6 +505,12 @@ pub trait TurnServices: Send + Sync {
     /// Sees each event of the session as it is emitted (the work log of the turn).
     /// Default: nothing.
     fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
+    /// Sees the (masked) events the provider sent between turns, before the session emits
+    /// them flattened (`background_output`). Whoever follows a Claude Code sub-agent still
+    /// running in the background after the turn (`chat::mirror`) reads them in their
+    /// structured form (`event_map::structured_out_of_turn`); nothing is emitted nor stored
+    /// from here. Default: nothing.
+    fn observe_out_of_turn(&self, _session_id: &str, _events: &[AgentEvent]) {}
     /// After each turn played (not one refused before it was sent): the
     /// Claude Code engine's post-stream steps — post-compaction re-injection,
     /// objective tracking, memory, feedback, observations. The host bounds each of
@@ -586,10 +592,13 @@ pub struct AgentSessionHandle {
     interrupted: AtomicBool,
     /// Cancelled when the session closes: ends what listens on its behalf (NATS).
     pub closed: tokio_util::sync::CancellationToken,
-    /// Continue a turn that stopped on its turn limit (`set_auto_continue`).
+    /// Continue a turn that stopped on its turn limit: set when the session opens
+    /// (always on, capped — decision 7b95342a — unless the operator's kill switch is
+    /// off); `set_auto_continue` no longer changes it.
     pub auto_continue: AtomicBool,
+    /// The current chain of continuations in a row (`post_stream::auto_continue_allowed`).
     auto_continue_count: std::sync::atomic::AtomicU32,
-    /// Continuations allowed before auto-continue switches itself off (0: no limit).
+    /// Continuations allowed in a row (0: no limit).
     max_auto_continues: std::sync::atomic::AtomicU32,
     /// The resume token (wire form) the graph holds for this session, as far as this
     /// handle knows: what the opener persisted, then each change [`Self::sync_resume_token`]
@@ -2270,6 +2279,12 @@ async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent:
         .into_iter()
         .map(mask_agent_event)
         .collect();
+    // Seen first by whoever follows a sub-agent still running in the background (its
+    // mirror): the batch as emitted, a notification of its end among it, comes after it, as
+    // the provider sent them.
+    if let Some(services) = &handle.services {
+        services.observe_out_of_turn(&handle.session_id, &events);
+    }
     let chat_events = {
         let mut mapper = handle.mapper.lock().await;
         out_of_band_to_chat_events(&events, &mut mapper, chrono::Utc::now())
