@@ -491,6 +491,12 @@ pub struct ChatYamlConfig {
     pub auto_update_cli: Option<bool>,
     /// Enable automatic Tauri application updates on startup (default: true).
     pub auto_update_app: Option<bool>,
+    /// Wall-clock cap of a native turn, in seconds (`CHAT_NATIVE_TURN_TIMEOUT_SECS` wins).
+    /// Unset by default: no cap, as in Claude Code.
+    pub native_turn_timeout_secs: Option<u64>,
+    /// Token budget of a native session, cache reads not counted
+    /// (`CHAT_NATIVE_SESSION_MAX_TOKENS` wins). Unset by default: no budget, as in Claude Code.
+    pub native_session_max_tokens: Option<u64>,
     /// Obscura's executable (`dsh-obscura-nav`), for the keyless `obscura` search engine of
     /// native sessions. Default: `OBSCURA_BIN`, else found on the `PATH`.
     pub obscura_path: Option<String>,
@@ -839,6 +845,12 @@ pub struct Config {
     /// Enable automatic Tauri application updates on startup.
     /// Priority: env var (CHAT_AUTO_UPDATE_APP) > YAML (chat.auto_update_app) > None (true).
     pub chat_auto_update_app: Option<bool>,
+    /// Wall-clock cap of a native turn, in seconds.
+    /// Priority: env var (CHAT_NATIVE_TURN_TIMEOUT_SECS) > YAML (chat.native_turn_timeout_secs) > None (no cap).
+    pub chat_native_turn_timeout_secs: Option<u64>,
+    /// Token budget of a native session (cache reads not counted).
+    /// Priority: env var (CHAT_NATIVE_SESSION_MAX_TOKENS) > YAML (chat.native_session_max_tokens) > None (no budget).
+    pub chat_native_session_max_tokens: Option<u64>,
     /// Obscura's executable. Priority: env var (OBSCURA_BIN) > YAML (chat.obscura_path) > PATH.
     pub chat_obscura_path: Option<String>,
     /// Obscura as the browser (N23). Priority: env var (OBSCURA_BROWSER) > YAML
@@ -965,6 +977,14 @@ impl Config {
                 .ok()
                 .map(|v| v == "true" || v == "1")
                 .or(yaml.chat.auto_update_app),
+            chat_native_turn_timeout_secs: chat::config::ChatConfig::positive_from_env(
+                chat::config::NATIVE_TURN_TIMEOUT_VAR,
+            )
+            .or(yaml.chat.native_turn_timeout_secs.filter(|n| *n > 0)),
+            chat_native_session_max_tokens: chat::config::ChatConfig::positive_from_env(
+                chat::config::NATIVE_SESSION_MAX_TOKENS_VAR,
+            )
+            .or(yaml.chat.native_session_max_tokens.filter(|n| *n > 0)),
             chat_obscura_path: std::env::var("OBSCURA_BIN")
                 .ok()
                 .filter(|v| !v.is_empty())
@@ -1703,6 +1723,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(auto_update) = config.chat_auto_update_cli {
             chat_config.auto_update_cli = auto_update;
         }
+        // Native session limits: none unless configured (ISO5).
+        chat_config.native_turn_timeout_secs = config.chat_native_turn_timeout_secs;
+        chat_config.native_session_max_tokens = config.chat_native_session_max_tokens;
         if let Some(auto_update_app) = config.chat_auto_update_app {
             chat_config.auto_update_app = auto_update_app;
         }
