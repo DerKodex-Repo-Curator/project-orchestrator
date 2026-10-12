@@ -1490,6 +1490,7 @@ mod integration_tests {
 
             let session = ActiveSession {
                 anchor: Default::default(),
+                mirror_tap: None,
                 events_tx: events_tx.clone(),
                 last_activity: Instant::now(),
                 cli_session_id: None,

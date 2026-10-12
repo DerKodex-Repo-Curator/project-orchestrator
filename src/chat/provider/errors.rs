@@ -334,6 +334,9 @@ pub fn classify_open_error(err: &anyhow::Error, provider_id: Option<&str>) -> Op
         .map(|tag| tag.provider_id.as_str());
     let provider_id = tagged.or(provider_id);
     err.chain().find_map(|cause| {
+        if cause.is::<crate::chat::mirror::MirrorReadOnly>() {
+            return Some(crate::chat::mirror::MirrorReadOnly::failure());
+        }
         if let Some(locked) = cause.downcast_ref::<AutoVaultLocked>() {
             let mut failure = open_failure(&ProviderError::CredentialsLocked, None);
             failure.fallbacks = Some(locked.fallbacks.clone());
