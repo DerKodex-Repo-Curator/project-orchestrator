@@ -14717,8 +14717,7 @@ impl ChatManager {
                             // stay reachable. Known limit: the flag is read at launch;
                             // a mid-conversation switch to trust takes effect at the
                             // next session build (resume), not on the live process.
-                            unscoped: spec.policy.mode
-                                == nexus_claude::agent::PolicyMode::Trust,
+                            unscoped: spec.policy.mode == nexus_claude::agent::PolicyMode::Trust,
                             policy: &spec.policy,
                             ceiling: spec.policy_ceiling.as_ref(),
                             project: project_slug.as_deref(),
