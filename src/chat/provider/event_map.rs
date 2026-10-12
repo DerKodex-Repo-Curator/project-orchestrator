@@ -1167,6 +1167,46 @@ mod tests {
         assert_eq!(subtype(StopReason::Error, true), "error_during_execution");
     }
 
+    /// A native turn on an OpenAI-compatible endpoint: the cache reads it reports
+    /// travel in the `result` usage, the same field as Claude Code's (what the chat
+    /// events store, the runner copies to `AgentExecution.tokens_cache_read` and the
+    /// frontend shows); an unreported cache write is absent, never a zero.
+    #[test]
+    fn a_native_turn_keeps_its_cache_reads_in_the_result_usage() {
+        use nexus_claude::agent::CostBasis;
+        let done = AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: None,
+            usage: Usage {
+                input_tokens: Some(700),
+                output_tokens: Some(50),
+                cache_read_tokens: Some(1600),
+                cache_creation_tokens: None,
+                context_tokens: Some(1300),
+                ..Default::default()
+            },
+            cost: Cost {
+                usd: Some(0.00096),
+                basis: CostBasis::Priced,
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 2,
+            model: Some("deepseek-chat".into()),
+            provider_session_id: Some("native-transcript".into()),
+            structured_output: None,
+            error: None,
+        };
+        let v = serde_json::to_value(&EventMapper::new().map(&done)[0]).unwrap();
+        assert_eq!(
+            v["usage"],
+            json!({"input_tokens": 700, "output_tokens": 50, "cache_read_tokens": 1600})
+        );
+        assert_eq!(v["cost"], json!({"usd": 0.00096, "basis": "priced"}));
+    }
+
     /// ISO5: a turn a configured limit stopped is shown as such (an `error` frame with its
     /// code, the figures and what to do), not as an opaque failure or nothing at all.
     #[test]

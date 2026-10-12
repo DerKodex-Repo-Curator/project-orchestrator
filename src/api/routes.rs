@@ -1901,6 +1901,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/tree",
             get(chat_handlers::get_session_tree),
         )
+        // Token usage and prompt-cache hits of a conversation, turn by turn (CTX0).
+        .route(
+            "/api/chat/sessions/{id}/usage",
+            get(chat_handlers::get_session_usage),
+        )
         .route(
             "/api/chat/runs/{run_id}/costs",
             get(chat_handlers::get_run_costs),
