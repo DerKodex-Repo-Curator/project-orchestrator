@@ -333,6 +333,10 @@ impl LiveSessionSnapshot {
 
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
+    /// The model's context window (tokens) the session was opened with, `None` when
+    /// unknown: sizes the global cap of each turn's enrichment
+    /// (`composer::turn_enrichment_cap`).
+    pub context_window: Option<u64>,
     /// The anchor mode of the session, fixed when it was opened or resumed, and the
     /// cache its turns share: nothing re-reads the environment per turn.
     pub anchor: super::anchor_resolver::AnchorSession,
@@ -848,6 +852,9 @@ pub(crate) struct OpeningTurn<'a> {
     pub message: &'a str,
     /// Index of the first turn the router counts itself (legacy engine).
     pub next_turn: u32,
+    /// The person the conversation belongs to (`ChatSessionNode::owner`): their "models Auto
+    /// may use" (AUTO-L) bound an Auto conversation without a pool of its own.
+    pub owner: Option<&'a str>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -1410,6 +1417,12 @@ pub(crate) fn spawn_anchor_shadow(
 ///
 /// `excluded_note_ids`: the notes the user pointed at with `#` (`refs::turn`): the
 /// knowledge injection does not repeat them.
+///
+/// `window_tokens`: the session's context window (`None`: unknown). The pipeline's
+/// block is held to `composer::turn_enrichment_cap` of it, whole sections only
+/// ([`super::enrichment::EnrichmentContext::to_system_prompt_markdown_capped`]); the
+/// anchor live block, a few lines, is not counted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn enrichment_for_turn(
     graph: &Arc<dyn GraphStore>,
     pipeline: &super::enrichment::EnrichmentPipeline,
@@ -1418,6 +1431,7 @@ pub(crate) async fn enrichment_for_turn(
     protocol: TurnProtocol,
     excluded_note_ids: std::collections::HashSet<String>,
     anchor: &super::anchor_resolver::AnchorSession,
+    window_tokens: Option<u64>,
 ) -> Option<String> {
     use super::anchor_resolver::AnchorContextMode;
     let mode = anchor.mode;
@@ -1514,7 +1528,8 @@ pub(crate) async fn enrichment_for_turn(
     );
     // Clean markdown prepended to the user message (replaces the old XML-wrapped
     // <enrichment_context> format).
-    let md = ctx.to_system_prompt_markdown();
+    let md =
+        ctx.to_system_prompt_markdown_capped(super::composer::turn_enrichment_cap(window_tokens));
     if live_block.is_empty() {
         return (!md.is_empty()).then_some(md);
     }
@@ -1580,6 +1595,10 @@ pub(crate) struct AgentTurnState {
     held: Arc<HeldSlot>,
     /// Tool calls announced and not yet answered: id → (tool, input so far).
     open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
+    /// The model's context window (tokens) the session was opened with, `None` when
+    /// unknown: sizes the global cap of each turn's enrichment
+    /// (`composer::turn_enrichment_cap`).
+    context_window: Option<u64>,
 }
 
 /// A session's [`HeldContext`] in this process: what waits in memory (the truth
@@ -2055,6 +2074,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             },
             turn.excluded_note_ids.clone(),
             &self.anchor,
+            self.session.context_window,
         )
         .await
         {
@@ -3075,6 +3095,26 @@ pub(crate) mod remote_send_hook {
     }
 }
 
+/// The window (tokens) a Claude Code session is budgeted for when nobody knows its
+/// model's window (CTX4, `ChatManager::session_context_window`): 200K, the smallest
+/// window of the Claude models the CLI serves (some have 1M). It gives the PO prompt's
+/// dynamic context and the per-turn enrichment the 40 000-character budget Claude
+/// Code sessions had before CTX4 (`composer::compute_dynamic_budget` clamps any
+/// window from ~67K tokens up to 40 000), so an unreachable catalog (OAuth login, no
+/// API key) does not cut the main path to the unknown-window 10 000.
+pub(crate) const CLAUDE_CODE_FLOOR_WINDOW: u64 = 200_000;
+
+/// The context window (tokens) frozen in a session's capability snapshot (the
+/// `capabilities` JSON stored at its opening: `{"context_window": {"value": N, ...}}`),
+/// `None` when there is no snapshot, it is unreadable, or it states no window.
+pub(crate) fn snapshot_context_window(snapshot: Option<&str>) -> Option<u64> {
+    let caps: serde_json::Value = serde_json::from_str(snapshot?).ok()?;
+    caps.get("context_window")?
+        .get("value")?
+        .as_u64()
+        .filter(|w| *w > 0)
+}
+
 /// Refuses a model whose context window cannot hold the tool schemas of the
 /// session's `profile` with room to work: the schemas must take at most half of
 /// it. A window that is not known is not a refusal (nothing is invented).
@@ -3510,6 +3550,20 @@ impl ChatManager {
                 return None;
             }
         };
+        // AUTO-L: the person's list, read once here (a change applies from the next opening or
+        // resume); the router applies it only while the conversation is Auto without a pool of
+        // its own. Unreadable = every model, never a refused turn.
+        let auto_models = match turn.owner {
+            Some(person) => {
+                super::provider::cognitive::auto_models::load(self.graph.as_ref(), person)
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(session_id, %error, "auto_models unreadable: every model applies");
+                        None
+                    })
+            }
+            _ => None,
+        };
         let trust = turn.permission_mode.is_some_and(|mode| {
             super::provider::policy::parse_mode(mode)
                 .is_some_and(|pair| pair.neutral == nexus_claude::agent::PolicyMode::Trust)
@@ -3527,6 +3581,7 @@ impl ChatManager {
                 provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
+                auto_models,
                 // Auto, or two models ticked or more: the user's choice for THIS
                 // conversation, decided at the `auto` stage (decision R-S1).
                 conversation_routes: super::provider::cognitive::conversation_routes(
@@ -4859,6 +4914,7 @@ impl ChatManager {
         project_slug: Option<&str>,
         user_message: &str,
         model: Option<&str>,
+        context_window: Option<u64>,
         session_id: &str,
         scaffolding_override: Option<u8>,
     ) -> (String, std::collections::HashSet<String>) {
@@ -4868,6 +4924,7 @@ impl ChatManager {
                 project_slug,
                 user_message,
                 model,
+                context_window,
                 Some(session_id),
                 scaffolding_override,
             )
@@ -4925,11 +4982,16 @@ impl ChatManager {
     ///
     /// Build the system prompt and return the set of note IDs included
     /// (from guidelines/gotchas) for deduplication with the enrichment pipeline.
+    ///
+    /// `context_window`: the model's window in tokens as the catalog knows it
+    /// ([`Self::session_context_window`], `None` = unknown), resolved once per opening:
+    /// it sizes the dynamic context (`composer::compute_dynamic_budget`).
     pub async fn build_system_prompt(
         &self,
         project_slug: Option<&str>,
         user_message: &str,
         model: Option<&str>,
+        context_window: Option<u64>,
         session_id: Option<&str>,
         scaffolding_override: Option<u8>,
     ) -> (String, std::collections::HashSet<String>) {
@@ -4945,6 +5007,7 @@ impl ChatManager {
         let Some(slug) = project_slug else {
             let input = ComposerInput {
                 cite_refs: self.refs_v1,
+                context_window,
                 ..Default::default()
             };
             return (FsmPromptComposer::compose(&input), empty_ids);
@@ -4960,6 +5023,7 @@ impl ChatManager {
                 );
                 let input = ComposerInput {
                     cite_refs: self.refs_v1,
+                    context_window,
                     ..Default::default()
                 };
                 return (FsmPromptComposer::compose(&input), empty_ids);
@@ -5136,6 +5200,7 @@ impl ChatManager {
             has_active_plan,
             task_count,
             model: model.unwrap_or(""),
+            context_window,
             message_embedding: message_embedding.as_ref(),
             external_tools_available,
             cite_refs: self.refs_v1,
@@ -5483,6 +5548,18 @@ impl ChatManager {
             }
             _ => SpawnParent::ThirdParty,
         }
+    }
+
+    /// The owner of the session a relayed conversation leaves (`relay.from_session_id`), read
+    /// from its node. `None` without a relay, or when it cannot be read.
+    async fn relayed_owner(&self, relay: Option<&super::relay::RelayedFrom>) -> Option<String> {
+        let from = Uuid::parse_str(&relay?.from_session_id).ok()?;
+        self.graph
+            .get_chat_session(from)
+            .await
+            .ok()
+            .flatten()?
+            .owner
     }
 
     /// The owner of the session `request` names as its parent (`spawned_by.parent_session_id`),
@@ -6537,7 +6614,13 @@ impl ChatManager {
             // to the parent's person, not to nobody (P18b round 3, fix A). Only the owner
             // is inherited: no claims means no token is minted, so the child's MCP access
             // stays exactly as restricted as before (H6).
-            None if request.user_claims.is_none() => self.spawning_parent_owner(request).await,
+            // A conversation the router moved (no claims: nobody asked) stays its person's: the
+            // new session belongs to the owner of the one it continues, so their "models Auto
+            // may use" (AUTO-L) and their permission answers follow the conversation.
+            None if request.user_claims.is_none() => match self.relayed_owner(relay).await {
+                Some(owner) => Some(owner),
+                None => self.spawning_parent_owner(request).await,
+            },
             owner => owner,
         };
         // Check max sessions: both engines' live sessions count.
@@ -6626,6 +6709,12 @@ impl ChatManager {
             },
         };
 
+        // The window the prompt and the per-turn enrichment are budgeted for (CTX4),
+        // resolved once for this opening.
+        let session_window = self
+            .session_context_window(&provider_choice.provider_id, &model, None)
+            .await;
+
         // Build system prompt — runner-spawned agents get a dedicated autonomous
         // execution prompt; conversational sessions get the generic PO prompt.
         let (system_prompt, _included_note_ids) =
@@ -6657,6 +6746,7 @@ impl ChatManager {
                     project_slug.as_deref(),
                     routing_message,
                     Some(&model),
+                    session_window,
                     &session_id.to_string(),
                     scaffolding_override,
                 )
@@ -6893,6 +6983,7 @@ impl ChatManager {
                     permission_mode: request.permission_mode.as_deref(),
                     message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 1,
+                    owner: session_node.owner.as_deref(),
                 },
             )
             .await
@@ -7076,6 +7167,7 @@ impl ChatManager {
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
+                    context_window: session_window,
                     anchor: self.anchor_session(),
                     mirror_tap: mirror_tap.clone(),
                     events_tx: events_tx.clone(),
@@ -8050,7 +8142,7 @@ impl ChatManager {
         // If the pipeline has no stages or all fail, the original prompt is used unchanged.
         // The agent engine runs the same function (`enrichment_for_turn`): one logic.
         let prompt = {
-            let (protocol, anchor) = {
+            let (protocol, anchor, window) = {
                 let sessions = active_sessions.read().await;
                 // The anchor mode is the session's own, fixed when it was opened or
                 // resumed: never read from the environment per turn.
@@ -8066,7 +8158,8 @@ impl ChatManager {
                         reasoning_path_tracker: Some(s.reasoning_path_tracker.clone()),
                     })
                     .unwrap_or_default();
-                (protocol, anchor)
+                let window = sessions.get(&session_id).and_then(|s| s.context_window);
+                (protocol, anchor, window)
             };
             match enrichment_for_turn(
                 &graph,
@@ -8076,6 +8169,7 @@ impl ChatManager {
                 protocol,
                 turn.excluded_note_ids.clone(),
                 &anchor,
+                window,
             )
             .await
             {
@@ -11171,6 +11265,18 @@ impl ChatManager {
             );
         }
 
+        // The window the prompt and the per-turn enrichment are budgeted for (CTX4).
+        let session_window = self
+            .session_context_window(
+                session_node
+                    .provider_id
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(super::provider::resolver::CLAUDE_CODE),
+                &session_node.model,
+                session_node.capabilities.as_deref(),
+            )
+            .await;
         // Build options - with resume flag only if we have a cli_session_id
         let (system_prompt, _included_note_ids) = self
             .build_system_prompt_anchored(
@@ -11179,6 +11285,7 @@ impl ChatManager {
                 session_node.project_slug.as_deref(),
                 message,
                 Some(&session_node.model),
+                session_window,
                 session_id,
                 None,
             )
@@ -11424,6 +11531,7 @@ impl ChatManager {
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
+                    context_window: session_window,
                     anchor: self.anchor_session(),
                     mirror_tap: mirror_tap.clone(),
                     events_tx: events_tx.clone(),
@@ -14322,7 +14430,43 @@ impl ChatManager {
                     .any(|e| e.provider == facts.provider_id && e.model == facts.model)
             });
         }
+        // AUTO-L: an Auto pilot with no models ticked chooses among its person's list (with
+        // the fallback to every model, stated in the reason, when nothing listed can serve).
+        let person_code = if !named
+            && ticked.is_none()
+            && matches!(role, super::provider::resolver::Role::Pilot)
+            && settings.mode == super::provider::cognitive::ProviderRoutingMode::Full
+        {
+            match self
+                .session_owner(request.user_claims.as_ref())
+                .await
+                .ok()
+                .flatten()
+            {
+                Some(person) => {
+                    match super::provider::cognitive::auto_models::load(
+                        self.graph.as_ref(),
+                        &person,
+                    )
+                    .await
+                    {
+                        Ok(Some(list)) => Some(super::provider::cognitive::auto_models::restrict(
+                            &mut pool, &list, &signature,
+                        )),
+                        Ok(None) => None,
+                        Err(error) => {
+                            warn!(%error, "auto_models unreadable: every model applies");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut decide = DecideRequest::new(signature, settings, pool);
+        decide.narrowed.extend(person_code);
         decide.slot = if named {
             Slot::Explicit
         } else {
@@ -14404,6 +14548,71 @@ impl ChatManager {
             }
         }
         Ok(Some(decision))
+    }
+
+    /// The context window (tokens) of `model` on `provider_id` as the model catalog
+    /// knows it, from the same sources as routing and compaction
+    /// (`routing_pool_scoped`, A1: nexus is the source of truth): for Claude Code, which
+    /// declares no window of its own, the live Anthropic catalog's `max_input_tokens`
+    /// first; then what nexus reports for the model (`capabilities(model)`: configured,
+    /// probed, or from its catalog). `None` when nobody knows it — never guessed from
+    /// the model's name.
+    pub(crate) async fn known_context_window(&self, provider_id: &str, model: &str) -> Option<u64> {
+        if provider_id == super::provider::resolver::CLAUDE_CODE {
+            if let Some(catalog) = self
+                .cognitive_routing
+                .as_ref()
+                .and_then(|routing| routing.claude_code_catalog.as_ref())
+            {
+                let from_catalog = catalog
+                    .snapshot()
+                    .await
+                    .models
+                    .iter()
+                    .find(|m| m.id == model)
+                    .and_then(|m| m.max_input_tokens);
+                if from_catalog.is_some() {
+                    return from_catalog;
+                }
+            }
+        }
+        let provider = self.provider_for(provider_id).await.ok()?;
+        provider
+            .capabilities(Some(model))
+            .context_window
+            .map(|w| w.value)
+    }
+
+    /// The window a session's system prompt is budgeted for (CTX4), resolved ONCE per
+    /// opening: the window frozen in the session's capability snapshot (`snapshot`,
+    /// what its provider reported when it was opened) when it holds one, else
+    /// [`Self::known_context_window`], else — for the Claude Code ENGINE only —
+    /// [`CLAUDE_CODE_FLOOR_WINDOW`]. The prompt is built once per opening and the
+    /// composer is pure in this window, so the budget — hence the cached prefix —
+    /// does not move between the turns of a session.
+    ///
+    /// Why an engine floor for Claude Code: its sessions often run on the CLI's OAuth
+    /// login with no API key, so the live Anthropic catalog can be unreachable (static
+    /// fallback, no `max_input_tokens`) and nexus declares no window for the CLI. The
+    /// CLI states no window at `system_init`; it reports one only in its `result`
+    /// (`modelUsage.*.contextWindow`), i.e. after the prompt is built, and taking it
+    /// then would move the budget mid-session. So an unknown window on that engine
+    /// keeps the budget it always had (40 000 characters, the 200K-token window it
+    /// used to assume from the model's name), decided by the engine, never the name.
+    /// A native provider with an unknown window keeps the 10 000 fallback.
+    pub(crate) async fn session_context_window(
+        &self,
+        provider_id: &str,
+        model: &str,
+        snapshot: Option<&str>,
+    ) -> Option<u64> {
+        if let Some(window) = snapshot_context_window(snapshot) {
+            return Some(window);
+        }
+        if let Some(window) = self.known_context_window(provider_id, model).await {
+            return Some(window);
+        }
+        (provider_id == super::provider::resolver::CLAUDE_CODE).then_some(CLAUDE_CODE_FLOOR_WINDOW)
     }
 
     /// The provider instance, built-in or stored. A stored instance becomes a
@@ -15043,6 +15252,7 @@ impl ChatManager {
                     permission_mode: request.permission_mode.as_deref(),
                     message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 0,
+                    owner,
                 },
             )
             .await;
@@ -15286,8 +15496,25 @@ impl ChatManager {
         // What waited for this session's next turn before it closed or the server
         // restarted.
         let held = self.held_slot(session_id).await;
+        // The window the per-turn enrichment is capped for (CTX4): the one frozen at the
+        // opening (registered after the snapshot is stored), else the catalog's.
+        let context_window = match node.as_ref() {
+            Some(n) => {
+                self.session_context_window(
+                    n.provider_id
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or(super::provider::resolver::CLAUDE_CODE),
+                    &n.model,
+                    n.capabilities.as_deref(),
+                )
+                .await
+            }
+            None => None,
+        };
         AgentTurnState {
             memory,
+            context_window,
             protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
             held,
             protocol_state: spawned.and_then(|s| s.protocol_state),
@@ -15679,6 +15906,12 @@ impl ChatManager {
                 node.project_slug.as_deref(),
                 message,
                 Some(&node.model),
+                self.session_context_window(
+                    &provider_id,
+                    &node.model,
+                    node.capabilities.as_deref(),
+                )
+                .await,
                 &sid,
                 None,
             )
@@ -15711,6 +15944,7 @@ impl ChatManager {
                     moved_in: false,
                     message,
                     next_turn: 0,
+                    owner: node.owner.as_deref(),
                 },
             )
             .await;
@@ -17061,7 +17295,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let (prompt, note_ids) = manager
-            .build_system_prompt(None, "test", None, None, None)
+            .build_system_prompt(None, "test", None, None, None, None)
             .await;
         assert!(prompt.contains("Project Orchestrator"));
         assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
@@ -17089,7 +17323,7 @@ mod tests {
         state.neo4j.create_project(&project).await.unwrap();
         let sid = Uuid::new_v4().to_string();
         let plain = manager_in(AnchorContextMode::Off, &state)
-            .build_system_prompt(Some(&project.slug), "plan", None, Some(&sid), None)
+            .build_system_prompt(Some(&project.slug), "plan", None, None, Some(&sid), None)
             .await;
         for mode in [AnchorContextMode::Off, AnchorContextMode::Shadow] {
             let m = manager_in(mode, &state);
@@ -17099,6 +17333,7 @@ mod tests {
                     "/tmp/test-project",
                     Some(&project.slug),
                     "plan",
+                    None,
                     None,
                     &sid,
                     None,
@@ -17122,6 +17357,7 @@ mod tests {
                 Some(&project.slug),
                 "plan",
                 None,
+                None,
                 &sid,
                 None,
             )
@@ -17129,7 +17365,7 @@ mod tests {
         let (first, _) = build().await;
         let (second, _) = build().await;
         let base = m
-            .build_system_prompt(Some(&project.slug), "plan", None, Some(&sid), None)
+            .build_system_prompt(Some(&project.slug), "plan", None, None, Some(&sid), None)
             .await
             .0;
         assert!(
@@ -17161,6 +17397,7 @@ mod tests {
             Default::default(),
             Default::default(),
             &anchor_in(AnchorContextMode::On),
+            None,
         )
         .await
         .expect("a neutral session without anchor gets the notice");
@@ -17177,6 +17414,7 @@ mod tests {
                 Default::default(),
                 Default::default(),
                 &anchor_in(mode),
+                None,
             )
             .await;
             assert!(
@@ -17463,6 +17701,7 @@ mod tests {
             Default::default(),
             Default::default(),
             &anchor,
+            None,
         )
         .await
         .expect("the notice");
@@ -17486,6 +17725,7 @@ mod tests {
             Default::default(),
             Default::default(),
             &anchor,
+            None,
         )
         .await;
         assert_eq!(seen.lock().unwrap().len(), 2);
@@ -17516,6 +17756,7 @@ mod tests {
                 Default::default(),
                 Default::default(),
                 &anchor,
+                None,
             )
         };
         let system = || async {
@@ -17524,6 +17765,7 @@ mod tests {
                 &s.cwd,
                 None,
                 "hello",
+                None,
                 None,
                 &sid,
                 None,
@@ -17590,6 +17832,7 @@ mod tests {
                 Default::default(),
                 Default::default(),
                 &anchor_in(AnchorContextMode::On),
+                None,
             )
             .await;
             per_turn.push(reads() - b);
@@ -17606,6 +17849,7 @@ mod tests {
                 Default::default(),
                 Default::default(),
                 &shared,
+                None,
             )
             .await;
             cached.push(reads() - b);
@@ -17626,6 +17870,7 @@ mod tests {
                 Default::default(),
                 Default::default(),
                 &shadow,
+                None,
             )
             .await;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -17633,6 +17878,165 @@ mod tests {
         }
         eprintln!("shadow reads per turn (turn included): {sh:?}");
         assert_eq!(sh[1], sh[2], "the shadow adds nothing after the first run");
+    }
+
+    /// CTX4: the PO prompt is budgeted from the model's KNOWN window, whatever the
+    /// model (a 128K DeepSeek carries what a 128K Claude carries, not the 10 000 of an
+    /// unknown window), and the window a session's prompt is built with is the one
+    /// frozen at its opening: two builds of the same session give the same prompt,
+    /// byte for byte, even when the provider has learned another window since.
+    #[tokio::test]
+    async fn the_prompt_budget_reads_the_window_and_holds_across_turns() {
+        use crate::notes::{Note, NoteType};
+        let state = mock_app_state();
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+        // A project context well past the unknown-window budget (10 000).
+        for i in 0..50 {
+            let note = Note::new(
+                Some(project.id),
+                NoteType::Gotcha,
+                format!(
+                    "gotcha {i}: {}",
+                    "the dynamic context must hold this ".repeat(40)
+                ),
+                "test".into(),
+            );
+            state.neo4j.create_note(&note).await.unwrap();
+        }
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let build = |model: &'static str, window: Option<u64>| {
+            let manager = &manager;
+            let slug = project.slug.clone();
+            async move {
+                manager
+                    .build_system_prompt(
+                        Some(&slug),
+                        "help me plan",
+                        Some(model),
+                        window,
+                        None,
+                        None,
+                    )
+                    .await
+                    .0
+            }
+        };
+        let deepseek = build("deepseek-chat", Some(128_000)).await;
+        let claude = build("claude-sonnet-4-6", Some(128_000)).await;
+        let unknown = build("deepseek-chat", None).await;
+        assert_eq!(
+            deepseek, claude,
+            "same window, same prompt, whatever the name"
+        );
+        assert!(
+            deepseek.len() > unknown.len() + 15_000,
+            "known 128K window: {} chars, unknown: {}",
+            deepseek.len(),
+            unknown.len()
+        );
+
+        // The window of a session is the one frozen in its snapshot when it holds one:
+        // a resume rebuilds the prompt with the same budget.
+        let snapshot = r#"{"context_window":{"value":128000,"source":"probed"}}"#;
+        assert_eq!(snapshot_context_window(Some(snapshot)), Some(128_000));
+        assert_eq!(snapshot_context_window(Some("{}")), None);
+        assert_eq!(snapshot_context_window(Some("not json")), None);
+        assert_eq!(snapshot_context_window(None), None);
+        let w1 = manager
+            .session_context_window("unknown-provider", "deepseek-chat", Some(snapshot))
+            .await;
+        let w2 = manager
+            .session_context_window("unknown-provider", "deepseek-chat", Some(snapshot))
+            .await;
+        assert_eq!((w1, w2), (Some(128_000), Some(128_000)));
+        // No snapshot and nobody knows the window: unknown, never guessed from the name.
+        assert_eq!(
+            manager
+                .session_context_window("unknown-provider", "claude-opus-4-6", None)
+                .await,
+            None
+        );
+        let first_turn = build("deepseek-chat", w1).await;
+        let second_turn = build("deepseek-chat", w2).await;
+        assert_eq!(first_turn, second_turn);
+        assert_eq!(first_turn, deepseek);
+    }
+
+    /// CTX4, review of #748: a Claude Code session whose Anthropic catalog is
+    /// unreachable (OAuth login, no API key: the static fallback has no window) keeps
+    /// the 40 000-character budget, by ENGINE, never by the model's name; a native
+    /// provider with an unknown window keeps the 10 000 fallback.
+    #[tokio::test]
+    async fn a_claude_code_session_with_an_unreachable_catalog_keeps_40_000() {
+        use super::super::composer::{
+            compute_dynamic_budget, turn_enrichment_cap, DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET,
+        };
+        use super::super::provider::resolver::CLAUDE_CODE;
+        use crate::chat::model_catalog::ModelCatalogCache;
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+        let state = mock_app_state();
+        // No key: the catalog never fetches and serves the static fallback, which
+        // knows no window.
+        let offline = ModelCatalogCache::new(None);
+        assert!(offline
+            .snapshot()
+            .await
+            .models
+            .iter()
+            .all(|m| m.max_input_tokens.is_none()));
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_cognitive_routing(
+                CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new()))
+                    .with_claude_code_catalog(offline),
+            );
+        assert_eq!(
+            manager
+                .known_context_window(CLAUDE_CODE, "claude-sonnet-4-6")
+                .await,
+            None,
+            "the window is really unknown here"
+        );
+
+        // Creation (no snapshot yet) and a reopen whose snapshot states no window.
+        for snapshot in [None, Some("{}")] {
+            let window = manager
+                .session_context_window(CLAUDE_CODE, "claude-sonnet-4-6", snapshot)
+                .await;
+            assert_eq!(window, Some(CLAUDE_CODE_FLOOR_WINDOW));
+            assert_eq!(compute_dynamic_budget(window, 0), 40_000);
+            assert_eq!(compute_dynamic_budget(window, 50_000), 40_000);
+            assert_eq!(turn_enrichment_cap(window), 40_000);
+        }
+        // Decided by the engine, not the name: any model on Claude Code.
+        assert_eq!(
+            manager
+                .session_context_window(CLAUDE_CODE, "some-future-model", None)
+                .await,
+            Some(CLAUDE_CODE_FLOOR_WINDOW)
+        );
+        // A known window still wins over the floor.
+        assert_eq!(
+            manager
+                .session_context_window(
+                    CLAUDE_CODE,
+                    "claude-sonnet-4-6",
+                    Some(r#"{"context_window":{"value":1000000,"source":"catalog"}}"#),
+                )
+                .await,
+            Some(1_000_000)
+        );
+        // A native provider with an unknown window, even with a Claude name: 10 000.
+        let native = manager
+            .session_context_window("unknown-provider", "claude-sonnet-4-6", None)
+            .await;
+        assert_eq!(native, None);
+        assert_eq!(
+            compute_dynamic_budget(native, 0),
+            DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET
+        );
+        assert_eq!(turn_enrichment_cap(native), 10_000);
     }
 
     #[tokio::test]
@@ -17643,7 +18047,7 @@ mod tests {
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let (prompt, _note_ids) = manager
-            .build_system_prompt(Some(&project.slug), "help me plan", None, None, None)
+            .build_system_prompt(Some(&project.slug), "help me plan", None, None, None, None)
             .await;
 
         // Contains the base prompt
@@ -20015,7 +20419,14 @@ mod tests {
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let (prompt, _note_ids) = manager
-            .build_system_prompt(Some(&project.slug), "check the plan", None, None, None)
+            .build_system_prompt(
+                Some(&project.slug),
+                "check the plan",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
 
         // Base prompt present
@@ -22275,6 +22686,7 @@ mod tests {
             permission_mode: None,
             message: "hello",
             next_turn: 0,
+            owner: None,
         };
         // The opening that will fail: its router, its token.
         let mut failed = OpeningCleanup::new(&sid, &manager.turn_routing);
@@ -24606,6 +25018,7 @@ mod tests {
         let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
 
         let session = ActiveSession {
+            context_window: None,
             anchor: Default::default(),
             mirror_tap: None,
             events_tx: tx,
@@ -26360,6 +26773,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(16);
 
         let session = ActiveSession {
+            context_window: None,
             anchor: Default::default(),
             mirror_tap: None,
             events_tx: tx,
@@ -30616,6 +31030,7 @@ pub(crate) mod test_support {
             );
         }
         let session = ActiveSession {
+            context_window: None,
             anchor: Default::default(),
             mirror_tap: None,
             events_tx,
@@ -31748,6 +32163,7 @@ mod image_turn_services_tests {
             provider_imposed: false,
             allowed_models: None,
             routing_pool: None,
+            auto_models: None,
             conversation_routes: false,
             current_model: "flash".into(),
             next_turn: 0,
