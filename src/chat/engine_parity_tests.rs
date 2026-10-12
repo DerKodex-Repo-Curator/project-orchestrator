@@ -2574,8 +2574,13 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Cause::Harness,
         format!("active_tasks_update avec t7={tracked}"),
     );
-    // The task is tracked: the claim has started (or is about to start) its reading of
-    // the CLI's descendants. The background process may start now.
+    // The task is tracked. The claim reads the CLI's descendants, then again a second
+    // later: the process must start between the two readings. The legacy engine takes
+    // the first reading before it announces the task; the agent engine (nexus) takes it
+    // in a task of its own, started after the announcement, through `ps` (slow under
+    // Code Coverage: a fork at once was overtaken there). The process starts 400 ms
+    // after the announcement: after the first reading, well before the second.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     std::fs::write(bg_go(&cwd), b"").unwrap();
     w.said(WAIT, "answered bg").await;
     // The PID claim lands about a second after the process: waited on as such, with a
