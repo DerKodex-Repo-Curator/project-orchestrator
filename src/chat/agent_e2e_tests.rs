@@ -13795,6 +13795,7 @@ mod file_scope_lift {
             program: fake_bin("nexus-tools"),
             browser: None,
             obscura: None,
+            embedded_obscura: false,
             deny_paths: vec![ssh.clone()],
         };
         let consents = nt::GraphConsents(Arc::new(crate::neo4j::mock::MockGraphStore::new()));

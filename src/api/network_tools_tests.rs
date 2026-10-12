@@ -557,10 +557,20 @@ async fn native_session_args(
     sid: &str,
     obscura: Option<std::path::PathBuf>,
 ) -> Vec<String> {
+    native_session_args_with(graph, sid, obscura, "#!/bin/sh\n").await
+}
+
+/// [`native_session_args`] with a `nexus-tools` that is this shell script.
+async fn native_session_args_with(
+    graph: Arc<MockGraphStore>,
+    sid: &str,
+    obscura: Option<std::path::PathBuf>,
+    nexus_tools_script: &str,
+) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;
     let bin = tempfile::TempDir::new().unwrap();
     let program = bin.path().join("nexus-tools");
-    std::fs::write(&program, "#!/bin/sh\n").unwrap();
+    std::fs::write(&program, nexus_tools_script).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let state = mock_app_state_with_graph(graph);
     let mut config = crate::chat::config::ChatConfig::from_env();
@@ -724,4 +734,28 @@ async fn a_native_session_is_offered_webfetch_once_the_project_consents_to_an_or
     assert_eq!(status, StatusCode::NO_CONTENT);
     let revoked = native_session_tools(graph, "p6-revoked").await;
     assert!(!revoked.iter().any(|t| t == "WebFetch"), "{revoked:?}");
+}
+
+/// A release nexus-tools (decision 1e9d7501): it embeds Obscura, so search is keyless by
+/// default. Nothing declared, nothing consented: the engine is passed all the same (`obscura`, in
+/// process) and WebSearch is offered; the consent is judged at the call (the first search names
+/// https://html.duckduckgo.com). A nexus-tools without the feature gives no default engine.
+#[tokio::test]
+async fn a_nexus_tools_that_embeds_obscura_gives_a_keyless_websearch_by_default() {
+    let (_app, graph) = app().await;
+    let embeds = "#!/bin/sh\n[ \"$1\" = --capabilities ] && echo '{\"version\":\"0.5.1\",\"tls\":true,\"obscura\":true}'\n";
+    let args = native_session_args_with(graph.clone(), "builtin-on", None, embeds).await;
+    let at = args
+        .iter()
+        .position(|a| a == "--search-engine")
+        .expect("the built-in engine is passed");
+    assert_eq!(args[at + 1], "obscura", "{args:?}");
+    assert!(tools_of(&args).iter().any(|t| t == "WebSearch"), "{args:?}");
+
+    let plain = native_session_args(graph, "builtin-off", None).await;
+    assert!(!plain.iter().any(|a| a == "--search-engine"), "{plain:?}");
+    assert!(
+        !tools_of(&plain).iter().any(|t| t == "WebSearch"),
+        "{plain:?}"
+    );
 }

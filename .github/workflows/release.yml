@@ -125,6 +125,15 @@ jobs:
             echo "::error::frontend dist has no third-party-licenses.txt (the frontend build generates it)"
             exit 1
           fi
+          # nexus-tools embeds Obscura (Apache-2.0: its LICENSE and NOTICE verbatim) and links V8 (the
+          # license texts of the prebuilt library, vendored in the nexus repository at the pinned revision).
+          nexus_ws="$(cargo metadata --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "nexus-tools" and (.source // "" | startswith("git+"))) | .manifest_path' \
+            | head -1 | xargs dirname | xargs dirname)"
+          test -f "$nexus_ws/obscura/NOTICE"
+          test -f "$nexus_ws/obscura/licenses/v8/NOTICE"
+          extra+=(--notices "Obscura (vendored in nexus-tools, Apache-2.0)=$nexus_ws/obscura")
+          extra+=(--notices "V8 and its third-party code (linked into nexus-tools)=$nexus_ws/obscura/licenses/v8")
           scripts/third-party-licenses.sh "${extra[@]}" licenses-out/THIRD-PARTY-LICENSES.txt
           head -20 licenses-out/THIRD-PARTY-LICENSES.txt
 
@@ -309,10 +318,15 @@ jobs:
       # degraded_features. It ships NEXT TO the orchestrator executable in every archive (light and
       # full), and from there in Homebrew, .deb, .rpm and the desktop app; the server finds it there
       # (src/chat/config.rs, detect_nexus_tools_path; NEXUS_TOOLS_PATH overrides). Built at the
-      # nexus revision Cargo.toml pins, with https (`--features tls`): scripts/build-nexus-tools.sh,
-      # the same script the CI runs (.github/actions/nexus-fakes).
-      - name: Build nexus-tools (pinned nexus revision, tls)
+      # nexus revision Cargo.toml pins, with https and Obscura embedded (`--features tls,obscura`: the
+      # keyless search and the browser, nothing to install next to it; V8 checksum-verified):
+      # scripts/build-nexus-tools.sh, the same script the CI runs (.github/actions/nexus-fakes).
+      # The macOS 10.15 "legacy" build keeps `tls` only: V8's prebuilt library does not promise
+      # to run that far back.
+      - name: Build nexus-tools (pinned nexus revision, tls + obscura)
         shell: bash
+        env:
+          NEXUS_TOOLS_FEATURES: ${{ matrix.legacy && 'tls' || 'tls,obscura' }}
         run: scripts/build-nexus-tools.sh "$RUNNER_TEMP/nexus-tools" --target ${{ matrix.target }} --target-dir target/nexus-tools
 
       # The license files of every archive: ours (LICENSE, LICENSE-MIT, LICENSE-EE) and the third-party

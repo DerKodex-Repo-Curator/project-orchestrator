@@ -459,12 +459,16 @@ session of the project is offered `WebFetch` once any origin is consented; each 
 
 `{"allowed": true|false}` → `{allowed, authorized_by?, authorized_at?}`. 400 `invalid_browser_setting`.
 The browser is attached only when its executable is found too: `obscura` on the `PATH`, or the Obscura
-executable with `chat.obscura_browser: true` / `OBSCURA_BROWSER=1`.
+executable with `chat.obscura_browser: true` / `OBSCURA_BROWSER=1`, or else the browser embedded in
+nexus-tools (release builds, `nexus-tools obscura mcp`).
 
 ### GET /api/chat/search-engines[?project={slug}] -- Protected
 
 The search engines (tool providers), each with `origin`, `grant_id` (`tool:<id>`), `key_granted`, and with
-`?project=` `origin_consented`.
+`?project=` `origin_consented`. When the server's nexus-tools embeds Obscura and no `obscura` engine is
+declared, the list also holds the built-in `{"id": "obscura-builtin", "engine": "obscura", "builtin": true}`
+(not stored, not deletable): a project that consents to `https://html.duckduckgo.com` gets a keyless
+`WebSearch` from it when no other engine is attached.
 
 ### POST /api/chat/search-engines -- Protected (human only)
 

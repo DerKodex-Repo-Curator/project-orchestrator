@@ -42,8 +42,9 @@ use crate::auth::jwt::Claims;
 use crate::chat::provider::endpoint_guard::origin_of;
 use crate::chat::provider::errors::OpenFailure;
 use crate::chat::provider::nexus_tools::{
-    BrowserAuthorization, SearchProviderRecord, ToolOriginConsent, BROWSER_KEY,
-    SEARCH_PROVIDER_PREFIX, TOOL_ORIGIN_PREFIX, TOOL_PROVIDER_PREFIX,
+    builtin_obscura_engine, BrowserAuthorization, SearchProviderRecord, ToolOriginConsent,
+    BROWSER_KEY, BUILTIN_OBSCURA_ID, SEARCH_PROVIDER_PREFIX, TOOL_ORIGIN_PREFIX,
+    TOOL_PROVIDER_PREFIX,
 };
 use crate::chat::provider::settings::{project_scope, valid_id, GLOBAL};
 use crate::vault::{GrantScope, SecretSelector};
@@ -174,6 +175,16 @@ async fn engines(state: &OrchestratorState) -> Result<Vec<SearchProviderRecord>,
         .filter_map(|(_, raw)| serde_json::from_str(raw).ok())
         .collect();
     engines.sort_by(|a, b| a.id.cmp(&b.id));
+    // The built-in engine (decision 1e9d7501): shown when the server's nexus-tools embeds
+    // Obscura and no `obscura` engine is declared. Not stored, so not deletable; a project still
+    // consents to its origin like to any other.
+    if !engines.iter().any(|e| e.engine == "obscura") {
+        if let Some(manager) = state.chat_manager.as_ref() {
+            if manager.nexus_tools_embeds_obscura().await {
+                engines.push(builtin_obscura_engine());
+            }
+        }
+    }
     Ok(engines)
 }
 
@@ -189,6 +200,9 @@ pub struct SearchEngineView {
     key_granted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     origin_consented: Option<bool>,
+    /// The built-in `obscura` engine: not declared by anyone, used when no other engine is.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    builtin: bool,
 }
 
 fn engine_view(
@@ -210,12 +224,14 @@ fn engine_view(
             .as_deref()
             .is_some_and(|o| consented.iter().any(|c| c.origin == o))
     });
+    let builtin = record.id == BUILTIN_OBSCURA_ID;
     SearchEngineView {
         record,
         origin,
         grant_id,
         key_granted,
         origin_consented,
+        builtin,
     }
 }
 
