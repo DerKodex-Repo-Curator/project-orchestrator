@@ -227,6 +227,15 @@ fn build_native_for_sessions(
     let Some(root) = transcripts else {
         return build_native(record, vault);
     };
+    if super::transcripts::inside_git_worktree(root) {
+        // The files hold the conversation in clear: never where a `git add -A` would
+        // publish them. Memory instead: the sessions do not resume after a restart.
+        tracing::warn!(
+            instance = %record.id,
+            "native transcripts kept in memory: their directory is inside a git work tree"
+        );
+        return build_native(record, vault);
+    }
     let known = KnownSecrets::new();
     let store = super::transcripts::store_for(root, &record.id, known.clone()).map_err(|e| {
         // The path may name a user; keep only the kind of failure.
@@ -562,6 +571,19 @@ impl nexus_claude::agent::AgentSession for KeyedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CTX6: a transcript root inside a git work tree is never written: the instance
+    /// still builds, with its transcripts in memory.
+    #[test]
+    fn a_transcript_root_inside_a_git_work_tree_keeps_the_transcripts_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let root = tmp.path().join("native-transcripts");
+        let built =
+            build_native_for_sessions(&record("none", Some("llama_server")), None, Some(&root));
+        assert!(built.is_ok());
+        assert!(!root.exists(), "nothing is created inside the work tree");
+    }
 
     /// CTX6: the resolver of a session-running instance registers the key it reads
     /// from the vault, so the transcript store of that instance masks its VALUE.
