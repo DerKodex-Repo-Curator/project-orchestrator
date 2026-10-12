@@ -76,6 +76,13 @@ pub(crate) fn mask_agent_event_with(
 /// `done.error` of an error turn, or a retryable terminal `error`.
 fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     match event {
+        // A turn its configured time limit stopped (`error_timeout`) is not a transient
+        // failure: running it again would hit the same limit (ISO5). A silent model
+        // stream (the endpoint's idle deadline) is `error_during_execution` and retries.
+        AgentEvent::Done {
+            subtype: Some(subtype),
+            ..
+        } if subtype == "error_timeout" => None,
         AgentEvent::Done {
             is_error: true,
             error: Some(error),
@@ -505,6 +512,12 @@ pub trait TurnServices: Send + Sync {
     /// Sees each event of the session as it is emitted (the work log of the turn).
     /// Default: nothing.
     fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
+    /// Sees the (masked) events the provider sent between turns, before the session emits
+    /// them flattened (`background_output`). Whoever follows a Claude Code sub-agent still
+    /// running in the background after the turn (`chat::mirror`) reads them in their
+    /// structured form (`event_map::structured_out_of_turn`); nothing is emitted nor stored
+    /// from here. Default: nothing.
+    fn observe_out_of_turn(&self, _session_id: &str, _events: &[AgentEvent]) {}
     /// After each turn played (not one refused before it was sent): the
     /// Claude Code engine's post-stream steps — post-compaction re-injection,
     /// objective tracking, memory, feedback, observations. The host bounds each of
@@ -2273,6 +2286,12 @@ async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent:
         .into_iter()
         .map(mask_agent_event)
         .collect();
+    // Seen first by whoever follows a sub-agent still running in the background (its
+    // mirror): the batch as emitted, a notification of its end among it, comes after it, as
+    // the provider sent them.
+    if let Some(services) = &handle.services {
+        services.observe_out_of_turn(&handle.session_id, &events);
+    }
     let chat_events = {
         let mut mapper = handle.mapper.lock().await;
         out_of_band_to_chat_events(&events, &mut mapper, chrono::Utc::now())
@@ -2875,6 +2894,22 @@ mod mask_tests {
             error: ProviderError::Overloaded
         })
         .is_some());
+        // A turn its configured time limit stopped is not run again (ISO5); a silent model
+        // stream (the same typed timeout, `error_during_execution`) still is.
+        let timeout = |subtype: &str| {
+            let mut event = done(
+                true,
+                Some(ProviderError::Timeout {
+                    after_ms: 1_800_000,
+                }),
+            );
+            if let AgentEvent::Done { subtype: s, .. } = &mut event {
+                *s = Some(subtype.to_string());
+            }
+            event
+        };
+        assert!(retryable_failure(&timeout("error_timeout")).is_none());
+        assert!(retryable_failure(&timeout("error_during_execution")).is_some());
     }
 }
 

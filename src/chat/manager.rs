@@ -2180,6 +2180,18 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         }
     }
 
+    /// What a Claude Code sub-agent still running in the background prints between the
+    /// parent's turns reaches its mirror in the form a turn shows it (P18c); the parent
+    /// itself shows it flattened, as before, and its work log is not touched.
+    fn observe_out_of_turn(&self, _session_id: &str, events: &[nexus_claude::agent::AgentEvent]) {
+        let Some(tap) = &self.mirror else { return };
+        for event in events {
+            for structured in super::provider::event_map::structured_out_of_turn(event) {
+                tap.observe(&structured);
+            }
+        }
+    }
+
     /// The post-stream steps of the Claude Code engine, with the same functions:
     /// post-compaction re-injection, objective tracking, memory / feedback /
     /// observations. Interrupt cleanup and auto-continue are the runtime's.
@@ -6353,8 +6365,28 @@ impl ChatManager {
     }
 
     /// The passive observer that mirrors the sub-agents of the Claude Code session
-    /// `session_id` into read-only child conversations (`chat::mirror`, P18c).
+    /// `session_id` into read-only child conversations (`chat::mirror`, P18c), on the
+    /// historical engine: what the CLI prints out of turn goes through `oob_listener`, which
+    /// the tap does not see.
     pub(crate) fn mirror_tap(&self, session_id: &str) -> Option<Arc<super::mirror::MirrorTap>> {
+        self.spawn_mirror_tap(session_id, false)
+    }
+
+    /// The same on the agent engine, whose out-of-turn pump shows the tap what the CLI
+    /// prints between turns (`TurnServices::observe_out_of_turn`): a background
+    /// sub-agent's mirror follows it until the CLI notifies its end.
+    pub(crate) fn agent_mirror_tap(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<super::mirror::MirrorTap>> {
+        self.spawn_mirror_tap(session_id, true)
+    }
+
+    fn spawn_mirror_tap(
+        &self,
+        session_id: &str,
+        follows_out_of_turn: bool,
+    ) -> Option<Arc<super::mirror::MirrorTap>> {
         if !self.subagent_mirrors {
             return None;
         }
@@ -6366,6 +6398,7 @@ impl ChatManager {
                 nats: self.nats.clone(),
                 registry: Arc::clone(&self.mirrors),
             },
+            follows_out_of_turn,
         ))
     }
 
@@ -14836,6 +14869,16 @@ impl ChatManager {
             spec.max_turns = u32::try_from(self.config.max_turns).ok();
         }
         spec.limits.max_tokens = max_tokens;
+        // A native session has no wall-clock cap on a turn and no token budget unless the
+        // operator sets one (ISO5, Claude Code has neither): `chat.native_turn_timeout_secs`,
+        // `chat.native_session_max_tokens`. A budget the request names wins.
+        if kind == nexus_claude::agent::ProviderKind::Native {
+            spec.limits.turn_timeout_ms = self
+                .config
+                .native_turn_timeout_secs
+                .map(|secs| secs.saturating_mul(1000));
+            spec.limits.max_tokens = max_tokens.or(self.config.native_session_max_tokens);
+        }
         spec.env = EnvSpec {
             inherit: Self::child_env_inherit_names(),
             set: Default::default(),
@@ -14843,6 +14886,16 @@ impl ChatManager {
         // What the historical engine sets in a local Claude CLI's environment, so its shell
         // behaves the same on the agent engine (M2): the operator's PATH (`process_path`),
         // and what `orchestrator secret get` needs to read a granted secret through a pipe.
+        // The operator's PATH reaches a local NATIVE session too: its shell is nexus-tools,
+        // which inherits PATH from the backend process, the bare launchd one
+        // (`/usr/bin:/bin:/usr/sbin:/sbin`) when the server runs as a service: `cargo`, `npm`...
+        // were not found (ISO5, measured on session 36d623c8). The secrets below stay
+        // Claude Code's.
+        if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
+            if let Some(path) = self.env_config.read().await.process_path.clone() {
+                spec.env.set.insert("PATH".to_string(), path);
+            }
+        }
         if kind == nexus_claude::agent::ProviderKind::ClaudeCode && remote_cwd.is_none() {
             if let Some(path) = self.env_config.read().await.process_path.clone() {
                 spec.env.set.insert("PATH".to_string(), path);
@@ -15329,7 +15382,7 @@ impl ChatManager {
                         // Claude Code runs its sub-agents itself: they get read-only mirrors
                         // (P18c). A native session's sub-agents are real children already.
                         matches!(kind, nexus_claude::agent::ProviderKind::ClaudeCode)
-                            .then(|| self.mirror_tap(session_id))
+                            .then(|| self.agent_mirror_tap(session_id))
                             .flatten(),
                     ),
                 ),
@@ -16669,6 +16722,8 @@ mod tests {
             session_token_expiry_secs: 86400,
             read_only_mcp_tools: Vec::new(),
             lasting_rules_dir: None,
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
         }
     }
 
@@ -17839,11 +17894,83 @@ mod tests {
             env.get("PO_SERVER_URL").map(String::as_str),
             Some("http://127.0.0.1:18123")
         );
-        // A remote machine gets none of it; the native harness has its own shell (nexus-tools).
+        // A remote machine gets none of it.
         assert!(env_of(ProviderKind::ClaudeCode, Some("~/w"))
             .await
             .is_empty());
-        assert!(env_of(ProviderKind::Native, None).await.is_empty());
+        // A local native session gets the PATH (its shell, nexus-tools, inherits it: under
+        // launchd the server's own is /usr/bin:/bin:/usr/sbin:/sbin, ISO5), and nothing else.
+        let native = env_of(ProviderKind::Native, None).await;
+        assert_eq!(
+            native.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["PATH"],
+            "{native:?}"
+        );
+        assert_eq!(
+            native.get("PATH").map(String::as_str),
+            Some("/opt/tools/bin:/usr/bin:/bin")
+        );
+        assert!(env_of(ProviderKind::Native, Some("~/w")).await.is_empty());
+    }
+
+    /// ISO5: a native session has no turn wall-clock cap and no token budget by default
+    /// (Claude Code has neither; a 30 min cap and a 10 M budget, cache reads included, cut
+    /// a working DeepSeek session). Configured, both reach the session's limits; a budget
+    /// the request names wins; another provider is not given them.
+    #[tokio::test]
+    async fn native_session_limits_are_unset_by_default_and_passed_through_when_configured() {
+        use nexus_claude::agent::{ProviderKind, SessionLimits};
+        let limits_of = |config: ChatConfig, kind: ProviderKind, max_tokens: Option<u64>| async move {
+            let state = mock_app_state();
+            let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+            manager
+                .build_agent_spec(AgentSpecInput {
+                    file_scope_lifted: false,
+                    cwd: "/tmp",
+                    model: "m",
+                    system_prompt: "p",
+                    permission_mode: None,
+                    add_dirs: &[],
+                    user_claims: None,
+                    session_id: "limits-s1",
+                    third_party: kind != ProviderKind::ClaudeCode,
+                    max_tokens,
+                    kind,
+                    remote_cwd: None,
+                    per_session_mcp: false,
+                    hooks: None,
+                })
+                .await
+                .unwrap()
+                .limits
+        };
+        // Nothing configured: no cap, no budget.
+        assert_eq!(
+            limits_of(test_config(), ProviderKind::Native, None).await,
+            SessionLimits::default()
+        );
+        let mut configured = test_config();
+        configured.native_turn_timeout_secs = Some(45 * 60);
+        configured.native_session_max_tokens = Some(25_000_000);
+        let limits = limits_of(configured.clone(), ProviderKind::Native, None).await;
+        assert_eq!(limits.turn_timeout_ms, Some(45 * 60 * 1000));
+        assert_eq!(limits.max_tokens, Some(25_000_000));
+        // The request's own budget wins over the configured one.
+        let limits = limits_of(configured.clone(), ProviderKind::Native, Some(1_000)).await;
+        assert_eq!(limits.max_tokens, Some(1_000));
+        // Not a native session: the native settings do not apply.
+        let limits = limits_of(configured, ProviderKind::ClaudeCode, None).await;
+        assert_eq!(limits.turn_timeout_ms, None);
+        assert_eq!(limits.max_tokens, None);
+    }
+
+    #[test]
+    fn native_limit_settings_read_a_positive_number_or_nothing() {
+        assert_eq!(ChatConfig::positive(Some("1800")), Some(1800));
+        assert_eq!(ChatConfig::positive(Some(" 42 ")), Some(42));
+        for unset in [None, Some(""), Some("0"), Some("-5"), Some("30m")] {
+            assert_eq!(ChatConfig::positive(unset), None, "{unset:?}");
+        }
     }
 
     /// M2: the built-in Claude Code of the agent engine opens with the CLI path set NOW
