@@ -66,6 +66,43 @@
 //! normal `Open`-state probe-granting logic runs — so a caller that keeps
 //! polling `can_attempt` is eventually granted a new probe instead of
 //! waiting forever on one that will never resolve.
+//!
+//! # Ownership vs the other "instance unavailable" mechanisms
+//!
+//! Review of PR #753 rightly asked which mechanism owns model health, so
+//! the same failure is not counted twice. Reading the tree (12/10/2026),
+//! there are three pre-existing ones, each on a *different* object, and
+//! this breaker is a fourth. The boundary that keeps them from
+//! double-counting is the **kind of call whose outcome each one listens
+//! to** — not the error itself:
+//!
+//! - `nexus-tools/src/search/resilience.rs::Breaker` — a near-identical
+//!   3-state breaker, but for **web search engines** (WebSearch / Obscura),
+//!   in another crate and another layer. Unrelated to LLM provider health;
+//!   do not confuse the two `Breaker` types, do not merge them.
+//! - `cognitive::decider::ProbeLog` — the **capabilities** of an
+//!   (instance, model): does it call tools, is it usable at all. Feeds
+//!   `supports_tools` / the "capability unknown" rejection, which is
+//!   orthogonal to health (`RejectReason::NoTools` ≠
+//!   `RejectReason::Unhealthy`). Listens only to *capability probes* fired
+//!   when a candidate pool is built.
+//! - `cognitive::candidates::HealthCache` — the **current** health of an
+//!   instance, from an *active* probe cached for a 60 s window. This is
+//!   today's source of `ModelFacts.healthy`. Listens only to its own
+//!   synthetic probe.
+//!
+//! This breaker owns a fourth thing: health observed **passively**, from
+//! the outcomes of *real production calls*, with anti-flapping (cooldown +
+//! single half-open probe) that a per-window active cache cannot give. So
+//! when it is wired (OR-3bis) it must NOT become a second writer of
+//! `ModelFacts.healthy` beside `HealthCache`; it sits *in front* of it — an
+//! `Open` breaker short-circuits `healthy` to `false` without an active
+//! probe, otherwise `HealthCache` decides as it does today. Each failure is
+//! then counted once: production outcomes feed this breaker, the synthetic
+//! health probe feeds `HealthCache`, capability probes feed `ProbeLog`.
+//! `force_open_until` is the one door the QUOTA task writes through, so a
+//! known reset time also flows through this single short-circuit rather
+//! than a parallel one.
 
 use std::time::{Duration, Instant};
 
