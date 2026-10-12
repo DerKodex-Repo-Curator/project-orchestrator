@@ -17,6 +17,7 @@ pub mod feedback;
 pub mod mode;
 pub mod report;
 pub mod scorer;
+pub mod segment;
 pub mod signature;
 pub mod store;
 pub(crate) mod wiring;
