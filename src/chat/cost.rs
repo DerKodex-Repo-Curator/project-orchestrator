@@ -158,7 +158,9 @@ fn add_to(slot: &mut Option<u64>, value: Option<u64>) {
 
 /// Sums `(seq, result event payload)` pairs: the payload is the stored JSON of a
 /// `ChatEvent::Result` (`usage` and `model` are read; anything else is ignored).
-pub fn session_usage<'a>(results: impl IntoIterator<Item = (i64, &'a serde_json::Value)>) -> SessionUsage {
+pub fn session_usage<'a>(
+    results: impl IntoIterator<Item = (i64, &'a serde_json::Value)>,
+) -> SessionUsage {
     let mut out = SessionUsage::default();
     for (seq, data) in results {
         out.turns += 1;
@@ -168,7 +170,10 @@ pub fn session_usage<'a>(results: impl IntoIterator<Item = (i64, &'a serde_json:
         let count = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
         let turn = TurnUsage {
             seq,
-            model: data.get("model").and_then(|m| m.as_str()).map(str::to_string),
+            model: data
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_string),
             input_tokens: count("input_tokens"),
             output_tokens: count("output_tokens"),
             cache_read_tokens: count("cache_read_tokens"),
@@ -284,7 +289,10 @@ mod tests {
         assert_eq!((u.turns, u.turns_with_usage), (3, 2));
         assert_eq!(u.input_tokens, Some(4200));
         assert_eq!(u.cache_read_tokens, Some(3800));
-        assert_eq!(u.cache_creation_tokens, None, "never reported: unknown, not zero");
+        assert_eq!(
+            u.cache_creation_tokens, None,
+            "never reported: unknown, not zero"
+        );
         assert_eq!(u.reasoning_tokens, Some(20));
         assert_eq!(u.by_turn.len(), 2);
         assert_eq!(u.by_turn[0].cache_hit_ratio, Some(0.0));
@@ -293,7 +301,10 @@ mod tests {
         assert_eq!(u.by_turn[1].model.as_deref(), Some("deepseek-v4-pro"));
         assert!((u.cache_hit_ratio.unwrap() - 3800.0 / 8000.0).abs() < 1e-12);
         let none = session_usage(std::iter::empty());
-        assert_eq!((none.turns, none.input_tokens, none.cache_hit_ratio), (0, None, None));
+        assert_eq!(
+            (none.turns, none.input_tokens, none.cache_hit_ratio),
+            (0, None, None)
+        );
     }
 
     #[test]
@@ -307,7 +318,11 @@ mod tests {
         let r = report(&[native, cc, without]);
         assert_eq!(r.total.cache_read_tokens, Some(1000));
         assert_eq!(r.total.cache_write_tokens, Some(50));
-        assert_eq!(r.total.input_tokens, Some(30), "the cached part is not in the input");
+        assert_eq!(
+            r.total.input_tokens,
+            Some(30),
+            "the cached part is not in the input"
+        );
         assert_eq!(r.by_provider["deepseek"].cache_read_tokens, Some(800));
         assert_eq!(
             r.by_provider["deepseek"].cache_write_tokens, None,

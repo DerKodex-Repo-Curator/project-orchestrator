@@ -14823,6 +14823,15 @@ impl ChatManager {
                 ),
             }
         }
+        // The native harness writes this id in its per-request log line (`native model
+        // request`, `host_session_id`), so a model request is tied to this conversation
+        // (CTX0). Other providers ignore an extension that is not theirs.
+        if kind == nexus_claude::agent::ProviderKind::Native {
+            spec.extensions.insert(
+                "native".to_string(),
+                serde_json::json!({ "host_session_id": session_id }),
+            );
+        }
         if has_turn_limits {
             spec.max_turns = u32::try_from(self.config.max_turns).ok();
         }
@@ -17727,6 +17736,49 @@ mod tests {
         assert!(!has_hooks(ProviderKind::ClaudeCode, Some("~/w"), scope(false)).await);
         // No scope, no hooks.
         assert!(!has_hooks(ProviderKind::Native, None, None).await);
+    }
+
+    /// CTX0: a native session names its conversation to the harness
+    /// (`extensions.native.host_session_id`), which writes it in the log line of every
+    /// model request; another provider is given no such extension.
+    #[tokio::test]
+    async fn a_native_session_spec_carries_the_conversation_id_for_the_request_log() {
+        use nexus_claude::agent::ProviderKind;
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let spec_of = |kind: ProviderKind| {
+            let manager = &manager;
+            async move {
+                manager
+                    .build_agent_spec(AgentSpecInput {
+                        file_scope_lifted: false,
+                        cwd: "/tmp",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: None,
+                        session_id: "36d623c8-c7f6-4818-bcb3-26da85a97380",
+                        third_party: kind != ProviderKind::ClaudeCode,
+                        max_tokens: None,
+                        kind,
+                        remote_cwd: None,
+                        per_session_mcp: false,
+                        hooks: None,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let native = spec_of(ProviderKind::Native).await;
+        assert_eq!(
+            native.extension("native"),
+            Some(&serde_json::json!({
+                "host_session_id": "36d623c8-c7f6-4818-bcb3-26da85a97380"
+            }))
+        );
+        let claude = spec_of(ProviderKind::ClaudeCode).await;
+        assert!(claude.extension("native").is_none(), "{claude:?}");
     }
 
     /// M2: a local Claude Code on the agent engine gets in its own environment what the

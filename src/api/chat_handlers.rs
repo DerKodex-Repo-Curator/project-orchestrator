@@ -674,7 +674,12 @@ pub async fn get_session_usage(
         results.extend(
             page.iter()
                 .filter(|e| e.event_type == "result")
-                .filter_map(|e| Some((e.seq, serde_json::from_str::<serde_json::Value>(&e.data).ok()?))),
+                .filter_map(|e| {
+                    Some((
+                        e.seq,
+                        serde_json::from_str::<serde_json::Value>(&e.data).ok()?,
+                    ))
+                }),
         );
         if (page.len() as i64) < PAGE || last <= after {
             break;
@@ -3255,6 +3260,60 @@ mod tests {
         assert_eq!(body["by_provider"]["claude-code"]["executions"], 2);
         assert_eq!(body["by_task_class"]["simple"]["executions"], 2);
         assert_eq!(body["by_model"]["llama"]["unknown_cost_executions"], 1);
+    }
+
+    /// CTX0: a conversation's usage, turn by turn, read from its stored `result` events:
+    /// a native turn's cache reads are there, an unreported cache write stays absent, and
+    /// only `result` events count. An unknown session is a 404.
+    #[tokio::test]
+    async fn the_session_usage_route_sums_the_stored_turns_with_their_cache_reads() {
+        let h = action_harness(None).await;
+        let session = crate::test_helpers::test_chat_session(None);
+        h.graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        let record = |seq: i64, kind: &str, data: serde_json::Value| {
+            crate::neo4j::models::ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: sid,
+                seq,
+                event_type: kind.to_string(),
+                data: data.to_string(),
+                created_at: chrono::Utc::now(),
+            }
+        };
+        h.graph
+            .store_chat_events(
+                sid,
+                vec![
+                    record(0, "user_message", serde_json::json!({"type": "user_message", "content": "a"})),
+                    record(1, "result", serde_json::json!({
+                        "type": "result", "model": "deepseek-v4-pro",
+                        "usage": {"input_tokens": 4000, "output_tokens": 100, "cache_read_tokens": 0}
+                    })),
+                    record(2, "user_message", serde_json::json!({"type": "user_message", "content": "b"})),
+                    record(3, "result", serde_json::json!({
+                        "type": "result", "model": "deepseek-v4-pro",
+                        "usage": {"input_tokens": 200, "output_tokens": 50, "cache_read_tokens": 3800}
+                    })),
+                ],
+            )
+            .await
+            .unwrap();
+        let (status, body) = call(&h.app, auth_get(&format!("/api/chat/sessions/{sid}/usage"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["turns"], 2, "{body}");
+        assert_eq!(body["input_tokens"], 4200);
+        assert_eq!(body["output_tokens"], 150);
+        assert_eq!(body["cache_read_tokens"], 3800);
+        assert!(body["cache_creation_tokens"].is_null(), "never reported: {body}");
+        assert_eq!(body["by_turn"][1]["seq"], 3);
+        assert_eq!(body["by_turn"][1]["cache_hit_ratio"], 0.95);
+        let (status, _) = call(
+            &h.app,
+            auth_get(&format!("/api/chat/sessions/{}/usage", Uuid::new_v4())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
