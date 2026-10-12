@@ -240,7 +240,7 @@ pub struct ParentEnvelope {
 /// `git worktree add`), so a `.git` file planted anywhere cannot borrow a repository. Its
 /// `commondir` then names the repository's `.git`. `None`: not a linked worktree (no `.git`, a
 /// `.git` DIRECTORY, a broken or forged link). Pure file reads: no `git` process.
-fn worktree_repository(dir: &str) -> Option<PathBuf> {
+fn worktree_repository(dir: &str) -> Option<(PathBuf, PathBuf)> {
     let start = resolve_path(dir);
     for candidate in start.ancestors() {
         let dot_git = candidate.join(".git");
@@ -263,18 +263,44 @@ fn worktree_repository(dir: &str) -> Option<PathBuf> {
             return None;
         }
         let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
-        return std::fs::canonicalize(admin.join(common.trim())).ok();
+        let repository = std::fs::canonicalize(admin.join(common.trim())).ok()?;
+        return Some((candidate.to_path_buf(), repository));
     }
     None
+}
+
+/// Whether `worktree` (a resolved worktree root) is too broad to be a child's working directory:
+/// the filesystem root, the home directory or one of its ancestors, or an ancestor of a place no
+/// file tool may reach. A parent in trust with a shell could otherwise fake a worktree there
+/// (`~/.git` plus an admin directory in its own repository) to give its child `cwd = ~`.
+fn too_broad_for_a_worktree(worktree: &Path, home: Option<&Path>, denied: &[PathBuf]) -> bool {
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    worktree.parent().is_none()
+        || home.is_some_and(|home| real(home).starts_with(worktree) || home.starts_with(worktree))
+        || denied
+            .iter()
+            .any(|place| real(place).starts_with(worktree) || place.starts_with(worktree))
 }
 
 impl ParentEnvelope {
     /// Whether `cwd` is a linked git worktree of a repository whose `.git` lies under one of the
     /// parent's directories ([`worktree_repository`]).
     fn is_worktree_of_a_root_repo(&self, cwd: &str) -> bool {
-        worktree_repository(cwd).is_some_and(|repo| {
+        self.worktree_allowed(
+            cwd,
+            dirs::home_dir().as_deref(),
+            &crate::chat::provider::nexus_tools::host_deny_paths(None),
+        )
+    }
+
+    /// [`Self::is_worktree_of_a_root_repo`] for a given home and deny list: a linked worktree of a
+    /// repository under the parent's directories, whose root is not too broad
+    /// ([`too_broad_for_a_worktree`]).
+    fn worktree_allowed(&self, cwd: &str, home: Option<&Path>, denied: &[PathBuf]) -> bool {
+        worktree_repository(cwd).is_some_and(|(worktree, repo)| {
             let repo = repo.to_string_lossy();
-            self.roots.iter().any(|root| is_within(root, &repo))
+            !too_broad_for_a_worktree(&worktree, home, denied)
+                && self.roots.iter().any(|root| is_within(root, &repo))
         })
     }
 
@@ -807,6 +833,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Follow-up review of #729 (point 4): a parent in trust with a shell can fake a worktree
+    /// (`~/.git` plus an admin directory in its own repository). Its root may not be the
+    /// filesystem root, the home directory or one of its ancestors, nor an ancestor of a place
+    /// no file tool may reach.
+    #[test]
+    fn a_worktree_root_may_not_be_the_root_the_home_or_above_a_denied_place() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let home = base.join("home");
+        let elsewhere = base.join("elsewhere");
+        let secrets = elsewhere.join("vault");
+        for dir in [&home, &secrets] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let denied = vec![secrets.join("vault.json")];
+        for broad in [
+            Path::new("/"),
+            home.as_path(),
+            base.as_path(),
+            elsewhere.as_path(),
+            secrets.as_path(),
+        ] {
+            assert!(
+                too_broad_for_a_worktree(broad, Some(&home), &denied),
+                "{broad:?}"
+            );
+        }
+        for fine in [home.join("src/wt"), elsewhere.join("wt")] {
+            assert!(
+                !too_broad_for_a_worktree(&fine, Some(&home), &denied),
+                "{fine:?}"
+            );
+        }
+    }
+
+    /// The same rule through the envelope: a worktree faked AT the home (a `.git` file pointing at
+    /// a real admin directory of the parent's repository, back-link included) is refused; the
+    /// same worktree elsewhere is accepted.
+    #[test]
+    fn a_worktree_faked_at_the_home_is_refused() {
+        let (_p, outside, root, wt) = repo_with_outside_worktree();
+        let envelope = envelope_over("trust", &root);
+        let wt_path = std::fs::canonicalize(&wt).unwrap();
+        let unrelated_home = outside.path().join("not-home");
+        assert!(envelope.worktree_allowed(&wt, Some(&unrelated_home), &[]));
+        // The worktree root is the home itself, or the home lies below it.
+        assert!(!envelope.worktree_allowed(&wt, Some(&wt_path), &[]));
+        assert!(!envelope.worktree_allowed(&wt, Some(&wt_path.join("me")), &[]));
+        // A denied place below the worktree root.
+        assert!(!envelope.worktree_allowed(&wt, Some(&unrelated_home), &[wt_path.join(".aws")]));
     }
 
     #[test]

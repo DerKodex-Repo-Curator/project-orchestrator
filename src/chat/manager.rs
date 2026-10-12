@@ -14769,6 +14769,16 @@ impl ChatManager {
                         "unknown permission mode or malformed tool pattern",
                     ))
                 })?;
+        // A session (re)built in a mode other than trust is no longer lifted (decision fce98b8a):
+        // a REST resume in a lower mode clears the stored flag, so a later switch back to trust
+        // by anyone but a person keeps it scoped.
+        let file_scope_lifted =
+            if file_scope_lifted && policy.mode != nexus_claude::agent::PolicyMode::Trust {
+                self.set_file_scope_lifted(session_id, false).await;
+                false
+            } else {
+                file_scope_lifted
+            };
         // The project is read before the hooks scope is consumed: it is what the consent of
         // the network tools is tied to (A28).
         let project_slug = hooks.as_ref().and_then(|scope| scope.project_slug.clone());
@@ -14849,6 +14859,9 @@ impl ChatManager {
         // opening (#598); its profile is signed into a per-session token, its network tools
         // follow the project's consent by origin and the browser its authorisation (#596).
         let mut gate: Option<Vec<String>> = None;
+        // The temporary directory of the session's `nexus-tools` (its command outputs): one of
+        // the directories its hooks hold it to once it leaves trust.
+        let mut gate_temp_dir: Option<std::path::PathBuf> = None;
         // The names of the native engine's own servers are reserved (P11b): a server of
         // the session named `nexus` would replace nexus-tools, and its tools would pass for
         // the built-in ones (`mcp__nexus__Read` granted whole for the session).
@@ -14876,7 +14889,7 @@ impl ChatManager {
                         &nt::NexusToolsConfig {
                             program,
                             browser,
-                            deny_paths: nt::host_deny_paths(),
+                            deny_paths: nt::host_deny_paths(self.config_yaml_path.as_deref()),
                         },
                         &nt::GraphConsents(self.graph.clone()),
                         self.vault.as_deref(),
@@ -14907,6 +14920,7 @@ impl ChatManager {
                         );
                     }
                     attach_native_servers(&mut spec.mcp_servers, attachment.servers)?;
+                    gate_temp_dir = attachment.temp_dir.clone();
                     gate = Some(attachment.search_origins);
                 }
                 None => tracing::warn!(
@@ -15010,7 +15024,14 @@ impl ChatManager {
                     project_slug,
                     search_origins,
                 )
-                .with_scope_dirs(spec.cwd.clone(), spec.extra_dirs.clone()),
+                .with_scope_dirs(
+                    spec.cwd.clone(),
+                    spec.extra_dirs
+                        .iter()
+                        .cloned()
+                        .chain(gate_temp_dir)
+                        .collect(),
+                ),
             ));
         }
         Ok(spec)
@@ -18133,11 +18154,19 @@ mod tests {
             program.canonicalize().unwrap()
         );
         // Nothing from the host's environment: only the session's own key and the profile
-        // it signs (#596), never on argv.
+        // it signs (#596), never on argv, and its own private temporary directory (decision
+        // fce98b8a: its command outputs live there, one of its directories).
         assert_eq!(
             env.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["NEXUS_TOOLS_KEY", "NEXUS_TOOLS_PROFILE"]
+            [
+                "NEXUS_TOOLS_KEY",
+                "NEXUS_TOOLS_PROFILE",
+                "TEMP",
+                "TMP",
+                "TMPDIR"
+            ]
         );
+        assert!(env["TMPDIR"].ends_with("nexus-s1"), "{}", env["TMPDIR"]);
         assert!(!args.contains(&env["NEXUS_TOOLS_PROFILE"]));
         assert!(!args.iter().any(|a| a == "--trust-harness"));
         let tools_at = args.iter().position(|a| a == "--tools").unwrap() + 1;

@@ -1060,7 +1060,11 @@ async fn handle_ws_chat_loop(
                                                     // A PERSON putting their session in trust lifts its
                                                     // file scope (decision fce98b8a); anyone else
                                                     // changes the mode only.
-                                                    if lifts_file_scope_on_switch(&claims, &mode) {
+                                                    let owner = match session_id.parse::<uuid::Uuid>() {
+                                                        Ok(id) => state.orchestrator.neo4j().get_chat_session(id).await.ok().flatten().and_then(|node| node.owner),
+                                                        Err(_) => None,
+                                                    };
+                                                    if lifts_file_scope_on_switch(&claims, &mode, owner.as_deref()) {
                                                         chat_manager.lift_file_scope(&session_id).await;
                                                     }
                                                     // Send confirmation back to frontend
@@ -1436,12 +1440,16 @@ pub(crate) async fn may_answer_permissions(
     }
 }
 
-/// Whether a WebSocket switch to `mode` by `claims` lifts the session's file scope (decision
-/// fce98b8a): a person ([`Claims::may_lift_file_scope`]) choosing trust (`trust` or
-/// `bypassPermissions`). The owner was checked before ([`may_answer_permissions`]).
-pub(crate) fn lifts_file_scope_on_switch(claims: &Claims, mode: &str) -> bool {
+/// Whether a WebSocket switch to `mode` by `claims` lifts the file scope of a session owned by
+/// `owner` (decision fce98b8a): a person ([`Claims::may_lift_file_scope`]) choosing trust
+/// (`trust` or `bypassPermissions`) on a session THEY own. [`may_answer_permissions`] lets anyone
+/// change the mode of a session without an owner (runner, delegation and protocol sessions):
+/// such a session is never lifted, whoever switches it.
+pub(crate) fn lifts_file_scope_on_switch(claims: &Claims, mode: &str, owner: Option<&str>) -> bool {
     use crate::chat::envelope::{mode_rank, TRUST_RANK};
-    claims.may_lift_file_scope() && mode_rank(mode) >= TRUST_RANK
+    claims.may_lift_file_scope()
+        && owner == Some(claims.sub.as_str())
+        && mode_rank(mode) >= TRUST_RANK
 }
 
 /// An `always` answer these claims may not give (`Claims::may_keep_lasting_approvals`),
@@ -1752,10 +1760,23 @@ mod tests {
             sub: uuid::Uuid::new_v4().to_string(),
             ..Claims::anonymous()
         };
-        assert!(lifts_file_scope_on_switch(&person, "trust"));
-        assert!(lifts_file_scope_on_switch(&person, "bypassPermissions"));
+        let mine = Some(person.sub.as_str());
+        assert!(lifts_file_scope_on_switch(&person, "trust", mine));
+        assert!(lifts_file_scope_on_switch(
+            &person,
+            "bypassPermissions",
+            mine
+        ));
+        // Follow-up review of #729 (point 2): a session without an owner (runner, delegation,
+        // protocol) or someone else's is never lifted, whoever switches it.
+        assert!(!lifts_file_scope_on_switch(&person, "trust", None));
+        assert!(!lifts_file_scope_on_switch(
+            &person,
+            "trust",
+            Some("someone-else")
+        ));
         for mode in ["default", "acceptEdits", "auto", "plan"] {
-            assert!(!lifts_file_scope_on_switch(&person, mode), "{mode}");
+            assert!(!lifts_file_scope_on_switch(&person, mode, mine), "{mode}");
         }
         let mcp = Claims {
             token_type: Some(crate::auth::jwt::TOKEN_TYPE_MCP.into()),
@@ -1771,7 +1792,11 @@ mod tests {
             ("service", Claims::service_account("protocol-agent:x")),
             ("anonymous", Claims::anonymous()),
         ] {
-            assert!(!lifts_file_scope_on_switch(&claims, "trust"), "{who}");
+            let theirs = Some(claims.sub.clone());
+            assert!(
+                !lifts_file_scope_on_switch(&claims, "trust", theirs.as_deref()),
+                "{who}"
+            );
         }
     }
 
