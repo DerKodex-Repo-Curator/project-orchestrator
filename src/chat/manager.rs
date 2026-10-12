@@ -15224,25 +15224,64 @@ impl ChatManager {
         // The consent of the project and the revocation of the token are checked before ANY
         // other hook, and whether or not the session has the knowledge-graph hooks.
         if let Some(search_origins) = gate {
-            spec.hooks = Some(Arc::new(
-                super::provider::nexus_tools::ToolAccessHooks::new(
-                    spec.hooks.take(),
-                    Arc::new(super::provider::nexus_tools::GraphConsents(
-                        self.graph.clone(),
-                    )),
-                    session_id,
-                    project_slug,
-                    search_origins,
-                )
-                .with_scope_dirs(
-                    spec.cwd.clone(),
-                    spec.extra_dirs
-                        .iter()
-                        .cloned()
-                        .chain(gate_temp_dir)
-                        .collect(),
-                ),
-            ));
+            let mut access = super::provider::nexus_tools::ToolAccessHooks::new(
+                spec.hooks.take(),
+                Arc::new(super::provider::nexus_tools::GraphConsents(
+                    self.graph.clone(),
+                )),
+                session_id,
+                project_slug,
+                search_origins,
+            )
+            .with_scope_dirs(
+                spec.cwd.clone(),
+                spec.extra_dirs
+                    .iter()
+                    .cloned()
+                    .chain(gate_temp_dir)
+                    .collect(),
+            );
+            // Rock'n roll (trust) is autonomy: the network tools do not wait for a consent of the
+            // project, they tell the person what they reached (a public origin only).
+            if let Some(manager) = self.weak_self() {
+                let opened_in_trust = spec.policy.mode == nexus_claude::agent::PolicyMode::Trust;
+                let (probe_manager, probe_session) = (manager.clone(), session_id.to_owned());
+                let in_trust: super::provider::nexus_tools::TrustProbe = Arc::new(move || {
+                    let Some(manager) = probe_manager.upgrade() else {
+                        return false;
+                    };
+                    let live = manager
+                        .agent_modes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&probe_session)
+                        .cloned();
+                    // The mode set while the session runs wins; without one, the opening mode.
+                    match live {
+                        Some(mode) => {
+                            super::provider::policy::parse_mode(&mode).is_some_and(|pair| {
+                                pair.neutral == nexus_claude::agent::PolicyMode::Trust
+                            })
+                        }
+                        None => opened_in_trust,
+                    }
+                });
+                let notice_session = session_id.to_owned();
+                let notice: super::provider::nexus_tools::TrustNotice =
+                    Arc::new(move |content: String| {
+                        let (manager, session_id) = (manager.clone(), notice_session.clone());
+                        tokio::spawn(async move {
+                            let Some(manager) = manager.upgrade() else {
+                                return;
+                            };
+                            if let Some(handle) = manager.agent_runtime.get(&session_id).await {
+                                handle.emit(ChatEvent::SystemHint { content }).await;
+                            }
+                        });
+                    });
+                access = access.with_trust(in_trust, notice);
+            }
+            spec.hooks = Some(Arc::new(access));
         }
         Ok(spec)
     }
