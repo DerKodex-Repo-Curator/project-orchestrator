@@ -1516,6 +1516,11 @@ pub struct ChatSession {
     /// The models PO may route this conversation among (`mixed`), as ticked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// `"claude_code"` on a READ-ONLY mirror of a Claude Code sub-agent (`chat::mirror`,
+    /// P18c): its thread is copied from its parent's stream, it has no process, a message
+    /// sent to it is refused (409 `mirror_read_only`). Omitted for every other session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_of: Option<String>,
 }
 
 /// What a chat session is doing *right now*, read from the live
@@ -2840,6 +2845,7 @@ mod tests {
     #[test]
     fn test_chat_session_serde_roundtrip() {
         let session = ChatSession {
+            mirror_of: None,
             routing_mode: None,
             routing_pool: None,
             id: "test-id".into(),
@@ -3066,6 +3072,7 @@ mod tests {
     #[test]
     fn test_chat_session_with_workspace_and_add_dirs() {
         let session = ChatSession {
+            mirror_of: None,
             routing_mode: None,
             routing_pool: None,
             id: "s1".into(),

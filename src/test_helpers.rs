@@ -526,6 +526,7 @@ pub fn test_release(project_id: Uuid, version: &str) -> ReleaseNode {
 pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
     ChatSessionNode {
         file_scope_lifted: false,
+        mirror_of: None,
         routing_pool: None,
         routing_mode: None,
         id: Uuid::new_v4(),

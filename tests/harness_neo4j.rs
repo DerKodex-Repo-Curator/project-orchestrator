@@ -46,6 +46,7 @@ async fn env() -> Option<Env> {
 fn node(id: Uuid) -> ChatSessionNode {
     ChatSessionNode {
         file_scope_lifted: false,
+        mirror_of: None,
         routing_pool: None,
         routing_mode: None,
         id,

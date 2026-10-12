@@ -119,6 +119,12 @@ pub async fn create_session(
     if let Some(sid) = request.session_id.clone() {
         Uuid::parse_str(&sid)
             .map_err(|_| AppError::BadRequest("Invalid session_id UUID".to_string()))?;
+        // A read-only mirror of a Claude Code sub-agent takes no message (P18c): 409
+        // `mirror_read_only`, before anything is sent, proxied or resumed.
+        chat_manager
+            .refuse_if_mirror(&sid)
+            .await
+            .map_err(|e| AppError::from_open_error(e, None))?;
 
         chat_manager
             .check_provider_binding(&sid, request.provider.as_deref())
@@ -364,6 +370,7 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         routed_by: s.routed_by,
         execution_place: s.execution_place,
         access: s.access,
+        mirror_of: s.mirror_of,
     }
 }
 
@@ -1087,6 +1094,12 @@ pub async fn respond_permission(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
+    // A read-only mirror of a Claude Code sub-agent (P18c) is answered in its parent.
+    if session.mirror_of.is_some() {
+        return Err(AppError::Provider(Box::new(
+            crate::chat::mirror::MirrorReadOnly::failure(),
+        )));
+    }
     // Only the person the session belongs to answers it (review #679 finding 6): another
     // signed-in user could otherwise approve, or grant for the session, a call in someone
     // else's conversation. A caller without claims (authentication off) is nobody: a
@@ -1197,7 +1210,7 @@ pub async fn send_session_message(
     if body.content.trim().is_empty() {
         return Err(AppError::BadRequest("content must not be empty".into()));
     }
-    state
+    let node = state
         .orchestrator
         .neo4j()
         .get_chat_session(session_id)
@@ -1206,6 +1219,14 @@ pub async fn send_session_message(
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
 
     let sid = session_id.to_string();
+    // A read-only mirror of a Claude Code sub-agent takes no message (P18c): 409
+    // `mirror_read_only`, before anything is composed, extracted or routed (read from the
+    // node just read: no second lookup).
+    if node.mirror_of.is_some() {
+        return Err(AppError::Provider(Box::new(
+            crate::chat::mirror::MirrorReadOnly::failure(),
+        )));
+    }
     let claims = claims.map(|axum::Extension(c)| c);
     let content = crate::refs::compose::compose_user_message(
         &state.orchestrator.neo4j_arc(),
@@ -1225,8 +1246,23 @@ pub async fn send_session_message(
         .await
     {
         Ok(route) => Ok(Json(serde_json::json!({ "routed": route }))),
-        Err(MessageDeliveryError::Resume(e)) => Err(AppError::Internal(e)),
-        Err(MessageDeliveryError::SendAndResume { resume, .. }) => Err(AppError::Internal(resume)),
+        Err(MessageDeliveryError::Resume(e)) => Err(mirror_or_internal(e)),
+        Err(MessageDeliveryError::SendAndResume { resume, .. }) => Err(mirror_or_internal(resume)),
+        Err(MessageDeliveryError::MirrorReadOnly) => Err(AppError::Provider(Box::new(
+            crate::chat::mirror::MirrorReadOnly::failure(),
+        ))),
+    }
+}
+
+/// A failed delivery: the typed 409 `mirror_read_only` when a mirror refused it (P18c),
+/// an internal error otherwise (as before).
+fn mirror_or_internal(e: anyhow::Error) -> AppError {
+    if e.chain()
+        .any(|c| c.is::<crate::chat::mirror::MirrorReadOnly>())
+    {
+        AppError::Provider(Box::new(crate::chat::mirror::MirrorReadOnly::failure()))
+    } else {
+        AppError::Internal(e)
     }
 }
 
@@ -5184,6 +5220,145 @@ mod tests {
 
     fn msg_uri(sid: Uuid) -> String {
         format!("/api/chat/sessions/{sid}/messages")
+    }
+
+    /// A parent session and its read-only mirror of a Claude Code sub-agent (P18c).
+    async fn seed_mirror(h: &ActionHarness) -> (Uuid, Uuid) {
+        let parent = seed_session(h).await;
+        let mirror = crate::neo4j::models::ChatSessionNode {
+            mirror_of: Some(crate::chat::mirror::MIRROR_OF_CLAUDE_CODE.to_string()),
+            spawned_by: Some(
+                crate::chat::types::SpawnedBy::Conversation {
+                    parent_session_id: parent,
+                    tool_use_id: Some("toolu_task".into()),
+                }
+                .to_json_string(),
+            ),
+            ..test_chat_session(None)
+        };
+        h.graph.create_chat_session(&mirror).await.unwrap();
+        (parent, mirror.id)
+    }
+
+    /// P18c: every REST write to a mirror is refused with 409 `mirror_read_only` — a
+    /// message, a message through `POST /api/chat/sessions` (`chat(send_message)` with a
+    /// `session_id`), a permission answer — and nothing reaches its thread.
+    #[tokio::test]
+    async fn a_mirror_refuses_every_rest_write_with_409_mirror_read_only() {
+        let h = action_harness(None).await;
+        let (_parent, mirror) = seed_mirror(&h).await;
+        for req in [
+            auth_post(&msg_uri(mirror), r#"{"content":"hello"}"#),
+            auth_post(
+                "/api/chat/sessions",
+                &serde_json::json!({"message": "hello", "session_id": mirror.to_string()})
+                    .to_string(),
+            ),
+            auth_post(&perm_uri(mirror, "r1"), r#"{"allow":true}"#),
+            // M1: a move to another provider would open a writable session holding the call.
+            auth_post(
+                &format!("/api/chat/sessions/{mirror}/switch-provider"),
+                r#"{"provider":"claude-code","message":"go on"}"#,
+            ),
+        ] {
+            let (status, body) = call(&h.app, req).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "mirror_read_only", "{body}");
+            assert_eq!(body["retryable"], false, "{body}");
+        }
+        assert!(h
+            .graph
+            .get_chat_events(mirror, 0, 100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!h.manager.is_session_active(&mirror.to_string()).await);
+        assert_eq!(
+            h.graph.get_session_children(_parent).await.unwrap().len(),
+            1,
+            "no second child holds the call"
+        );
+    }
+
+    /// P18c (M7): deleting an OPEN mirror ends it for its tap — never written again, never
+    /// written anew for its call — and it is no longer live.
+    #[tokio::test]
+    async fn deleting_an_open_mirror_stops_its_tap() {
+        let h = action_harness(None).await;
+        let parent = seed_session(&h).await;
+        let tap = h.manager.mirror_tap(&parent.to_string()).expect("a tap");
+        tap.observe(&ChatEvent::ToolUse {
+            id: "toolu_task".into(),
+            tool: "Task".into(),
+            input: serde_json::json!({"prompt": "go"}),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: None,
+        });
+        let said = |t: &str| ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: Some("toolu_task".into()),
+        };
+        tap.observe(&said("working"));
+        tap.flushed().await;
+        let mirror =
+            crate::chat::mirror::test_support::mirrors_of(h.graph.as_ref(), parent).await[0].id;
+        assert!(h.manager.is_session_streaming(&mirror.to_string()).await);
+
+        let (status, body) = call(
+            &h.app,
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/chat/sessions/{mirror}"))
+                .header("authorization", test_bearer_token())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!h.manager.is_session_streaming(&mirror.to_string()).await);
+        tap.observe(&said("after the delete"));
+        tap.flushed().await;
+        assert!(h.graph.get_chat_session(mirror).await.unwrap().is_none());
+        assert!(
+            !crate::chat::mirror::test_support::thread(h.graph.as_ref(), mirror)
+                .await
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AssistantText { content, .. } if content == "after the delete")),
+            "never written again"
+        );
+        assert!(
+            crate::chat::mirror::test_support::mirrors_of(h.graph.as_ref(), parent)
+                .await
+                .is_empty(),
+            "not written anew for its call"
+        );
+    }
+
+    /// P18c: the session object (GET) and the parent's children carry `mirror_of`; a normal
+    /// session leaves the field off the wire.
+    #[tokio::test]
+    async fn a_mirror_says_so_in_the_session_and_the_children() {
+        let h = action_harness(None).await;
+        let (parent, mirror) = seed_mirror(&h).await;
+        let (status, body) = call(&h.app, auth_get(&format!("/api/chat/sessions/{mirror}"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["mirror_of"], "claude_code", "{body}");
+        assert_eq!(body["spawned_by"]["tool_use_id"], "toolu_task", "{body}");
+        let (status, body) = call(
+            &h.app,
+            auth_get(&format!("/api/chat/sessions/{parent}/children")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let children = body
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| body["items"].as_array().cloned().unwrap_or_default());
+        assert_eq!(children.len(), 1, "{body}");
+        assert_eq!(children[0]["mirror_of"], "claude_code", "{body}");
+        let (_, body) = call(&h.app, auth_get(&format!("/api/chat/sessions/{parent}"))).await;
+        assert!(body.get("mirror_of").is_none(), "{body}");
     }
 
     /// Store a one-chunk document so a message can refer to it.

@@ -181,3 +181,110 @@ async fn another_persons_set_permission_mode_is_refused_by_the_websocket_loop() 
     assert_eq!(stored.permission_mode.as_deref(), Some("default"));
     assert!(!stored.file_scope_lifted);
 }
+
+// ── P18c: a read-only mirror of a Claude Code sub-agent refuses every write ─────────
+
+/// A mirror of a Claude Code sub-agent (`chat::mirror`) of some parent.
+fn mirror_session() -> ChatSessionNode {
+    ChatSessionNode {
+        mirror_of: Some(crate::chat::mirror::MIRROR_OF_CLAUDE_CODE.to_string()),
+        spawned_by: Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: uuid::Uuid::new_v4(),
+                tool_use_id: Some("toolu_task".into()),
+            }
+            .to_json_string(),
+        ),
+        ..test_chat_session(None)
+    }
+}
+
+/// Sends `frame` to a mirror and returns the refusal: the FLAT frame
+/// `{type: "error", code: "mirror_read_only", message}`, its message never behind the
+/// generic "Failed to …" prefix (the client recognises the code). Nothing was stored.
+async fn refused_by_a_mirror(frame: Value) -> Value {
+    let session = mirror_session();
+    let (graph, mut ws) = connected(&session).await;
+    ws.send(WsMessage::text(frame.to_string())).await.unwrap();
+    let refused = frame_where(&mut ws, |v| v["type"] == "error").await;
+    assert_eq!(refused["code"], "mirror_read_only", "{refused}");
+    let message = refused["message"].as_str().unwrap();
+    assert!(!message.starts_with("Failed"), "{refused}");
+    assert!(message.contains("read-only"), "{refused}");
+    assert!(
+        graph
+            .get_chat_events(session.id, 0, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing was written to the mirror"
+    );
+    refused
+}
+
+#[tokio::test]
+async fn a_message_to_a_mirror_is_refused_by_the_websocket_loop() {
+    refused_by_a_mirror(json!({"type": "user_message", "content": "hello"})).await;
+}
+
+#[tokio::test]
+async fn a_queued_message_to_a_mirror_is_refused_by_the_websocket_loop() {
+    refused_by_a_mirror(json!({"type": "user_message", "content": "hello", "queue": true})).await;
+}
+
+/// A permission answer (an `AskUserQuestion` of Claude Code is answered the same way).
+#[tokio::test]
+async fn a_permission_answer_to_a_mirror_is_refused_by_the_websocket_loop() {
+    refused_by_a_mirror(
+        json!({"type": "permission_response", "id": "pr_m", "allow": true, "scope": "once"}),
+    )
+    .await;
+}
+
+/// The answer to a question (`input_response`).
+#[tokio::test]
+async fn a_question_answer_to_a_mirror_is_refused_by_the_websocket_loop() {
+    refused_by_a_mirror(json!({"type": "input_response", "id": "q_m", "content": "Postgres"}))
+        .await;
+}
+
+/// A change of model or of permission mode (M7).
+#[tokio::test]
+async fn a_model_or_mode_change_on_a_mirror_is_refused_by_the_websocket_loop() {
+    refused_by_a_mirror(json!({"type": "set_model", "model": "other"})).await;
+    refused_by_a_mirror(json!({"type": "set_permission_mode", "mode": "plan"})).await;
+}
+
+/// The routing's own refusals reach the socket as the same flat frame, whichever way
+/// they come: its `MirrorReadOnly`, or carried by a failed resume (`Resume`) or by a send
+/// then a resume that both failed (`SendAndResume`). Any other failure keeps its text.
+#[test]
+fn a_mirror_refusal_from_the_routing_is_the_flat_frame_on_every_path() {
+    use crate::api::ws_chat_handler::{delivery_error_frame, mirror_read_only_frame};
+    use crate::chat::manager::MessageDeliveryError;
+    let flat = mirror_read_only_frame();
+    assert_eq!(flat["type"], "error");
+    assert_eq!(flat["code"], "mirror_read_only");
+    let mirror = || anyhow::Error::new(crate::chat::mirror::MirrorReadOnly);
+    assert_eq!(
+        delivery_error_frame(&MessageDeliveryError::MirrorReadOnly),
+        flat
+    );
+    assert_eq!(
+        delivery_error_frame(&MessageDeliveryError::Resume(mirror())),
+        flat
+    );
+    assert_eq!(
+        delivery_error_frame(&MessageDeliveryError::SendAndResume {
+            send: anyhow::anyhow!("no stdin"),
+            resume: mirror(),
+        }),
+        flat
+    );
+    let other = delivery_error_frame(&MessageDeliveryError::Resume(anyhow::anyhow!("boom")));
+    assert!(other.get("code").is_none());
+    assert!(other["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("Failed to resume session"));
+}

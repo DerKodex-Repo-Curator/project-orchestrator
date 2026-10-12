@@ -281,6 +281,13 @@ pub struct ChatSessionNode {
     /// leaves trust. Absent on nodes written before it existed: not lifted.
     #[serde(default)]
     pub file_scope_lifted: bool,
+    /// Set on a READ-ONLY mirror of a sub-agent another engine runs by itself
+    /// (`chat::mirror`, P18c): `"claude_code"` for a sub-agent of Claude Code's own
+    /// `Task`/`Agent` tool, copied from its parent's stream. Such a session has no process:
+    /// a message sent to it is refused (409 `mirror_read_only`) and nothing resumes it.
+    /// Absent on every other session (and on the wire: `skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_of: Option<String>,
 }
 
 impl ChatSessionNode {
@@ -3533,6 +3540,7 @@ mod tests {
     fn test_chat_session_node_with_workspace_and_add_dirs() {
         let session = ChatSessionNode {
             file_scope_lifted: false,
+            mirror_of: None,
             routing_pool: None,
             routing_mode: None,
             id: Uuid::new_v4(),
@@ -3572,6 +3580,7 @@ mod tests {
     fn test_chat_session_node_workspace_fields_default() {
         let session = ChatSessionNode {
             file_scope_lifted: false,
+            mirror_of: None,
             routing_pool: None,
             routing_mode: None,
             id: Uuid::new_v4(),

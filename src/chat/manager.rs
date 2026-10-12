@@ -336,6 +336,9 @@ pub struct ActiveSession {
     /// The anchor mode of the session, fixed when it was opened or resumed, and the
     /// cache its turns share: nothing re-reads the environment per turn.
     pub anchor: super::anchor_resolver::AnchorSession,
+    /// Mirrors the sub-agents of this Claude Code session into read-only child
+    /// conversations (`chat::mirror`, P18c): fed by `stream_response`, passive. `None` in tests.
+    pub mirror_tap: Option<Arc<super::mirror::MirrorTap>>,
     /// Persistent broadcast sender — one per session lifetime, NOT replaced per message
     pub events_tx: broadcast::Sender<ChatEvent>,
     /// When the session was last active
@@ -633,6 +636,9 @@ pub enum MessageDeliveryError {
         send: anyhow::Error,
         resume: anyhow::Error,
     },
+    /// The session is a read-only mirror of a Claude Code sub-agent (`chat::mirror`): nothing
+    /// was sent (409 `mirror_read_only`).
+    MirrorReadOnly,
 }
 
 /// Result of `ChatManager::cancel_running_tools`. Surfaced to REST/WS
@@ -958,6 +964,11 @@ pub struct ChatManager {
     /// envelope counts the live children and held until the sub-agent ends, so parallel `Agent`
     /// calls cannot all count the same children and pass the cap together.
     pub(crate) subagent_slots: std::sync::Mutex<HashMap<String, usize>>,
+    /// The read-only mirrors of Claude Code sub-agents this process wrote (`chat::mirror`,
+    /// P18c): idempotency across the taps of a session, and the live view of the open ones.
+    pub(crate) mirrors: Arc<super::mirror::MirrorRegistry>,
+    /// Whether the Claude Code sessions opened here get a mirror tap (always, but in tests).
+    pub(crate) subagent_mirrors: bool,
 }
 
 // ============================================================================
@@ -1218,11 +1229,18 @@ fn is_conclusive_tool(tool_name: &str, input: &serde_json::Value) -> bool {
 /// which carries the rest (the `tool_use_id` join included). `spawned_by` is absent for a
 /// session nothing spawned, `parent_session_id` for an origin that names none (`trigger`).
 fn session_created_payload(request: &ChatRequest, project_slug: Option<&str>) -> serde_json::Value {
+    session_created_payload_of(request.spawned_by.as_deref(), project_slug)
+}
+
+/// [`session_created_payload`] from the session's stored `spawned_by` (a mirror of a Claude
+/// Code sub-agent, `chat::mirror`, has no request): the same trimmed payload.
+pub(crate) fn session_created_payload_of(
+    spawned_by: Option<&str>,
+    project_slug: Option<&str>,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({ "project_slug": project_slug });
-    if let Some(spawned_by) = request
-        .spawned_by
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    if let Some(spawned_by) =
+        spawned_by.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
     {
         let mut trimmed = serde_json::Map::new();
         if let Some(kind) = spawned_by.get("type") {
@@ -1530,6 +1548,9 @@ pub(crate) struct ManagerTurnServices {
     /// Where routing decisions are stored (`CognitiveRouting::store`): a change of model a
     /// turn could not make is written back on its decision. `None`: nowhere.
     routing_store: Option<Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
+    /// Mirrors the sub-agents of a Claude Code session into read-only child conversations
+    /// (`chat::mirror`, P18c), from [`Self::observe`]. `None` for every other provider.
+    mirror: Option<Arc<super::mirror::MirrorTap>>,
 }
 
 /// What a session of the agent engine keeps for the end of its turns: the fields of
@@ -2122,6 +2143,10 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     /// `tool_use_input_resolved`) is logged when its result (or its cancel) arrives,
     /// with the resolved input.
     fn observe(&self, _session_id: &str, event: &ChatEvent) {
+        // A Claude Code sub-agent's activity is mirrored, passively (P18c).
+        if let Some(tap) = &self.mirror {
+            tap.observe(event);
+        }
         let mut open = self
             .session
             .open_tools
@@ -3218,6 +3243,8 @@ impl ChatManager {
             self_ref: Default::default(),
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
+            mirrors: Default::default(),
+            subagent_mirrors: true,
         }
     }
 
@@ -3313,6 +3340,8 @@ impl ChatManager {
             self_ref: Default::default(),
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
+            mirrors: Default::default(),
+            subagent_mirrors: true,
         }
     }
 
@@ -5254,6 +5283,11 @@ impl ChatManager {
                 }
             }
         }
+        // An open mirror of a Claude Code sub-agent works as long as its sub-agent (P18c).
+        for id in self.mirrors.open_ids() {
+            snap.live.insert(id);
+            snap.streaming.insert(id);
+        }
         for (id, pending) in inputs {
             let ids: std::collections::HashSet<String> =
                 pending.lock().await.keys().cloned().collect();
@@ -6347,6 +6381,54 @@ impl ChatManager {
         }
     }
 
+    /// The passive observer that mirrors the sub-agents of the Claude Code session
+    /// `session_id` into read-only child conversations (`chat::mirror`, P18c).
+    pub(crate) fn mirror_tap(&self, session_id: &str) -> Option<Arc<super::mirror::MirrorTap>> {
+        if !self.subagent_mirrors {
+            return None;
+        }
+        Some(super::mirror::MirrorTap::spawn(
+            session_id,
+            super::mirror::MirrorDeps {
+                graph: self.graph.clone(),
+                event_emitter: self.event_emitter.clone(),
+                nats: self.nats.clone(),
+                registry: Arc::clone(&self.mirrors),
+            },
+        ))
+    }
+
+    /// No sub-agent mirror for the sessions this manager opens (tests: the parent's stream
+    /// compared with and without the tap).
+    #[cfg(test)]
+    pub(crate) fn without_subagent_mirrors(mut self) -> Self {
+        self.subagent_mirrors = false;
+        self
+    }
+
+    /// Refuses a message to a read-only mirror of a Claude Code sub-agent
+    /// ([`super::mirror::MirrorReadOnly`], 409 `mirror_read_only`) before anything sends it,
+    /// resumes or proxies it. A session that cannot be read is not refused here (what
+    /// follows reports it).
+    pub async fn refuse_if_mirror(&self, session_id: &str) -> Result<()> {
+        if self.mirrors.is_known_mirror(session_id) || self.mirrors.is_open(session_id) {
+            return Err(super::mirror::MirrorReadOnly.into());
+        }
+        // A session live here is a normal one (a mirror has no process): no graph read on
+        // the path of every write of a live session (a parent answering its sub-agent's
+        // permission never waits on the store).
+        if self.is_session_active(session_id).await {
+            return Ok(());
+        }
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return Ok(());
+        };
+        match self.graph.get_chat_session(uuid).await {
+            Ok(Some(node)) if node.mirror_of.is_some() => Err(super::mirror::MirrorReadOnly.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// Create a new chat session: persist to Neo4j, spawn CLI subprocess, start streaming
     pub async fn create_session(&self, request: &ChatRequest) -> Result<CreateSessionResponse> {
         self.create_session_relayed(request, None).await
@@ -6624,6 +6706,7 @@ impl ChatManager {
         });
         let session_node = ChatSessionNode {
             file_scope_lifted: request.file_scope_lifted,
+            mirror_of: None,
             id: session_id,
             cli_session_id: None,
             project_slug: project_slug.clone(),
@@ -6977,6 +7060,8 @@ impl ChatManager {
                 super::session_grants::Asker::ClaudeCode,
             )
             .await;
+        // Its Claude Code sub-agents are mirrored (P18c, `chat::mirror`).
+        let mirror_tap = self.mirror_tap(&session_id.to_string());
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -6992,6 +7077,7 @@ impl ChatManager {
                 session_id.to_string(),
                 ActiveSession {
                     anchor: self.anchor_session(),
+                    mirror_tap: mirror_tap.clone(),
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
                     cli_session_id: None,
@@ -7841,12 +7927,22 @@ impl ChatManager {
         search: Arc<dyn crate::meilisearch::SearchStore>,
         documents: crate::documents::store::DocumentStore,
     ) {
+        // The tap that mirrors this session's Claude Code sub-agents (P18c, `chat::mirror`):
+        // it sees each event AFTER it was broadcast, and never holds the turn.
+        let mirror_tap = active_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .and_then(|s| s.mirror_tap.clone());
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
                          tx: &broadcast::Sender<ChatEvent>,
                          nats: &Option<Arc<crate::events::NatsEmitter>>,
                          sid: &str| {
             let _ = tx.send(event.clone());
+            if let Some(tap) = &mirror_tap {
+                tap.observe(&event);
+            }
             if let Some(ref nats) = nats {
                 nats.publish_chat_event(sid, event);
             }
@@ -9131,6 +9227,10 @@ impl ChatManager {
                 .await;
         }
 
+        // The turn is over: a sub-agent mirror still open is closed (P18c).
+        if let Some(tap) = &mirror_tap {
+            tap.turn_ended();
+        }
         // 5. Streaming status update (a lock, nothing remote: never bounded)
         let has_pending = post_handler.finalize_streaming_status().await;
 
@@ -9589,6 +9689,9 @@ impl ChatManager {
         content: &str,
         claims: Option<&crate::auth::jwt::Claims>,
     ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        if self.refuse_if_mirror(session_id).await.is_err() {
+            return Err(MessageDeliveryError::MirrorReadOnly);
+        }
         // Read before anything awaits: see `resume_point`.
         let from = self.resume_point(session_id).await;
         if self.is_session_active(session_id).await {
@@ -10135,6 +10238,10 @@ impl ChatManager {
         content: &str,
         claims: Option<&crate::auth::jwt::Claims>,
     ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        // A read-only mirror of a Claude Code sub-agent takes no message (P18c).
+        if self.refuse_if_mirror(session_id).await.is_err() {
+            return Err(MessageDeliveryError::MirrorReadOnly);
+        }
         // A registered session whose CLI has left would swallow the message (the
         // write goes to a closed stdin and the turn ends empty): drop it so the
         // message takes the resume path below.
@@ -10213,6 +10320,7 @@ impl ChatManager {
     }
 
     pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
+        self.refuse_if_mirror(session_id).await?;
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             let pair = super::provider::policy::parse_mode(mode)
                 .ok_or_else(|| anyhow!("Unknown permission mode '{mode}'"))?;
@@ -10376,6 +10484,9 @@ impl ChatManager {
         use super::relay;
         use super::types::SwitchProviderError;
 
+        // A read-only mirror never moves to another provider (P18c): the move would open a
+        // writable session holding the same `tool_use_id`, and write into the mirror's thread.
+        self.refuse_if_mirror(session_id).await?;
         let previous = Uuid::parse_str(session_id)
             .map_err(|_| anyhow::Error::new(SwitchProviderError::InvalidSession))?;
         if message.trim().is_empty() {
@@ -10588,6 +10699,7 @@ impl ChatManager {
     /// Returns `false` for a dormant session, which has no subscribers: the
     /// caller confirms to the asker directly.
     pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<bool> {
+        self.refuse_if_mirror(session_id).await?;
         self.set_session_model_inner(session_id, model, true).await
     }
 
@@ -11102,6 +11214,10 @@ impl ChatManager {
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
+        // A read-only mirror of a Claude Code sub-agent has no process to resume (P18c).
+        if session_node.mirror_of.is_some() {
+            return Err(super::mirror::MirrorReadOnly.into());
+        }
         *opened_on = Some(
             session_node
                 .provider_id
@@ -11362,6 +11478,9 @@ impl ChatManager {
                 super::session_grants::Asker::ClaudeCode,
             )
             .await;
+        // Its Claude Code sub-agents are mirrored (P18c): a new tap per resume, the registry
+        // keeps one mirror per call.
+        let mirror_tap = self.mirror_tap(session_id);
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -11382,6 +11501,7 @@ impl ChatManager {
                 session_id.to_string(),
                 ActiveSession {
                     anchor: self.anchor_session(),
+                    mirror_tap: mirror_tap.clone(),
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
                     cli_session_id: cli_session_id.map(|s| s.to_string()),
@@ -12061,6 +12181,10 @@ impl ChatManager {
 
     /// Subscribe to a session's broadcast channel (used by WebSocket handler)
     pub async fn subscribe(&self, session_id: &str) -> Result<broadcast::Receiver<ChatEvent>> {
+        // An open mirror of a Claude Code sub-agent is followed live (P18c).
+        if let Some(rx) = self.mirrors.subscribe(session_id) {
+            return Ok(rx);
+        }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             return Ok(handle.events_tx.subscribe());
         }
@@ -12097,6 +12221,9 @@ impl ChatManager {
 
     /// Check if a session is currently streaming
     pub async fn is_session_streaming(&self, session_id: &str) -> bool {
+        if self.mirrors.is_open(session_id) {
+            return true;
+        }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             return handle.is_streaming.load(Ordering::SeqCst);
         }
@@ -15116,6 +15243,7 @@ impl ChatManager {
     fn turn_services_with(
         &self,
         session: AgentTurnState,
+        mirror: Option<Arc<super::mirror::MirrorTap>>,
     ) -> Arc<dyn super::agent_runtime::TurnServices> {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
@@ -15134,6 +15262,7 @@ impl ChatManager {
                 .cognitive_routing
                 .as_ref()
                 .and_then(|routing| routing.store.clone()),
+            mirror,
         })
     }
 
@@ -15273,7 +15402,16 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
-                Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
+                Some(
+                    self.turn_services_with(
+                        self.agent_turn_state(session_id).await,
+                        // Claude Code runs its sub-agents itself: they get read-only mirrors
+                        // (P18c). A native session's sub-agents are real children already.
+                        matches!(kind, nexus_claude::agent::ProviderKind::ClaudeCode)
+                            .then(|| self.mirror_tap(session_id))
+                            .flatten(),
+                    ),
+                ),
                 host_missing,
                 self.session_grants_for(
                     session_id,
@@ -15764,6 +15902,8 @@ impl ChatManager {
     /// that cannot be removed fails the deletion (the conversation would stay on disk
     /// with nothing left to find it); a retry removes both.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
+        // An open mirror of a Claude Code sub-agent: its tap drops it and never writes it again.
+        self.mirrors.deleted(session_id);
         let _ = self.close_session(&session_id.to_string()).await;
         if let Some(node) = self.graph.get_chat_session(session_id).await? {
             if let (Some(root), Some(provider), Some(token)) = (
@@ -20946,6 +21086,45 @@ mod tests {
         assert_eq!(fake.state.turns_started.lock().unwrap().len(), 1);
     }
 
+    /// P18c: a read-only mirror of a Claude Code sub-agent cut by a restart is never resumed
+    /// (it has no process), even by a server that resumes Claude Code at boot and for a link
+    /// (`conversation` without `tool_use_id`) that would otherwise be resumed: it is closed.
+    #[tokio::test]
+    async fn a_cut_mirror_of_a_claude_code_sub_agent_is_closed_at_boot_never_resumed() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        node.mirror_of = Some(crate::chat::mirror::MIRROR_OF_CLAUDE_CODE.to_string());
+        node.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::new_v4(),
+                tool_use_id: None,
+            }
+            .to_json_string(),
+        );
+        graph.create_chat_session(&node).await.unwrap();
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+        let events = events_of(&graph, sid).await;
+        assert_closed_by_recovery(&events);
+        assert!(
+            events.last().unwrap().data.contains("never resumed"),
+            "{events:?}"
+        );
+        // And nobody can resume it by hand either.
+        let err = manager
+            .resume_session(&sid.to_string(), "go on", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::chat::provider::errors::classify_open_error(&err, None)
+                .map(|f| (f.status, f.code)),
+            Some((409, crate::chat::mirror::MIRROR_READ_ONLY))
+        );
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+    }
+
     /// Review of #726, point 3: a cut turn of a Claude Code session of the agent engine is
     /// CLOSED at boot, as the historical engine's always were — not resumed with nobody
     /// there (its CLI could run tools in `acceptEdits` or `bypassPermissions`).
@@ -23890,6 +24069,7 @@ mod tests {
     async fn test_chat_session_node_serialization() {
         let session = ChatSessionNode {
             file_scope_lifted: false,
+            mirror_of: None,
             routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
@@ -24262,6 +24442,7 @@ mod tests {
     async fn test_chat_session_node_serialization_with_conversation_id() {
         let session = ChatSessionNode {
             file_scope_lifted: false,
+            mirror_of: None,
             routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
@@ -24304,6 +24485,7 @@ mod tests {
     async fn test_chat_session_node_serialization_without_conversation_id() {
         let session = ChatSessionNode {
             file_scope_lifted: false,
+            mirror_of: None,
             routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
@@ -24375,6 +24557,7 @@ mod tests {
 
         let session = ActiveSession {
             anchor: Default::default(),
+            mirror_tap: None,
             events_tx: tx,
             last_activity: Instant::now(),
             cli_session_id: None,
@@ -26128,6 +26311,7 @@ mod tests {
 
         let session = ActiveSession {
             anchor: Default::default(),
+            mirror_tap: None,
             events_tx: tx,
             last_activity: Instant::now(),
             cli_session_id: None,
@@ -30379,6 +30563,7 @@ pub(crate) mod test_support {
         }
         let session = ActiveSession {
             anchor: Default::default(),
+            mirror_tap: None,
             events_tx,
             last_activity: Instant::now(),
             cli_session_id: None,
@@ -30545,6 +30730,7 @@ mod refs_turn_services_tests {
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
             routing_store: None,
+            mirror: None,
         };
 
         let note = Uuid::new_v4();
@@ -30973,6 +31159,7 @@ mod held_context_tests {
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
             routing_store: None,
+            mirror: None,
         }
     }
 
@@ -31529,6 +31716,7 @@ mod image_turn_services_tests {
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
             routing_store: Some(store.clone()),
+            mirror: None,
         };
         // Before any turn input, nothing says an image comes.
         assert_eq!(services.model_for_images(&sid).await, None);

@@ -169,6 +169,9 @@ pub struct MockGraphStore {
     pub fail_mark_read: std::sync::atomic::AtomicBool,
     /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
     pub fail_harness_writes: std::sync::atomic::AtomicBool,
+    /// Makes every `create_chat_session` fail once set (a session written after it, such as
+    /// the mirror of a sub-agent, is lost; the sessions already written are untouched).
+    pub fail_session_writes: std::sync::atomic::AtomicBool,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -392,6 +395,7 @@ impl MockGraphStore {
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
+            fail_session_writes: std::sync::atomic::AtomicBool::new(false),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -7715,6 +7719,12 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
+        if self
+            .fail_session_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected failure of create_chat_session");
+        }
         // As the Neo4j store: a session is created with its shell at home.
         self.session_shell_moved
             .write()

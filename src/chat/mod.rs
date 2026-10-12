@@ -32,6 +32,7 @@ pub(crate) mod hook_ledger;
 pub mod lasting_rules;
 pub mod manager;
 pub mod message_attachments;
+pub mod mirror;
 pub mod model_catalog;
 pub mod neutral_place;
 pub mod observation_detector;
