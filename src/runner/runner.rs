@@ -3285,6 +3285,7 @@ impl PlanRunner {
             None => None,
         };
         let request = ChatRequest {
+            file_scope_lifted: false,
             access: None,
             routing_pool: None,
             routing_mode: None,

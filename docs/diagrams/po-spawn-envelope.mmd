@@ -44,6 +44,8 @@ flowchart TD
         MINT["✅ build_options → generate_session_token<br/>scope signé : session:&lt;id&gt; ceiling:&lt;mode&gt; tools:&lt;profil&gt;<br/>jti unique<br/>test : session_token_is_bound_to_its_session_and_carries_a_jti"]
         REG["✅ agent_tokens::register(jti, session)<br/>liste d'AUTORISATION en mémoire ;<br/>un nouveau jeton remplace ceux de la session<br/>test : a_new_token_for_a_session_supersedes_the_previous_one"]
         REVOKE["✅ close_session → agent_tokens::revoke_session<br/>test : agent_token_of_a_closed_session_is_refused"]
+        LIFT["✅ levée du périmètre de fichiers (décision fce98b8a) : Claims::may_lift_file_scope = une PERSONNE (jamais agent_session, jeton MCP, compte du serveur, anonyme) ;<br/>agent_tokens::set_launched_unscoped / set_scope_lift_live / must_confine_unscoped / is_scope_lifted : un nexus-tools lancé --unscoped dont la session a quitté le trust est borné par ses hooks ; revoke_session efface<br/>test : only_a_person_opening_a_session_in_trust_lifts_its_file_scope, leaving_trust_ends_a_persons_lift_of_the_file_scope"]
+        REVOKE -.-> LIFT
         MINT --> REG
         REG -.fermeture.-> REVOKE
     end
@@ -96,7 +98,7 @@ flowchart TD
         FAN{"✅ enfants VIVANTS du parent ≥ 4 ?<br/>(get_session_children × is_session_active) ;<br/>sous-agents (P18) : créneau SubagentSlot pris AVANT ce compte, tenu jusqu'à la fin<br/>test : parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child"}
         E_FAN["✅ 403 envelope_too_many_children<br/>test : a_fifth_live_child_is_refused_…"]
         CEIL["✅ plafond = min(mode vivant | persisté | défaut global, plafond signé) ; mode vivant d'une session native (moteur agent) : agent_modes, gardé et persisté par set_session_permission_mode (P18)<br/>test : a_child_is_capped_at_the_parents_current_mode<br/>test : the_live_mode_and_the_signed_ceiling_both_clamp"]
-        DIRS{"✅ cwd et add_dirs sous cwd/add_dirs du parent ?<br/>(is_within : composants entiers, .. replié, liens résolus)"}
+        DIRS{"✅ cwd et add_dirs sous cwd/add_dirs du parent ?<br/>(is_within : composants entiers, .. replié, liens résolus) ;<br/>seule exception : parent en trust (rang 4 : trust OU bypassPermissions, jamais le littéral) → cwd permis dans un WORKTREE git d'un dépôt sous les racines du parent (fichier .git → worktrees/&lt;nom&gt;, lien retour gitdir vérifié, commondir sous une racine ; aucune commande git) ; add_dirs hors racines TOUJOURS refusés<br/>test : a_parent_in_trust_may_open_its_child_in_a_worktree_of_its_repository_whatever_the_spelling, a_parent_in_trust_cannot_open_its_child_anywhere_else, extra_directories_never_leave_the_parents_even_in_trust, a_planted_git_file_does_not_borrow_the_parents_repository"}
         E_DIRS["✅ 403 envelope_cwd_outside_parent /<br/>envelope_add_dir_outside_parent<br/>test : cwd_outside_the_parent_is_refused"]
         PROJ{"✅ projet = celui du parent ?<br/>workspace = celui du parent ?"}
         E_PROJ["✅ 403 envelope_project_mismatch /<br/>envelope_workspace_mismatch"]

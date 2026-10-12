@@ -764,6 +764,11 @@ pub(crate) struct AgentSpecInput<'a> {
     /// whatever its capabilities say): no project-orchestrator MCP server, and the
     /// session reports `project_orchestrator_tools` among what it does not do.
     pub per_session_mcp: bool,
+    /// A person lifted the session's file scope ([`ChatSessionNode::file_scope_lifted`]). It
+    /// takes effect only for a native session in trust with normal access ([`nt::attach`]).
+    ///
+    /// [`nt::attach`]: super::provider::nexus_tools::attach
+    pub file_scope_lifted: bool,
     /// The knowledge-graph hooks to give the session (`None`: none).
     pub hooks: Option<AgentHookScope>,
 }
@@ -6618,6 +6623,7 @@ impl ChatManager {
             })
         });
         let session_node = ChatSessionNode {
+            file_scope_lifted: request.file_scope_lifted,
             id: session_id,
             cli_session_id: None,
             project_slug: project_slug.clone(),
@@ -10181,6 +10187,31 @@ impl ChatManager {
     /// If we tried to lock the client here, the WS event loop would deadlock:
     /// it awaits the lock while stream_response holds it, so broadcast events
     /// can no longer be forwarded to the frontend.
+    /// Records whether a person lifted the session's file scope (decision fce98b8a): persisted
+    /// on the node (a resume launches `nexus-tools` from it) and live (a process launched
+    /// `--unscoped` is confined by its hooks once the lift ends). Persistence failures are
+    /// logged: the live state still confines.
+    pub async fn set_file_scope_lifted(&self, session_id: &str, lifted: bool) {
+        crate::auth::agent_tokens::set_scope_lift_live(session_id, lifted);
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            if let Err(e) = self
+                .graph
+                .update_chat_session_file_scope_lifted(uuid, lifted)
+                .await
+            {
+                warn!(session_id = %session_id, error = %e, "Failed to persist the file-scope lift of a session (non-fatal)");
+            }
+        }
+        info!(session_id = %session_id, file_scope_lifted = lifted, "file scope lift of the session changed");
+    }
+
+    /// A PERSON switched the session to trust (the WebSocket handler checked owner and person):
+    /// the file scope is lifted. It takes effect on the live process if it was launched
+    /// `--unscoped`, otherwise at the next launch (resume).
+    pub async fn lift_file_scope(&self, session_id: &str) {
+        self.set_file_scope_lifted(session_id, true).await;
+    }
+
     pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             let pair = super::provider::policy::parse_mode(mode)
@@ -10195,6 +10226,11 @@ impl ChatManager {
                 session_id,
                 pair.neutral != nexus_claude::agent::PolicyMode::Trust,
             );
+            // Leaving trust ends a person's lift of the file scope (decision fce98b8a): only a
+            // person sets it again ([`Self::lift_file_scope`]).
+            if pair.neutral != nexus_claude::agent::PolicyMode::Trust {
+                self.set_file_scope_lifted(session_id, false).await;
+            }
             // What a child's ceiling reads (A17, P18): kept live, and persisted so a resume and
             // the envelope after a restart see the mode the session is in, not its opening one.
             self.agent_modes
@@ -10265,6 +10301,9 @@ impl ChatManager {
             new_mode = %mode,
             "Permission mode changed for session (via stdin_tx, lock-free)"
         );
+        if super::envelope::mode_rank(mode) < super::envelope::TRUST_RANK {
+            self.set_file_scope_lifted(session_id, false).await;
+        }
 
         // Persist to Neo4j
         if let Ok(uuid) = Uuid::parse_str(session_id) {
@@ -10394,6 +10433,7 @@ impl ChatManager {
         };
         let by_router = moved_by == relay::MOVED_BY_AUTO;
         let request = ChatRequest {
+            file_scope_lifted: node.file_scope_lifted,
             routing_pool: node
                 .routing_pool
                 .as_deref()
@@ -14574,6 +14614,7 @@ impl ChatManager {
             remote_cwd,
             per_session_mcp,
             hooks,
+            file_scope_lifted,
         } = i;
         // A neutral directory of the host is made on demand (new session or resume).
         if remote_cwd.is_none() {
@@ -14705,19 +14746,23 @@ impl ChatManager {
                         .and_then(runnable_nexus_tools)
                         .map(nexus_claude::providers::native::BrowserTools::new);
                     let attachment = nt::attach(
-                        &nt::NexusToolsConfig { program, browser },
+                        &nt::NexusToolsConfig {
+                            program,
+                            browser,
+                            deny_paths: nt::host_deny_paths(),
+                        },
                         &nt::GraphConsents(self.graph.clone()),
                         self.vault.as_deref(),
                         nt::AttachInput {
                             session_id,
                             cwd: &spec.cwd,
                             extra_dirs: &spec.extra_dirs,
-                            // Trust (rock'n roll): the file scope anchors paths but no
-                            // longer confines them — worktrees made by another harness
-                            // stay reachable. Known limit: the flag is read at launch;
-                            // a mid-conversation switch to trust takes effect at the
-                            // next session build (resume), not on the live process.
-                            unscoped: spec.policy.mode == nexus_claude::agent::PolicyMode::Trust,
+                            // The file scope is lifted inside `attach`, from the policy, the
+                            // access and the person's choice (decision fce98b8a). A lift chosen
+                            // mid-conversation takes effect at the next launch (resume); a
+                            // session that leaves trust is confined by `ToolAccessHooks`.
+                            access,
+                            lifted_by_person: file_scope_lifted,
                             policy: &spec.policy,
                             ceiling: spec.policy_ceiling.as_ref(),
                             project: project_slug.as_deref(),
@@ -14837,7 +14882,8 @@ impl ChatManager {
                     session_id,
                     project_slug,
                     search_origins,
-                ),
+                )
+                .with_scope_dirs(spec.cwd.clone(), spec.extra_dirs.clone()),
             ));
         }
         Ok(spec)
@@ -14906,6 +14952,7 @@ impl ChatManager {
         let spec = self
             .build_agent_spec_with_access(
                 AgentSpecInput {
+                    file_scope_lifted: request.file_scope_lifted,
                     cwd: &request.cwd,
                     model,
                     system_prompt,
@@ -15565,6 +15612,7 @@ impl ChatManager {
         let spec = self
             .build_agent_spec_with_access(
                 AgentSpecInput {
+                    file_scope_lifted: node.file_scope_lifted,
                     cwd: &node.cwd,
                     model: &node.model,
                     system_prompt: &system_prompt,
@@ -16689,6 +16737,7 @@ mod tests {
                 manager
                     .build_agent_spec_with_access(
                         AgentSpecInput {
+                            file_scope_lifted: false,
                             cwd: "/tmp",
                             model: "m",
                             system_prompt: "p",
@@ -17102,6 +17151,7 @@ mod tests {
 
         // The agent session token of a session P owns opens sessions P owns.
         let parent = crate::neo4j::models::ChatSessionNode {
+            file_scope_lifted: false,
             owner: Some(person.to_string()),
             ..crate::test_helpers::test_chat_session(None)
         };
@@ -17132,6 +17182,7 @@ mod tests {
         let m = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
         let secret = "test-secret-key-minimum-32-chars!!";
         let parent = crate::neo4j::models::ChatSessionNode {
+            file_scope_lifted: false,
             owner: Some("someone-else".into()),
             ..crate::test_helpers::test_chat_session(None)
         };
@@ -17597,6 +17648,7 @@ mod tests {
             async move {
                 manager
                     .build_agent_spec(AgentSpecInput {
+                        file_scope_lifted: false,
                         cwd: "/tmp",
                         model: "m",
                         system_prompt: "p",
@@ -17652,6 +17704,7 @@ mod tests {
             async move {
                 manager
                     .build_agent_spec(AgentSpecInput {
+                        file_scope_lifted: false,
                         cwd: "/tmp",
                         model: "m",
                         system_prompt: "p",
@@ -17808,6 +17861,7 @@ mod tests {
             async move {
                 manager
                     .build_agent_spec(AgentSpecInput {
+                        file_scope_lifted: false,
                         cwd: "/Users/me/project",
                         model: "sonnet",
                         system_prompt: "base prompt",
@@ -17856,6 +17910,7 @@ mod tests {
             async move {
                 manager
                     .build_agent_spec(AgentSpecInput {
+                        file_scope_lifted: false,
                         cwd: "/tmp",
                         model: "openclaw",
                         system_prompt: "p",
@@ -17909,6 +17964,7 @@ mod tests {
             async move {
                 manager
                     .build_agent_spec(AgentSpecInput {
+                        file_scope_lifted: false,
                         cwd: "/tmp",
                         model: "m",
                         system_prompt: "p",
@@ -18034,6 +18090,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
         let spec = manager
             .build_agent_spec(AgentSpecInput {
+                file_scope_lifted: false,
                 cwd: "/tmp",
                 model: "m",
                 system_prompt: "p",
@@ -18071,6 +18128,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let spec = manager
             .build_agent_spec(AgentSpecInput {
+                file_scope_lifted: false,
                 cwd: "/tmp",
                 model: "m",
                 system_prompt: "p",
@@ -18115,6 +18173,7 @@ mod tests {
         use nexus_claude::agent::{McpServerSpec, ProviderKind};
         let spec = manager
             .build_agent_spec(AgentSpecInput {
+                file_scope_lifted: false,
                 cwd: "/tmp",
                 model: "m",
                 system_prompt: "p",
@@ -18452,6 +18511,7 @@ mod tests {
         let claims = crate::auth::jwt::Claims::service_account("b40");
         manager
             .build_agent_spec(AgentSpecInput {
+                file_scope_lifted: false,
                 cwd: "/work/app",
                 model: "m",
                 system_prompt: "p",
@@ -18509,6 +18569,7 @@ mod tests {
             async move {
                 let spec = manager
                     .build_agent_spec(AgentSpecInput {
+                        file_scope_lifted: false,
                         cwd: "/work/app",
                         model: "m",
                         system_prompt: "p",
@@ -18569,6 +18630,84 @@ mod tests {
             !runs(top.to_string(), ProviderKind::ClaudeCode).await.0,
             "Claude Code brings its own Task"
         );
+    }
+
+    /// The spec of a native session with `nexus-tools`, for a mode, a person's lift and an
+    /// access (decision fce98b8a).
+    async fn lifted_nexus_tools_spec(
+        sid: &str,
+        permission_mode: &str,
+        file_scope_lifted: bool,
+        access: crate::chat::provider::policy::SessionAccess,
+    ) -> nexus_claude::agent::SessionSpec {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(graph);
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let (_bin, program) = fake_nexus_tools();
+        config.nexus_tools_path = Some(program);
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("lift");
+        manager
+            .build_agent_spec_with_access(
+                AgentSpecInput {
+                    file_scope_lifted,
+                    cwd: "/work/app",
+                    model: "m",
+                    system_prompt: "p",
+                    permission_mode: Some(permission_mode),
+                    add_dirs: &[],
+                    user_claims: Some(&claims),
+                    session_id: sid,
+                    third_party: true,
+                    max_tokens: None,
+                    kind: nexus_claude::agent::ProviderKind::Native,
+                    remote_cwd: None,
+                    per_session_mcp: true,
+                    hooks: None,
+                },
+                access,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Review of #729 (nit and finding 2), the wiring from the session to the launch line: a
+    /// native session launches `nexus-tools --unscoped` only in trust (`bypassPermissions` or
+    /// `trust`), with normal access, when a person lifted it. A runner, delegation or protocol
+    /// session (trust, nobody lifted it) and a read-only one stay scoped. The deny list always
+    /// goes.
+    #[tokio::test]
+    async fn a_native_session_launches_nexus_tools_unscoped_only_when_a_person_lifted_its_trust() {
+        use crate::chat::provider::policy::SessionAccess::{Normal, ReadOnly};
+        use nexus_claude::agent::McpServerSpec;
+        for (index, (mode, lifted, access, expected)) in [
+            ("bypassPermissions", true, Normal, true),
+            ("trust", true, Normal, true),
+            ("bypassPermissions", false, Normal, false),
+            ("bypassPermissions", true, ReadOnly, false),
+            ("default", true, Normal, false),
+            ("acceptEdits", true, Normal, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sid = format!("lift-wiring-{index}");
+            let spec = lifted_nexus_tools_spec(&sid, mode, lifted, access).await;
+            let Some(McpServerSpec::Stdio { args, .. }) = spec.mcp_servers.get("nexus") else {
+                panic!("{mode}: nexus-tools must be attached");
+            };
+            assert_eq!(
+                args.contains(&"--unscoped".to_owned()),
+                expected,
+                "{mode} lifted={lifted} {access:?}: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a == "--deny-path"),
+                "{mode}: the deny list goes in every case"
+            );
+            crate::auth::agent_tokens::revoke_session(&sid);
+        }
     }
 
     #[tokio::test]
@@ -19839,6 +19978,7 @@ mod tests {
 
     fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
         ChatRequest {
+            file_scope_lifted: false,
             access: None,
             routing_pool: None,
             routing_mode: None,
@@ -22296,6 +22436,76 @@ mod tests {
         assert_eq!(answers[0].0, "perm-1");
     }
 
+    /// Decision fce98b8a, review of #729 (point 3): a person's lift is persisted with the
+    /// session, a session launched `--unscoped` keeps its lift live while in trust, and leaving
+    /// trust clears both: the persisted flag (a resume launches scoped) and the live lift (the
+    /// running process is confined by its hooks). Only a person's switch lifts it again.
+    #[tokio::test]
+    async fn leaving_trust_ends_a_persons_lift_of_the_file_scope() {
+        let (manager, graph, _fake) = agent_manager();
+        let request = ChatRequest {
+            file_scope_lifted: true,
+            permission_mode: Some("bypassPermissions".into()),
+            ..agent_request("go")
+        };
+        let sid = manager.create_session(&request).await.unwrap().session_id;
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        assert!(
+            graph
+                .get_chat_session(uuid)
+                .await
+                .unwrap()
+                .unwrap()
+                .file_scope_lifted
+        );
+        // As `attach` records a process launched `--unscoped`.
+        crate::auth::agent_tokens::set_launched_unscoped(&sid, true);
+        assert!(!crate::auth::agent_tokens::must_confine_unscoped(&sid));
+
+        manager
+            .set_session_permission_mode(&sid, "default")
+            .await
+            .unwrap();
+        assert!(
+            !graph
+                .get_chat_session(uuid)
+                .await
+                .unwrap()
+                .unwrap()
+                .file_scope_lifted
+        );
+        assert!(crate::auth::agent_tokens::must_confine_unscoped(&sid));
+        assert!(!crate::auth::agent_tokens::is_scope_lifted(&sid));
+
+        // Back to trust by the mode change alone: still confined, still not lifted.
+        manager
+            .set_session_permission_mode(&sid, "trust")
+            .await
+            .unwrap();
+        assert!(crate::auth::agent_tokens::must_confine_unscoped(&sid));
+        assert!(
+            !graph
+                .get_chat_session(uuid)
+                .await
+                .unwrap()
+                .unwrap()
+                .file_scope_lifted
+        );
+        // A person's switch (the WebSocket handler, after its owner and person checks).
+        manager.lift_file_scope(&sid).await;
+        assert!(!crate::auth::agent_tokens::must_confine_unscoped(&sid));
+        assert!(
+            graph
+                .get_chat_session(uuid)
+                .await
+                .unwrap()
+                .unwrap()
+                .file_scope_lifted
+        );
+        manager.close_session(&sid).await.unwrap();
+        crate::auth::agent_tokens::revoke_session(&sid);
+    }
+
     #[tokio::test]
     async fn agent_path_interrupt_model_mode_and_close_reach_the_provider() {
         let (manager, _graph, fake) = agent_manager();
@@ -22665,6 +22875,7 @@ mod tests {
             let spec = manager
                 .build_agent_spec_with_access(
                     AgentSpecInput {
+                        file_scope_lifted: false,
                         cwd: "/tmp",
                         model: "m",
                         system_prompt: "p",
@@ -23678,6 +23889,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization() {
         let session = ChatSessionNode {
+            file_scope_lifted: false,
             routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
@@ -24049,6 +24261,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_with_conversation_id() {
         let session = ChatSessionNode {
+            file_scope_lifted: false,
             routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
@@ -24090,6 +24303,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_without_conversation_id() {
         let session = ChatSessionNode {
+            file_scope_lifted: false,
             routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),

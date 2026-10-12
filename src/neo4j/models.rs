@@ -274,6 +274,13 @@ pub struct ChatSessionNode {
     /// before it existed: any signed-in person answers, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// A PERSON lifted this session's file scope (decision fce98b8a): they opened it in trust
+    /// over REST, or its owner switched it to trust over the WebSocket. Only then does a native
+    /// session in trust launch `nexus-tools --unscoped`. Never set by an agent, an MCP token, a
+    /// service account, the runner, `delegate_task` or a protocol run; cleared when the session
+    /// leaves trust. Absent on nodes written before it existed: not lifted.
+    #[serde(default)]
+    pub file_scope_lifted: bool,
 }
 
 impl ChatSessionNode {
@@ -3525,6 +3532,7 @@ mod tests {
     #[test]
     fn test_chat_session_node_with_workspace_and_add_dirs() {
         let session = ChatSessionNode {
+            file_scope_lifted: false,
             routing_pool: None,
             routing_mode: None,
             id: Uuid::new_v4(),
@@ -3563,6 +3571,7 @@ mod tests {
     #[test]
     fn test_chat_session_node_workspace_fields_default() {
         let session = ChatSessionNode {
+            file_scope_lifted: false,
             routing_pool: None,
             routing_mode: None,
             id: Uuid::new_v4(),

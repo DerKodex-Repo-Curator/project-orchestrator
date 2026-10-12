@@ -8013,6 +8013,15 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.file_scope_lifted = lifted;
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {

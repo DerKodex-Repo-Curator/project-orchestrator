@@ -121,6 +121,15 @@ impl Claims {
     pub fn may_keep_lasting_approvals(&self) -> bool {
         self.is_human() && !self.is_service_account() && !self.sub.is_empty()
     }
+
+    /// Whether these claims may lift a session's file scope by putting it in trust (decision
+    /// fce98b8a): a person signed in with their own session token, exactly as for lasting
+    /// approvals. Never an agent session's token, a long-lived MCP token (any client holding it
+    /// would read the whole disk through its sessions), a vault token, the server's account
+    /// (runner, delegation, protocol runs) or the anonymous user (authentication off).
+    pub fn may_lift_file_scope(&self) -> bool {
+        self.may_keep_lasting_approvals()
+    }
 }
 
 /// Encode a JWT token for the given user.

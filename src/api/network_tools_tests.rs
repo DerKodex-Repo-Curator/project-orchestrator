@@ -547,6 +547,7 @@ async fn native_session_tools(graph: Arc<MockGraphStore>, sid: &str) -> Vec<Stri
     let claims = crate::auth::jwt::Claims::service_account("p6");
     let spec = manager
         .build_agent_spec(crate::chat::manager::AgentSpecInput {
+            file_scope_lifted: false,
             cwd: "/work/app",
             model: "m",
             system_prompt: "p",

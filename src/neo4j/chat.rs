@@ -78,6 +78,7 @@ impl Neo4jClient {
                     execution_place: $execution_place,
                     access: $access,
                     owner: $owner,
+                    file_scope_lifted: $file_scope_lifted,
                     shell_moved: false
                 })
                 WITH s
@@ -117,6 +118,7 @@ impl Neo4jClient {
                     execution_place: $execution_place,
                     access: $access,
                     owner: $owner,
+                    file_scope_lifted: $file_scope_lifted,
                     shell_moved: false
                 })
                 "#,
@@ -184,7 +186,8 @@ impl Neo4jClient {
                     )
                     .param("execution_place", session.execution_place.as_str())
                     .param("access", session.access.as_str())
-                    .param("owner", session.owner.clone().unwrap_or_default()),
+                    .param("owner", session.owner.clone().unwrap_or_default())
+                    .param("file_scope_lifted", session.file_scope_lifted),
             )
             .await?;
 
@@ -383,6 +386,20 @@ impl Neo4jClient {
         let q = query(cypher)
             .param("id", id.to_string())
             .param("mode", mode.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Records whether a person lifted the file scope of a chat session (decision fce98b8a).
+    pub async fn update_chat_session_file_scope_lifted(
+        &self,
+        id: Uuid,
+        lifted: bool,
+    ) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) SET s.file_scope_lifted = $lifted, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("lifted", lifted);
         self.graph.run(q).await?;
         Ok(())
     }
@@ -1024,6 +1041,7 @@ impl Neo4jClient {
         };
 
         Ok(ChatSessionNode {
+            file_scope_lifted: node.get::<bool>("file_scope_lifted").unwrap_or(false),
             id: node.get::<String>("id")?.parse()?,
             cli_session_id: if cli_session_id.is_empty() {
                 None

@@ -1149,6 +1149,7 @@ mod tests {
                 ));
         let created = manager
             .create_session(&crate::chat::types::ChatRequest {
+                file_scope_lifted: false,
                 access: None,
                 routing_pool: None,
                 routing_mode: None,

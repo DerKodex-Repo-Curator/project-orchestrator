@@ -2488,6 +2488,14 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_permission_mode(id, mode).await
     }
 
+    async fn update_chat_session_file_scope_lifted(
+        &self,
+        id: Uuid,
+        lifted: bool,
+    ) -> anyhow::Result<()> {
+        self.update_chat_session_file_scope_lifted(id, lifted).await
+    }
+
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> anyhow::Result<()> {
         self.update_chat_session_model(id, model).await
     }
