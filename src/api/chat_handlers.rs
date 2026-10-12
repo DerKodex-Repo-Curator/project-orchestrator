@@ -647,6 +647,45 @@ pub async fn get_run_costs(
     Ok(Json(crate::chat::cost::report(&executions)))
 }
 
+/// GET /api/chat/sessions/{id}/usage — the token usage of a conversation, turn by turn:
+/// input (not cached), output, cache reads and writes, reasoning, and the cache-hit ratio.
+/// Read from the `result` events stored with the turns (every engine, every provider).
+pub async fn get_session_usage(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<crate::chat::cost::SessionUsage>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
+        .get_chat_session(session_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
+    const PAGE: i64 = 1000;
+    let mut results = Vec::new();
+    let mut after = -1;
+    loop {
+        let page = neo4j
+            .get_chat_events(session_id, after, PAGE)
+            .await
+            .map_err(AppError::Internal)?;
+        let Some(last) = page.last().map(|e| e.seq) else {
+            break;
+        };
+        results.extend(
+            page.iter()
+                .filter(|e| e.event_type == "result")
+                .filter_map(|e| Some((e.seq, serde_json::from_str::<serde_json::Value>(&e.data).ok()?))),
+        );
+        if (page.len() as i64) < PAGE || last <= after {
+            break;
+        }
+        after = last;
+    }
+    Ok(Json(crate::chat::cost::session_usage(
+        results.iter().map(|(seq, data)| (*seq, data)),
+    )))
+}
+
 /// GET /api/chat/runs/{run_id}/sessions — Get all sessions for a PlanRun
 pub async fn get_run_sessions(
     State(state): State<OrchestratorState>,
