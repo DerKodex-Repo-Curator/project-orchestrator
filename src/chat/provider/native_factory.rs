@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use nexus_claude::agent::{
     AgentProvider, CostBasis, CredentialRef, CredentialResolver, EnvCredentialResolver,
-    ProviderError, SessionLimits,
+    KnownSecrets, ProviderError, SessionLimits,
 };
 use nexus_claude::model::{EndpointQuirks, OpenAiEndpoint, OpenAiEndpointConfig};
 use nexus_claude::providers::native::{NativeConfig, NativeProvider};
@@ -155,6 +155,30 @@ fn native_provider(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<NativeProvider, ProviderError> {
+    native_provider_with(record, sessions_resolver(vault, None))
+}
+
+/// The resolver of an instance: the vault's (per request, under a grant) or the
+/// process environment. With `known`, every key it resolves is also registered
+/// there, so that the instance's transcript store masks that VALUE (CTX6).
+fn sessions_resolver(
+    vault: Option<Arc<VaultService>>,
+    known: Option<&KnownSecrets>,
+) -> Arc<dyn CredentialResolver> {
+    let resolver: Arc<dyn CredentialResolver> = match vault {
+        Some(vault) => Arc::new(VaultCredentialResolver::new(vault)),
+        None => Arc::new(EnvCredentialResolver),
+    };
+    match known {
+        Some(known) => Arc::new(known.recording(resolver)),
+        None => resolver,
+    }
+}
+
+fn native_provider_with(
+    record: &InstanceRecord,
+    resolver: Arc<dyn CredentialResolver>,
+) -> Result<NativeProvider, ProviderError> {
     // A stored record is checked again here: an `env:` reference must name a
     // variable declared for provider credentials, whenever it was stored.
     super::settings::parse_credential_ref(
@@ -174,10 +198,6 @@ fn native_provider(
     // not offer: the strict default stays.
     endpoint.allow_private_network = false;
 
-    let resolver: Arc<dyn CredentialResolver> = match vault {
-        Some(vault) => Arc::new(VaultCredentialResolver::new(vault)),
-        None => Arc::new(EnvCredentialResolver),
-    };
     let model_endpoint = Arc::new(OpenAiEndpoint::new(endpoint, resolver));
 
     let mut config = NativeConfig::new(record.id.clone());
@@ -201,7 +221,8 @@ fn native_provider(
 
 /// The native harness of a record that runs SESSIONS: its transcripts are kept in
 /// `<transcripts>/<instance id>/` (owner-only files) so a session resumes after a
-/// restart (P14). Without a root they stay in memory (nexus' default): the probes,
+/// restart (P14). The files are the conversation, byte for byte (CTX6): the only
+/// text masked is the VALUE of a key this instance's resolver handed out. Without a root they stay in memory (nexus' default): the probes,
 /// listings and tests build that way.
 fn build_native_for_sessions(
     record: &InstanceRecord,
@@ -211,12 +232,23 @@ fn build_native_for_sessions(
     let Some(root) = transcripts else {
         return build_native(record, vault);
     };
-    let store = super::transcripts::store_for(root, &record.id).map_err(|e| {
+    if super::transcripts::inside_git_worktree(root) {
+        // The files hold the conversation in clear: never where a `git add -A` would
+        // publish them. Memory instead: the sessions do not resume after a restart.
+        tracing::warn!(
+            instance = %record.id,
+            "native transcripts kept in memory: their directory is inside a git work tree"
+        );
+        return build_native(record, vault);
+    }
+    let known = KnownSecrets::new();
+    let store = super::transcripts::store_for(root, &record.id, known.clone()).map_err(|e| {
         // The path may name a user; keep only the kind of failure.
         ProviderError::protocol(format!("transcript store unavailable: {:?}", e.kind()))
     })?;
     Ok(Arc::new(
-        native_provider(record, vault)?.with_transcript_store(store),
+        native_provider_with(record, sessions_resolver(vault, Some(&known)))?
+            .with_transcript_store(store),
     ))
 }
 
@@ -544,6 +576,63 @@ impl nexus_claude::agent::AgentSession for KeyedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CTX6: a transcript root inside a git work tree is never written: the instance
+    /// still builds, with its transcripts in memory.
+    #[test]
+    fn a_transcript_root_inside_a_git_work_tree_keeps_the_transcripts_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let root = tmp.path().join("native-transcripts");
+        let built =
+            build_native_for_sessions(&record("none", Some("llama_server")), None, Some(&root));
+        assert!(built.is_ok());
+        assert!(!root.exists(), "nothing is created inside the work tree");
+    }
+
+    /// CTX6: the resolver of a session-running instance registers the key it reads
+    /// from the vault, so the transcript store of that instance masks its VALUE.
+    #[tokio::test]
+    async fn a_sessions_resolver_teaches_the_store_the_key_it_resolves() {
+        use crate::vault::grants::{GrantScope, SecretSelector};
+        let vault = VaultService::ephemeral();
+        vault
+            .init(
+                "correct horse battery staple".into(),
+                chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        vault
+            .put("endpoint-key", "sk-ctx6-resolved-9f2a", None, now)
+            .unwrap();
+        vault
+            .grant(
+                SecretSelector::Names(["endpoint-key".to_string()].into()),
+                GrantScope::Provider("local".to_string()),
+                chrono::Duration::hours(1),
+                None,
+                now,
+            )
+            .unwrap();
+        let known = KnownSecrets::new();
+        let resolver = sessions_resolver(Some(vault), Some(&known));
+        assert!(known.is_empty());
+        let resolved = resolver
+            .resolve("local", &CredentialRef::Vault("endpoint-key".into()))
+            .await
+            .unwrap()
+            .is_some();
+        assert!(resolved);
+        assert_eq!(known.mask("key sk-ctx6-resolved-9f2a"), "key <redacted>");
+        // Without a store to feed, nothing is recorded.
+        assert!(sessions_resolver(None, None)
+            .resolve("local", &CredentialRef::None)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     fn record(credential_ref: &str, preset: Option<&str>) -> InstanceRecord {
         InstanceRecord {

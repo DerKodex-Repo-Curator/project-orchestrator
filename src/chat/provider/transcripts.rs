@@ -10,7 +10,7 @@
 //! ```text
 //! <app dir>/native-transcripts/            0700
 //!     <instance id>/                       0700 (nexus)
-//!         <transcript id>.json             0600 (nexus), credential-shaped text masked
+//!         <transcript id>.json             0600 (nexus), the conversation byte for byte
 //! ```
 //!
 //! Lifetime: a transcript lives as long as its session. A CLOSED session stays
@@ -18,13 +18,31 @@
 //! ([`remove_for_token`], called by `ChatManager::delete_session`).
 //!
 //! What is written is the conversation itself, which the graph already holds as
-//! chat events: no new class of data, but owner-only files, and nexus masks the
-//! credential-shaped fragments before writing.
+//! chat events: no new class of data, in owner-only files. It is written BYTE FOR
+//! BYTE (decision CTX6): a resume replays the request the live session sent, so the
+//! endpoint's prefix cache still serves it and every tool-call argument is the JSON
+//! the model wrote. Masking by shape (a field named `max_tokens`, a long word)
+//! corrupted that history and is gone. The only masking is by VALUE: the keys the
+//! instance's resolver handed out ([`store_for`]'s `known`, fed by
+//! `KnownSecrets::recording` in `native_factory`) are replaced in contents and
+//! reasoning, never inside a tool-call argument. A native resume reloads THIS
+//! file (the token names it); it is never rebuilt from the graph's chat events.
+//!
+//! Where: the server's application directory (beside the vault), NEVER a project
+//! directory or a git work tree: the files hold the conversation in clear, and a
+//! `git add -A` there would publish it. [`store_for`] refuses a root inside a git work
+//! tree ([`inside_git_worktree`]); `native_factory` then keeps the transcripts in
+//! memory (the session does not resume after a restart) and says so in a warning.
+//!
+//! On Windows the `0600`/`0700` modes do not exist: the protection is the ACL of
+//! the user profile (`%APPDATA%`, readable by that user, SYSTEM and the
+//! administrators by default). A profile whose ACLs were widened, or a roaming
+//! profile synced to a share, carries the transcripts with it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nexus_claude::agent::{ProviderKind, ResumeToken};
+use nexus_claude::agent::{KnownSecrets, ProviderKind, ResumeToken};
 use nexus_claude::providers::native::FileTranscriptStore;
 
 const DIR_NAME: &str = "native-transcripts";
@@ -44,6 +62,30 @@ pub fn default_root() -> PathBuf {
     app.join(DIR_NAME)
 }
 
+/// Whether `path` (absolute, or taken from the current directory) lies in a git
+/// work tree: one of its ancestors, or itself, holds a `.git` entry (a directory, or
+/// the file of a linked worktree or a submodule).
+pub fn inside_git_worktree(path: &Path) -> bool {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            // Unknown place: fail closed.
+            Err(_) => return true,
+        }
+    };
+    let has_git = |path: &Path| {
+        path.ancestors()
+            .any(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+    };
+    // Through a symbolic link too: the deepest existing ancestor, resolved.
+    let resolved = absolute
+        .ancestors()
+        .find_map(|dir| std::fs::canonicalize(dir).ok());
+    has_git(&absolute) || resolved.is_some_and(|real| has_git(&real))
+}
+
 /// A name that is safe as ONE path component: letters, digits, `-`, `_`.
 fn safe_component(name: &str) -> bool {
     !name.is_empty()
@@ -61,7 +103,18 @@ pub fn dir_for(root: &Path, instance_id: &str) -> Option<PathBuf> {
 
 /// The store of an instance. The root is made owner-only here (it lists the
 /// instances); nexus makes the instance directory `0700` and each file `0600`.
-pub fn store_for(root: &Path, instance_id: &str) -> std::io::Result<Arc<FileTranscriptStore>> {
+/// `known`: the secret values to mask (shared with the instance's resolver).
+pub fn store_for(
+    root: &Path,
+    instance_id: &str,
+    known: KnownSecrets,
+) -> std::io::Result<Arc<FileTranscriptStore>> {
+    if inside_git_worktree(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the transcript root is inside a git work tree",
+        ));
+    }
     let dir = dir_for(root, instance_id).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -69,7 +122,9 @@ pub fn store_for(root: &Path, instance_id: &str) -> std::io::Result<Arc<FileTran
         )
     })?;
     create_private_dir(root)?;
-    Ok(Arc::new(FileTranscriptStore::new(dir)))
+    Ok(Arc::new(
+        FileTranscriptStore::new(dir).with_known_secrets(known),
+    ))
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -154,7 +209,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("native-transcripts");
-        let store = store_for(&root, "local").unwrap();
+        let store = store_for(&root, "local", KnownSecrets::new()).unwrap();
         store.save("t1", &[ChatMessage::user("hello")]).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&root), 0o700);
@@ -166,5 +221,81 @@ mod tests {
         assert!(!file.exists());
         assert!(!remove_for_token(&root, "local", &native_token("t1")).unwrap());
         assert!(!remove_for_token(&root, "local", "garbage").unwrap());
+    }
+
+    /// CTX6: the conversation is in clear on disk, so its root is the server's own
+    /// application directory (beside the vault), absolute, never a relative path that
+    /// would land in whatever directory the server was started from.
+    #[test]
+    fn the_default_root_is_the_servers_application_directory() {
+        let root = default_root();
+        if let Some(app) = dirs::config_dir() {
+            assert!(root.starts_with(&app), "{}", root.display());
+            assert!(root.is_absolute());
+        }
+        assert!(root.ends_with(DIR_NAME));
+    }
+
+    /// CTX6: a root inside a git work tree (a project, a worktree, a submodule, or
+    /// reached through a symbolic link) is refused: `git add -A` would publish it.
+    #[test]
+    fn a_root_inside_a_git_work_tree_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("app").join(DIR_NAME);
+        assert!(!inside_git_worktree(&outside));
+        assert!(store_for(&outside, "local", KnownSecrets::new()).is_ok());
+
+        let repo = tmp.path().join("project");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("data").join(DIR_NAME);
+        assert!(inside_git_worktree(&nested));
+        let refused = store_for(&nested, "local", KnownSecrets::new()).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!nested.exists(), "nothing is created there");
+
+        // A linked worktree or a submodule has a `.git` FILE.
+        let linked = tmp.path().join("wt");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /elsewhere").unwrap();
+        assert!(inside_git_worktree(&linked.join(DIR_NAME)));
+
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("innocent");
+            std::os::unix::fs::symlink(&repo, &link).unwrap();
+            assert!(inside_git_worktree(&link.join(DIR_NAME)));
+        }
+    }
+
+    /// CTX6: the file is the conversation (a field named like a secret, a long
+    /// argument, all byte for byte); only a key the resolver handed out is masked,
+    /// and never inside a tool-call argument.
+    #[test]
+    fn the_store_keeps_the_conversation_and_masks_only_a_known_value() {
+        use nexus_claude::agent::Secret;
+        use nexus_claude::model::ToolCallChunk;
+        let tmp = tempfile::tempdir().unwrap();
+        let known = KnownSecrets::new();
+        let store = store_for(tmp.path(), "local", known.clone()).unwrap();
+        known.register(&Secret::new("vault-key-77e1b0"));
+        let long =
+            serde_json::json!({ "max_tokens": 4096, "path": "segment/".repeat(80) }).to_string();
+        let conversation = vec![
+            ChatMessage::user(r#"{"input_tokens":12} and vault-key-77e1b0"#),
+            ChatMessage::assistant_tool_calls(vec![ToolCallChunk {
+                id: "c1".into(),
+                name: "mcp__po__note".into(),
+                arguments: long.clone(),
+            }]),
+            ChatMessage::tool("c1", "ok"),
+        ];
+        store.save("t", &conversation).unwrap();
+        let back = store.load("t").unwrap().unwrap();
+        assert_eq!(
+            back[0].content.as_deref(),
+            Some(r#"{"input_tokens":12} and <redacted>"#)
+        );
+        assert_eq!(back[1].tool_calls[0].arguments, long);
+        assert_eq!(back[1..], conversation[1..]);
     }
 }
