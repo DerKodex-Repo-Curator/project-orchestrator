@@ -8185,7 +8185,7 @@ mod legacy_session_record {
             let outcome = manager.interrupt_scoped(&sid, true).await.unwrap();
             assert!(outcome.delivered, "the session is local: {outcome:?}");
             assert!(
-                idle_within(&manager, &sid, 15).await,
+                idle_within(&manager, &sid, 30).await,
                 "a delivered Stop frees the session even when its turn ignores the token"
             );
             let events = received(&mut rx);
@@ -13468,24 +13468,36 @@ mod legacy_turn_end_at_boot {
     /// Finding 4: a turn stopped by a person ends on the thread with a `result`
     /// (`stop_reason: interrupted`), whether the CLI answers the interrupt or not.
     async fn a_stopped_turn_is_stored_with_its_end(cli_answers: bool) {
+        let marks = tempfile::tempdir().unwrap();
+        let mid_turn = marks.path().join("mid-turn");
         let mut transcript = vec![
             json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
             init(),
             text("working on it", "msg_1"),
-            json!({"op": "await_stdin", "contains": "\"interrupt\"", "timeout_ms": 15000, "optional": true}),
+            // The readiness signal: the fake CLI touches `mid_turn` once it has written
+            // "working on it" (a child process, reaped at once). A complete assistant
+            // message shows in neither part of the streaming snapshot on this engine,
+            // and the fixed pause this replaces was too short under Code Coverage.
+            json!({"op": "spawn_child", "program": "touch", "args": [mid_turn.display().to_string()]}),
+            json!({"op": "wait_children_exit", "timeout_ms": 30000}),
+            json!({"op": "await_stdin", "contains": "\"interrupt\"", "timeout_ms": 60000, "optional": true}),
         ];
         if cli_answers {
             transcript.push(result("error_during_execution", "", true));
         }
         transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
         let cli = open(transcript).await;
-        for _ in 0..400 {
-            if cli.manager.is_session_streaming(&cli.sid).await {
-                break;
-            }
+        // The Stop lands mid-turn: the turn runs and the CLI is in it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !(mid_turn.exists() && cli.manager.is_session_streaming(&cli.sid).await) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fake CLI never reached the middle of its turn (marker={}, streaming={})",
+                mid_turn.exists(),
+                cli.manager.is_session_streaming(&cli.sid).await
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
         cli.manager.interrupt(&cli.sid).await.unwrap();
         cli.idle().await;
         assert!(

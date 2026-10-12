@@ -663,10 +663,25 @@ pub struct CancelToolsResult {
 
 /// How long a stopped turn may take to end before the interrupt watchdog
 /// ends it (`ChatManager::abandon_turn_if_stuck`). A turn that honours its
-/// cancellation ends within milliseconds; its post-stream steps are each
-/// bounded by `post_stream::POST_STREAM_STEP_BUDGET` and run after the Stop
-/// is acknowledged, so this only needs to cover the acknowledgement itself.
-pub(crate) const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+/// cancellation leaves its stream loop within milliseconds; its post-stream
+/// steps are each bounded by `post_stream::POST_STREAM_STEP_BUDGET` and run
+/// after the Stop is acknowledged. The acknowledgement itself includes the wait
+/// for the CLI's own `result` of the stopped turn, inside the loop and bounded by
+/// [`INTERRUPTED_TURN_RESULT_GRACE`]: the grace covers that wait with a margin.
+///
+/// They used to be equal (5 s each): a CLI that never answered its interrupt
+/// held the drain for the whole 5 s, and the watchdog, armed a moment earlier,
+/// fired at the same time. When it won (a loaded machine: the Code Coverage
+/// job), it aborted a turn that was ending on its own, inside its loop, and the
+/// turn's events, collected for one write at the end of the loop, were lost:
+/// the stopped turn had neither its text nor its end on the thread, and looked
+/// cut at the next boot (task 39427f40).
+pub(crate) const INTERRUPT_GRACE: Duration =
+    Duration::from_secs(INTERRUPTED_TURN_RESULT_GRACE.as_secs() + 5);
+const _: () = assert!(
+    INTERRUPT_GRACE.as_secs() >= INTERRUPTED_TURN_RESULT_GRACE.as_secs() + 5,
+    "the interrupt watchdog must outlast the wait for the interrupted turn's result"
+);
 
 /// Outcome of [`ChatManager::interrupt_scoped`]. Surfaced to REST callers
 /// so a client can tell a real interrupt from a silent no-op: before this,
