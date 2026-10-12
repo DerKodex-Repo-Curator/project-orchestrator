@@ -2094,6 +2094,10 @@ pub trait GraphStore: Send + Sync {
     /// Update the permission_mode field on a chat session node
     async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()>;
 
+    /// Record whether a PERSON lifted the session's file scope (decision fce98b8a):
+    /// [`ChatSessionNode::file_scope_lifted`].
+    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()>;
+
     /// Update the model field on a chat session node (so a mid-session model switch
     /// survives idle-cleanup and is honored on resume/respawn)
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;

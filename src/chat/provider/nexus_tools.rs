@@ -357,6 +357,9 @@ pub struct ToolAccessHooks {
     session_id: String,
     project: Option<String>,
     search_origins: Vec<String>,
+    /// The directories the session was launched with (cwd, then extra ones): what its file
+    /// tools are held to when a session launched `--unscoped` left trust.
+    scope_dirs: Option<(PathBuf, Vec<PathBuf>)>,
 }
 
 impl ToolAccessHooks {
@@ -374,6 +377,57 @@ impl ToolAccessHooks {
             session_id: session_id.into(),
             project,
             search_origins,
+            scope_dirs: None,
+        }
+    }
+
+    /// The session's directories, to confine its file tools once it leaves trust.
+    #[must_use]
+    pub fn with_scope_dirs(mut self, cwd: PathBuf, extra_dirs: Vec<PathBuf>) -> Self {
+        self.scope_dirs = Some((cwd, extra_dirs));
+        self
+    }
+
+    /// Why a file tool call of a session launched `--unscoped` that LEFT trust is refused: its
+    /// path resolves outside the session's directories. Resolved by nexus-tools' own resolver
+    /// (`files::Scope`: symlinks and `..` followed component by component), so the backend and
+    /// the server agree on what "inside" means. `None`: allowed (not a file tool, no path given:
+    /// the working directory, or inside). Fails closed when the directories are unknown or gone.
+    /// `Bash` is not judged here: in a mode other than trust each command is asked for.
+    /// Known limit: a `cd` the shell made while in trust survives (nexus-tools keeps the shell's
+    /// directory across calls, and an unscoped scope accepted it), so the next commands start
+    /// there; outside trust each of them is asked for, and the file tools are judged by the path
+    /// they name, whatever the shell's directory. The session's temporary directory (command
+    /// outputs) is one of its directories ([`session_temp_dir`]).
+    fn outside_scope(&self, call: &ToolCallInfo) -> Option<String> {
+        let tool = call
+            .canonical
+            .as_deref()
+            .or_else(|| call.name.rsplit("__").next())
+            .unwrap_or_default();
+        let key = match tool {
+            "Read" | "Write" | "Edit" => "file_path",
+            "NotebookEdit" => "notebook_path",
+            "Glob" | "Grep" => "path",
+            _ => return None,
+        };
+        let given = call
+            .input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())?;
+        let refused = || {
+            Some(format!(
+                "this session left trust mode: its file tools are held to its own directories \
+                 again, and `{given}` is outside them"
+            ))
+        };
+        let Some((cwd, extra)) = &self.scope_dirs else {
+            return refused();
+        };
+        match nexus_tools::files::Scope::new(cwd, extra.iter().cloned()) {
+            Ok(scope) if scope.resolve(given).is_ok() => None,
+            _ => refused(),
         }
     }
 
@@ -390,6 +444,20 @@ impl SessionHooks for ToolAccessHooks {
             return HookVerdict::Deny {
                 reason: ToolAccessError::TokenRevoked.reason(),
             };
+        }
+        // Launched `--unscoped`, then out of trust: the server still enforces no root, so the
+        // backend does, until the process is relaunched (decision fce98b8a).
+        if Self::is_nexus_tool(call)
+            && crate::auth::agent_tokens::must_confine_unscoped(&self.session_id)
+        {
+            if let Some(reason) = self.outside_scope(call) {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    tool = %call.name,
+                    "file tool outside the session's directories refused: the session left trust"
+                );
+                return HookVerdict::Deny { reason };
+            }
         }
         if let Err(refusal) = check_call(
             self.consents.as_ref(),
@@ -477,15 +545,32 @@ struct Claims<'a> {
     sid: &'a str,
     tools: &'a [String],
     exp: u64,
+    /// nexus-tools accepts `--unscoped` only with this claim (nexus #93). Left out when false,
+    /// like nexus-tools does, so the token of a scoped session is unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unscoped: bool,
 }
 
 /// Signs the token of a profile with `key` (the bytes of the key string, as nexus-tools reads
 /// them): `v1.<base64url(claims)>.<base64url(HMAC-SHA256(key, "v1.<base64url(claims)>"))>`.
 pub fn sign_profile(key: &str, session_id: &str, tools: &[String], exp: u64) -> String {
+    sign_profile_claims(key, session_id, tools, exp, false)
+}
+
+/// [`sign_profile`], with the `unscoped` claim when `unscoped` (the session's file scope is
+/// lifted: [`attach`]).
+pub fn sign_profile_claims(
+    key: &str,
+    session_id: &str,
+    tools: &[String],
+    exp: u64,
+    unscoped: bool,
+) -> String {
     let body = serde_json::to_vec(&Claims {
         sid: session_id,
         tools,
         exp,
+        unscoped,
     })
     .unwrap_or_default();
     let signed = format!("v1.{}", URL_SAFE_NO_PAD.encode(body));
@@ -501,10 +586,15 @@ pub fn sign_profile(key: &str, session_id: &str, tools: &[String], exp: u64) -> 
 impl SessionToolsToken {
     /// A fresh key and the token it signs.
     pub fn mint(session_id: &str, tools: &[String], exp: u64) -> Self {
+        Self::mint_with(session_id, tools, exp, false)
+    }
+
+    /// [`Self::mint`], the token carrying the `unscoped` claim when `unscoped`.
+    pub fn mint_with(session_id: &str, tools: &[String], exp: u64, unscoped: bool) -> Self {
         let mut bytes = [0u8; 32];
         rand_core_06::OsRng.fill_bytes(&mut bytes);
         let key = hex::encode(bytes);
-        let token = sign_profile(&key, session_id, tools, exp);
+        let token = sign_profile_claims(&key, session_id, tools, exp, unscoped);
         Self { key, token }
     }
 
@@ -529,6 +619,9 @@ pub struct NexusToolsConfig {
     pub program: PathBuf,
     /// The browser, when its executable was found. Present does not mean authorised.
     pub browser: Option<BrowserTools>,
+    /// Places no file tool of the session may reach, scoped or not (`--deny-path`, nexus #93):
+    /// [`host_deny_paths`] in production.
+    pub deny_paths: Vec<PathBuf>,
 }
 
 /// The `nexus-tools` tools a session's policy gives it (the profile signed into its token).
@@ -562,6 +655,12 @@ pub struct AttachInput<'a> {
     pub cwd: &'a Path,
     /// Extra directories of the file scope.
     pub extra_dirs: &'a [PathBuf],
+    /// The session's access: a read-only session never has its file scope lifted.
+    pub access: super::policy::SessionAccess,
+    /// A PERSON lifted this session's file scope ([`crate::neo4j::models::ChatSessionNode::file_scope_lifted`],
+    /// decision fce98b8a). Not the decision itself: [`attach`] lifts the scope only when the
+    /// policy is in trust AND the access is normal AND this is set ([`lifts_file_scope`]).
+    pub lifted_by_person: bool,
     /// The session's neutral tool policy.
     pub policy: &'a ToolPolicy,
     /// The ceiling of its mode, when it has one.
@@ -585,6 +684,11 @@ pub struct Attachment {
     pub tools: Vec<String>,
     /// Engines left out, and why (no key granted, vault locked, origin not consented).
     pub skipped_engines: Vec<(String, ToolAccessError)>,
+    /// The server was launched `--unscoped`: its roots are not enforced (the deny list is).
+    pub unscoped: bool,
+    /// The temporary directory of this session's `nexus-tools` (`TMPDIR`, [`session_temp_dir`]):
+    /// its command outputs live below it, so it is part of the session's directories.
+    pub temp_dir: Option<PathBuf>,
 }
 
 /// Resolves the key of a search provider for THAT provider: the vault is asked under the grant
@@ -609,6 +713,169 @@ pub fn resolve_search_key(
         // Locked, throttled, unreadable: the key cannot be read now. Never "no key".
         Err(_) => Err(ToolAccessError::CredentialsLocked { provider: grant_id }),
     }
+}
+
+/// The temporary directory of one session's `nexus-tools`: `<tmp>/po-nexus-tools/<session>`,
+/// created private (0700). `None` when it cannot be made: the server then uses the host's.
+pub fn session_temp_dir(session_id: &str) -> Option<PathBuf> {
+    let name: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let base = std::env::temp_dir().join("po-nexus-tools");
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for private in [&base, &dir] {
+            std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+    }
+    std::fs::canonicalize(dir).ok()
+}
+
+/// Whether a session's file scope is lifted (`nexus-tools --unscoped`): its policy is in trust
+/// (`trust` and `bypassPermissions` alike: the neutral mode), its access is normal (a read-only
+/// session never reads the whole disk), AND a person chose it ([`AttachInput::lifted_by_person`],
+/// decision fce98b8a). The runner, `delegate_task` and protocol runs are in trust too, but
+/// nobody chose the lift for them: they stay scoped.
+pub fn lifts_file_scope(
+    policy: &ToolPolicy,
+    access: super::policy::SessionAccess,
+    lifted_by_person: bool,
+) -> bool {
+    policy.mode == nexus_claude::agent::PolicyMode::Trust
+        && access == super::policy::SessionAccess::Normal
+        && lifted_by_person
+}
+
+/// The application directory of project-orchestrator (`config.yaml`, `vault.json`,
+/// `identity.key`, documents, transcripts), as the server finds it.
+fn app_dir() -> Option<PathBuf> {
+    let config = dirs::config_dir()?;
+    Some(if cfg!(target_os = "windows") {
+        config.join("ProjectOrchestrator")
+    } else {
+        config.join("project-orchestrator")
+    })
+}
+
+/// Where the host keeps what [`deny_paths_for`] protects. [`HostPlaces::detect`] in production.
+#[derive(Debug, Clone, Default)]
+pub struct HostPlaces {
+    /// The user's home directory.
+    pub home: Option<PathBuf>,
+    /// The application directory of project-orchestrator ([`app_dir`]).
+    pub app: Option<PathBuf>,
+    /// The vault store.
+    pub vault: Option<PathBuf>,
+    /// The configuration file the server actually loaded (`--config`, the app directory or the
+    /// working directory), made absolute.
+    pub config: Option<PathBuf>,
+    /// `$CLAUDE_CONFIG_DIR`, when set: Claude Code's configuration moved out of `~/.claude`.
+    pub claude_config_dir: Option<PathBuf>,
+}
+
+impl HostPlaces {
+    /// The places of this host. `config` is the file the server loaded (relative to its working
+    /// directory when it was found there).
+    pub fn detect(config: Option<&Path>) -> Self {
+        let absolute = |path: &Path| {
+            if path.is_absolute() {
+                Some(path.to_path_buf())
+            } else {
+                std::env::current_dir().ok().map(|cwd| cwd.join(path))
+            }
+        };
+        Self {
+            home: dirs::home_dir(),
+            app: app_dir(),
+            vault: Some(crate::vault::Vault::default_path()),
+            config: config.and_then(absolute),
+            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        }
+    }
+}
+
+/// Home entries that hold credentials of the user's other tools: no file tool reads them.
+const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".claude",
+    ".claude.json",
+    ".project-orchestrator",
+    ".config/gh",
+    ".aws",
+    ".netrc",
+    ".docker/config.json",
+    ".kube",
+    ".gnupg",
+    ".codex",
+];
+
+/// The places no file tool of any session may reach (`--deny-path`, nexus #93), scoped or not:
+/// - in the home: `.ssh`, `.claude` and `.claude.json` (`mcp.json` holds the server's token),
+///   the old `~/.project-orchestrator`, and the credentials of other tools (`gh`, AWS, `.netrc`,
+///   Docker, Kubernetes, GnuPG, Codex);
+/// - `$CLAUDE_CONFIG_DIR` when set;
+/// - the vault store, the configuration file the server loaded and the `.env` next to it;
+/// - every entry of the application directory except `chat-neutral`, where sessions without a
+///   project WORK.
+///
+/// The secret files are named even when absent, so one created later is still denied. Bash is
+/// a shell, not a sandbox: this list confines the file tools only.
+pub fn deny_paths_for(places: &HostPlaces) -> Vec<PathBuf> {
+    let mut denied = Vec::new();
+    if let Some(home) = &places.home {
+        denied.extend(HOME_SECRETS.iter().map(|entry| home.join(entry)));
+    }
+    denied.extend(places.claude_config_dir.clone());
+    denied.extend(places.vault.clone());
+    if let Some(config) = &places.config {
+        denied.push(config.clone());
+        if let Some(dir) = config.parent() {
+            denied.push(dir.join(".env"));
+        }
+    }
+    if let Some(app) = &places.app {
+        for name in [
+            "config.yaml",
+            "vault.json",
+            "vault-grants.json",
+            "identity.key",
+            "documents",
+            "native-transcripts",
+        ] {
+            denied.push(app.join(name));
+        }
+        if let Ok(entries) = std::fs::read_dir(app) {
+            for entry in entries.flatten() {
+                if entry.file_name() != crate::chat::neutral_place::DIR_NAME {
+                    denied.push(entry.path());
+                }
+            }
+        }
+    }
+    denied.retain(|path| path.is_absolute());
+    let mut seen = std::collections::BTreeSet::new();
+    denied.retain(|path| seen.insert(path.clone()));
+    denied
+}
+
+/// [`deny_paths_for`] the places of this host, `config` being the file the server loaded.
+pub fn host_deny_paths(config: Option<&Path>) -> Vec<PathBuf> {
+    deny_paths_for(&HostPlaces::detect(config))
 }
 
 /// Decides and builds what a native session is given. Returns an empty [`Attachment`] when the
@@ -703,17 +970,45 @@ pub async fn attach(
     let exp = u64::try_from(input.now.timestamp())
         .unwrap_or(0)
         .saturating_add(input.ttl_secs);
-    let token = SessionToolsToken::mint(input.session_id, &tools, exp);
+    // The file scope: lifted only for trust + normal access + a person's explicit choice. Then
+    // BOTH the flag and the signed claim go to the server (nexus-tools refuses one without the
+    // other); the deny list goes in every case.
+    let unscoped = lifts_file_scope(input.policy, input.access, input.lifted_by_person);
+    let token = SessionToolsToken::mint_with(input.session_id, &tools, exp, unscoped);
     crate::auth::agent_tokens::register_tools(input.session_id);
+    crate::auth::agent_tokens::set_launched_unscoped(input.session_id, unscoped);
     let mut args = vec!["--cwd".to_owned(), input.cwd.display().to_string()];
     for dir in input.extra_dirs {
         args.push("--add-dir".to_owned());
         args.push(dir.display().to_string());
     }
+    for denied in &config.deny_paths {
+        args.push("--deny-path".to_owned());
+        args.push(denied.display().to_string());
+    }
+    if unscoped {
+        tracing::info!(
+            session_id = input.session_id,
+            file_scope = "unscoped",
+            deny_paths = config.deny_paths.len(),
+            "nexus-tools launched with its file scope lifted (trust, chosen by a person): roots \
+             not enforced, deny list kept"
+        );
+        args.push("--unscoped".to_owned());
+    }
+    attachment.unscoped = unscoped;
     args.push("--tools".to_owned());
     args.push(tools.join(","));
     args.extend(engine_args);
     let mut env = token.environment();
+    // A temporary directory of its own: `nexus-tools` keeps the outputs of its commands in
+    // `<tmp>/nexus-tools-<pid>`, which the hooks then know to be this session's (and only it).
+    if let Some(tmp) = session_temp_dir(input.session_id) {
+        for variable in ["TMPDIR", "TMP", "TEMP"] {
+            env.insert(variable.to_owned(), tmp.display().to_string());
+        }
+        attachment.temp_dir = Some(tmp);
+    }
     env.extend(secrets);
     attachment.servers.insert(
         NEXUS_TOOLS_SERVER.to_owned(),
@@ -839,6 +1134,7 @@ mod tests {
         NexusToolsConfig {
             program: PathBuf::from("/opt/nexus/nexus-tools"),
             browser: None,
+            deny_paths: vec![PathBuf::from("/home/me/.ssh")],
         }
     }
 
@@ -851,6 +1147,8 @@ mod tests {
             session_id: session,
             cwd: Path::new("/work/app"),
             extra_dirs: &[],
+            access: super::super::policy::SessionAccess::Normal,
+            lifted_by_person: false,
             policy,
             ceiling: None,
             project,
@@ -1305,6 +1603,275 @@ mod tests {
         assert!(!crate::auth::agent_tokens::tools_live("att-s1"));
     }
 
+    /// The claims a signed profile token carries, read without the key (the body is not secret).
+    fn token_claims(token: &str) -> serde_json::Value {
+        let body = token.split('.').nth(1).unwrap();
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(body).unwrap()).unwrap()
+    }
+
+    /// The file scope is lifted (decision fce98b8a) only when the policy is in trust, the access
+    /// is normal AND a person chose it. Then BOTH the flag and the signed claim go to the server
+    /// (nexus-tools refuses one without the other); the deny list goes in every case. The
+    /// runner, `delegate_task` and protocol runs are in trust without a person's choice: scoped.
+    #[tokio::test]
+    async fn the_file_scope_is_lifted_only_for_trust_normal_access_and_a_persons_choice() {
+        use super::super::policy::SessionAccess::{Normal, ReadOnly};
+        let graph = Arc::new(MockGraphStore::new());
+        let consents = GraphConsents(graph);
+        let cases = [
+            (PolicyMode::Trust, Normal, true, true),
+            (PolicyMode::Trust, Normal, false, false),
+            (PolicyMode::Trust, ReadOnly, true, false),
+            (PolicyMode::Ask, Normal, true, false),
+            (PolicyMode::AutoEdits, Normal, true, false),
+            (PolicyMode::PlanOnly, Normal, true, false),
+        ];
+        for (index, (mode, access, lifted_by_person, expected)) in cases.into_iter().enumerate() {
+            let sid = format!("att-lift-{index}");
+            let policy =
+                ToolPolicy::from_patterns(mode, &["Read", "Grep"], &[] as &[&str]).unwrap();
+            let mut attach_input = input(&sid, &policy, Some("proj"));
+            attach_input.access = access;
+            attach_input.lifted_by_person = lifted_by_person;
+            let attachment = attach(&config(), &consents, None, attach_input).await;
+            let case = format!("{mode:?} {access:?} lifted={lifted_by_person}");
+            let (_, args, env) = stdio(&attachment, "nexus");
+            assert_eq!(
+                args.contains(&"--unscoped".to_owned()),
+                expected,
+                "{case}: {args:?}"
+            );
+            assert_eq!(attachment.unscoped, expected, "{case}");
+            let claims = token_claims(&env["NEXUS_TOOLS_PROFILE"]);
+            assert_eq!(
+                claims.get("unscoped") == Some(&json!(true)),
+                expected,
+                "{case}: {claims}"
+            );
+            if !expected {
+                assert!(
+                    claims.get("unscoped").is_none(),
+                    "{case}: a scoped token is unchanged"
+                );
+            }
+            assert_eq!(
+                crate::auth::agent_tokens::is_scope_lifted(&sid),
+                expected,
+                "{case}"
+            );
+            // The deny list, in every case.
+            let at = args.iter().position(|a| a == "--deny-path").unwrap();
+            assert_eq!(args[at + 1], "/home/me/.ssh", "{case}");
+            // A private temporary directory of its own (its command outputs live below it).
+            let tmp = attachment
+                .temp_dir
+                .clone()
+                .expect("a session temporary directory");
+            assert_eq!(env["TMPDIR"], tmp.display().to_string(), "{case}");
+            assert!(tmp.ends_with(&sid), "{case}: {tmp:?}");
+            crate::auth::agent_tokens::revoke_session(&sid);
+        }
+    }
+
+    /// `bypassPermissions` (the stored spelling) is the same trust as `trust`.
+    #[tokio::test]
+    async fn bypass_permissions_lifts_the_file_scope_like_trust() {
+        let graph = Arc::new(MockGraphStore::new());
+        let consents = GraphConsents(graph);
+        for (index, mode) in ["bypassPermissions", "trust"].into_iter().enumerate() {
+            let pair = super::super::policy::parse_mode(mode).unwrap();
+            let policy =
+                ToolPolicy::from_patterns(pair.neutral, &["Read"], &[] as &[&str]).unwrap();
+            let sid = format!("att-bypass-{index}");
+            let mut attach_input = input(&sid, &policy, Some("proj"));
+            attach_input.lifted_by_person = true;
+            let attachment = attach(&config(), &consents, None, attach_input).await;
+            assert!(attachment.unscoped, "{mode}");
+            crate::auth::agent_tokens::revoke_session(&sid);
+        }
+    }
+
+    /// A session launched `--unscoped` that LEFT trust is held to its directories by its hooks
+    /// (the process keeps its roots unenforced until relaunched), with nexus-tools' own resolver.
+    #[tokio::test]
+    async fn a_session_launched_unscoped_is_confined_by_its_hooks_once_it_leaves_trust() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("in.txt"), "in").unwrap();
+        // The session's temporary directory: a background command's output file lives below it.
+        let session_tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(session_tmp.path().join("nexus-tools-42")).unwrap();
+        std::fs::write(session_tmp.path().join("nexus-tools-42/task.out"), "done").unwrap();
+        std::fs::write(outside.path().join("out.txt"), "out").unwrap();
+        let sid = "hook-confine-1";
+        let hooks = ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(Arc::new(MockGraphStore::new()))),
+            sid,
+            Some("proj".into()),
+            Vec::new(),
+        )
+        .with_scope_dirs(
+            root.path().to_path_buf(),
+            vec![session_tmp.path().to_path_buf()],
+        );
+        crate::auth::agent_tokens::register_tools(sid);
+        let read = |path: &Path| {
+            call(
+                "mcp__nexus__Read",
+                Some("Read"),
+                json!({"file_path": path.display().to_string()}),
+            )
+        };
+        let denied = |verdict: HookVerdict| matches!(verdict, HookVerdict::Deny { .. });
+        // Launched scoped: nothing for the hooks to do (the server confines).
+        assert!(!denied(
+            hooks
+                .before_tool(&read(&outside.path().join("out.txt")))
+                .await
+        ));
+        // Launched unscoped, in trust: the lift holds, outside is allowed.
+        crate::auth::agent_tokens::set_launched_unscoped(sid, true);
+        assert!(!denied(
+            hooks
+                .before_tool(&read(&outside.path().join("out.txt")))
+                .await
+        ));
+        // Left trust: outside refused for every file tool, inside still allowed.
+        crate::auth::agent_tokens::set_scope_lift_live(sid, false);
+        let out = outside.path().join("out.txt").display().to_string();
+        for (name, canonical, input) in [
+            ("mcp__nexus__Read", "Read", json!({"file_path": out})),
+            (
+                "mcp__nexus__Write",
+                "Write",
+                json!({"file_path": out, "content": "x"}),
+            ),
+            (
+                "mcp__nexus__Edit",
+                "Edit",
+                json!({"file_path": out, "old_string": "o", "new_string": "x"}),
+            ),
+            (
+                "mcp__nexus__NotebookEdit",
+                "NotebookEdit",
+                json!({"notebook_path": out, "new_source": "x"}),
+            ),
+            (
+                "mcp__nexus__Grep",
+                "Grep",
+                json!({"pattern": "o", "path": outside.path().display().to_string()}),
+            ),
+            (
+                "mcp__nexus__Glob",
+                "Glob",
+                json!({"pattern": "*", "path": outside.path().display().to_string()}),
+            ),
+            // `..` resolved like the server does.
+            (
+                "mcp__nexus__Read",
+                "Read",
+                json!({"file_path": format!("{}/../{}/out.txt", root.path().display(), outside.path().file_name().unwrap().to_string_lossy())}),
+            ),
+        ] {
+            assert!(
+                denied(
+                    hooks
+                        .before_tool(&call(name, Some(canonical), input.clone()))
+                        .await
+                ),
+                "{name} {input}"
+            );
+        }
+        assert!(!denied(
+            hooks.before_tool(&read(&root.path().join("in.txt"))).await
+        ));
+        assert!(
+            !denied(
+                hooks
+                    .before_tool(&read(&session_tmp.path().join("nexus-tools-42/task.out")))
+                    .await
+            ),
+            "the output of a background command stays readable"
+        );
+        assert!(!denied(
+            hooks
+                .before_tool(&call(
+                    "mcp__nexus__Glob",
+                    Some("Glob"),
+                    json!({"pattern": "*"})
+                ))
+                .await
+        ));
+        // Back in trust by a person: lifted again.
+        crate::auth::agent_tokens::set_scope_lift_live(sid, true);
+        assert!(!denied(
+            hooks
+                .before_tool(&read(&outside.path().join("out.txt")))
+                .await
+        ));
+        crate::auth::agent_tokens::revoke_session(sid);
+    }
+
+    /// The deny list names the secrets of the host and of project-orchestrator (the config the
+    /// server loaded and its `.env`, `$CLAUDE_CONFIG_DIR`, other tools' credentials) and never
+    /// the neutral directory where sessions without a project work. Built from temporary
+    /// places: the test reads nothing of the real machine.
+    #[test]
+    fn the_deny_list_names_the_secrets_and_spares_the_neutral_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let neutral = app.path().join(crate::chat::neutral_place::DIR_NAME);
+        std::fs::create_dir_all(&neutral).unwrap();
+        std::fs::write(app.path().join("some-future-store.db"), "x").unwrap();
+        let config = elsewhere.path().join("config.yaml");
+        let claude_dir = elsewhere.path().join("claude-config");
+        let places = HostPlaces {
+            home: Some(home.path().to_path_buf()),
+            app: Some(app.path().to_path_buf()),
+            vault: Some(app.path().join("vault.json")),
+            config: Some(config.clone()),
+            claude_config_dir: Some(claude_dir.clone()),
+        };
+        let denied = deny_paths_for(&places);
+        let mut expected: Vec<PathBuf> = HOME_SECRETS
+            .iter()
+            .map(|entry| home.path().join(entry))
+            .collect();
+        expected.extend([
+            claude_dir,
+            config,
+            elsewhere.path().join(".env"),
+            app.path().join("vault.json"),
+            app.path().join("identity.key"),
+            // An entry of the app directory nobody named yet.
+            app.path().join("some-future-store.db"),
+        ]);
+        for path in &expected {
+            assert!(denied.contains(path), "{path:?} not in {denied:?}");
+        }
+        for secret in [
+            ".claude.json",
+            ".aws",
+            ".netrc",
+            ".config/gh",
+            ".docker/config.json",
+            ".kube",
+            ".gnupg",
+            ".codex",
+        ] {
+            assert!(denied.contains(&home.path().join(secret)), "{secret}");
+        }
+        assert!(
+            !denied.iter().any(|d| neutral.starts_with(d)),
+            "the neutral directory is denied: {denied:?}"
+        );
+        assert!(denied.iter().all(|d| d.is_absolute()));
+        let unique: std::collections::BTreeSet<_> = denied.iter().collect();
+        assert_eq!(unique.len(), denied.len(), "no path twice");
+    }
+
     /// WebFetch is offered only to a project that consented to some origin: without one every
     /// call would be refused. A forged document (key and origin that differ) is no consent, an
     /// unreadable store offers nothing, and a session without a project never gets it.
@@ -1575,6 +2142,7 @@ mod tests {
         let with = |browser: Option<BrowserTools>| NexusToolsConfig {
             program: PathBuf::from("/opt/nexus/nexus-tools"),
             browser,
+            deny_paths: Vec::new(),
         };
         // Detected, not authorised.
         let a = attach(

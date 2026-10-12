@@ -27,7 +27,7 @@ pub use crate::neo4j::models::ExecutionPlace;
 /// A directory not touched for this long, with no live session to keep it, is an orphan.
 pub const ORPHAN_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-const DIR_NAME: &str = "chat-neutral";
+pub(crate) const DIR_NAME: &str = "chat-neutral";
 
 /// Root of every neutral directory.
 pub fn root() -> PathBuf {

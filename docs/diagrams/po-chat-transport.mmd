@@ -76,7 +76,7 @@ flowchart TD
         INTERRUPT["✅ interrupt → ChatManager::interrupt ; cancel_tools → cancel_running_tools<br/><i>vérifié : test_client_message_deserialization</i>"]
         PERMRESP["✅ permission_response (id, allow) : dédoublonnée par connexion,<br/>→ route_permission_response(require_pending = false)<br/><i>vérifié : test_client_message_deserialization</i>"]
         INPUTRESP["🟠 input_response (id, content) : local send_message, sinon try_remote_send,<br/>sinon erreur « Session not active on any instance » — pas de reprise,<br/>contrairement à user_message (asymétrie commentée dans le code)"]
-        SETTINGS["✅ set_permission_mode (session active seulement), set_model,<br/>set_auto_continue → set_session_permission_mode / set_session_model / set_auto_continue<br/><i>vérifié : test_client_message_deserialization</i>"]
+        SETTINGS["✅ set_permission_mode (PROPRIÉTAIRE seulement : may_answer_permissions, refus avant tout changement, lecture du propriétaire en échec = refus ; une PERSONNE qui passe en trust SA session (owner == Some(claims.sub) : jamais une session sans propriétaire — runner, délégation, protocole) lève le périmètre de fichiers : lifts_file_scope_on_switch → lift_file_scope, décision fce98b8a ; test : another_persons_set_permission_mode_is_refused_by_the_websocket_loop, only_a_person_switching_to_trust_lifts_the_file_scope) (session active seulement), set_model,<br/>set_auto_continue → set_session_permission_mode / set_session_model / set_auto_continue<br/><i>vérifié : test_client_message_deserialization</i>"]
     end
 
     SELECT -->|"trame cliente"| USERMSG

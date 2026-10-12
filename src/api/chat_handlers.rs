@@ -30,6 +30,28 @@ use uuid::Uuid;
 /// action) which previously could only START conversations: `ChatRequest`
 /// documented `session_id` as "Session ID to resume" but `create_session`
 /// ignored it and always generated a fresh UUID.
+/// Whether this new-session request lifts the session's file scope (decision fce98b8a): a
+/// PERSON ([`crate::auth::jwt::Claims::may_lift_file_scope`]: not an agent session, not a
+/// long-lived MCP token, not the server's account, not the anonymous user) opens a NEW session
+/// and names trust (`trust` or `bypassPermissions`) explicitly. A resume, a mode left to the
+/// default and every agent caller do not.
+pub(crate) fn person_lifts_file_scope(
+    caller: &crate::chat::envelope::SpawnCaller,
+    request: &crate::chat::types::ChatRequest,
+) -> bool {
+    use crate::chat::envelope::{mode_rank, SpawnCaller, TRUST_RANK};
+    matches!(caller, SpawnCaller::Human)
+        && request.session_id.is_none()
+        && request
+            .user_claims
+            .as_ref()
+            .is_some_and(|claims| claims.may_lift_file_scope())
+        && request
+            .permission_mode
+            .as_deref()
+            .is_some_and(|mode| mode_rank(mode) >= TRUST_RANK)
+}
+
 pub async fn create_session(
     State(state): State<OrchestratorState>,
     claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
@@ -51,6 +73,9 @@ pub async fn create_session(
     if let Some(axum::Extension(c)) = claims {
         request.user_claims = Some(c);
     }
+    // A person opening a session in trust lifts its file scope (decision fce98b8a). Never
+    // from the body (`serde(skip)`), never for an agent, an MCP token or the server's account.
+    request.file_scope_lifted = person_lifts_file_scope(&caller, &request);
 
     let chat_manager = state
         .chat_manager
@@ -3028,6 +3053,7 @@ mod tests {
             nexus_claude::agent::ProviderKind::ClaudeCode
         );
         let request = crate::chat::types::ChatRequest {
+            file_scope_lifted: false,
             access: None,
             routing_pool: None,
             routing_mode: None,
@@ -4963,6 +4989,7 @@ mod tests {
         let h = action_harness(None).await;
         let owner = Uuid::new_v4();
         let session = crate::neo4j::models::ChatSessionNode {
+            file_scope_lifted: false,
             owner: Some(owner.to_string()),
             ..test_chat_session(None)
         };
@@ -5067,6 +5094,7 @@ mod tests {
         let h = action_harness(None).await;
         let owner = Uuid::new_v4();
         let session = crate::neo4j::models::ChatSessionNode {
+            file_scope_lifted: false,
             owner: Some(owner.to_string()),
             ..test_chat_session(None)
         };
@@ -5864,5 +5892,105 @@ pub(crate) fn cancel_error(error: anyhow::Error) -> AppError {
             AppError::Provider(Box::new(failure))
         }
         None => AppError::Internal(error),
+    }
+}
+
+#[cfg(test)]
+mod file_scope_lift_tests {
+    use super::person_lifts_file_scope;
+    use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
+    use crate::chat::envelope::SpawnCaller;
+    use crate::chat::types::ChatRequest;
+
+    fn person() -> Claims {
+        Claims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            email: "me@example.com".into(),
+            ..Claims::anonymous()
+        }
+    }
+
+    fn opening(claims: Option<Claims>, mode: Option<&str>) -> ChatRequest {
+        ChatRequest {
+            user_claims: claims,
+            permission_mode: mode.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// Decision fce98b8a: only a person opening a NEW session with trust named explicitly lifts
+    /// its file scope. A long-lived MCP token (classified as a person by `identify_caller`), an
+    /// agent session, the server's account, the anonymous user, an agent caller, a resume and a
+    /// mode left to the default never do.
+    #[test]
+    fn only_a_person_opening_a_session_in_trust_lifts_its_file_scope() {
+        let human = SpawnCaller::Human;
+        for mode in ["trust", "bypassPermissions"] {
+            assert!(
+                person_lifts_file_scope(&human, &opening(Some(person()), Some(mode))),
+                "{mode}"
+            );
+        }
+        for mode in [
+            None,
+            Some("default"),
+            Some("acceptEdits"),
+            Some("auto"),
+            Some("plan"),
+        ] {
+            assert!(
+                !person_lifts_file_scope(&human, &opening(Some(person()), mode)),
+                "{mode:?}"
+            );
+        }
+        let mcp = Claims {
+            token_type: Some(TOKEN_TYPE_MCP.into()),
+            ..person()
+        };
+        let agent = Claims {
+            token_type: Some(TOKEN_TYPE_AGENT_SESSION.into()),
+            ..person()
+        };
+        for (who, claims) in [
+            ("mcp token", Some(mcp)),
+            ("agent session", Some(agent)),
+            (
+                "service account",
+                Some(Claims::service_account("runner-agent:x")),
+            ),
+            ("anonymous", Some(Claims::anonymous())),
+            ("no claims", None),
+        ] {
+            assert!(
+                !person_lifts_file_scope(&human, &opening(claims, Some("trust"))),
+                "{who}"
+            );
+        }
+        let caller = SpawnCaller::Agent {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            token_ceiling: None,
+        };
+        assert!(!person_lifts_file_scope(
+            &caller,
+            &opening(Some(person()), Some("trust"))
+        ));
+        let resume = ChatRequest {
+            session_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..opening(Some(person()), Some("trust"))
+        };
+        assert!(!person_lifts_file_scope(&human, &resume));
+    }
+
+    /// The request body cannot set the flag: it is not deserialised.
+    #[test]
+    fn the_request_body_cannot_lift_the_file_scope() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "message": "go",
+            "cwd": "/tmp",
+            "permission_mode": "trust",
+            "file_scope_lifted": true,
+        }))
+        .unwrap();
+        assert!(!request.file_scope_lifted);
     }
 }

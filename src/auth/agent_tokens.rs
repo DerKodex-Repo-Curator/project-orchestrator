@@ -95,10 +95,64 @@ pub fn tools_live(session_id: &str) -> bool {
         .contains(session_id)
 }
 
+/// Sessions whose `nexus-tools` was launched `--unscoped` (decision fce98b8a), and whether the
+/// lift still holds: `true` while the session stays in trust as a person chose it, `false` once
+/// it left trust. The process keeps its roots unenforced until it is relaunched, so while the
+/// value is `false` the backend confines the file tools itself ([`must_confine_unscoped`]).
+static UNSCOPED: LazyLock<RwLock<HashMap<String, bool>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Records how the session's `nexus-tools` was just launched: `--unscoped` (the lift holds) or
+/// not (nothing to confine).
+pub fn set_launched_unscoped(session_id: &str, unscoped: bool) {
+    let mut map = UNSCOPED.write().unwrap_or_else(|e| e.into_inner());
+    if unscoped {
+        map.insert(session_id.to_string(), true);
+    } else {
+        map.remove(session_id);
+    }
+}
+
+/// Whether the lift of a session launched `--unscoped` still holds. No effect on a session
+/// launched scoped: a lift chosen later takes effect at its next launch.
+pub fn set_scope_lift_live(session_id: &str, live: bool) {
+    if let Some(value) = UNSCOPED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(session_id)
+    {
+        *value = live;
+    }
+}
+
+/// Whether the session's `nexus-tools` runs `--unscoped` and the lift holds: what the session
+/// reports as `file_scope: "unscoped"` in its capabilities.
+pub fn is_scope_lifted(session_id: &str) -> bool {
+    UNSCOPED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .is_some_and(|live| *live)
+}
+
+/// Whether the session's `nexus-tools` runs `--unscoped` while its lift no longer holds: the
+/// backend must then refuse every file tool call outside the session's directories.
+pub fn must_confine_unscoped(session_id: &str) -> bool {
+    UNSCOPED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .is_some_and(|live| !live)
+}
+
 /// Revoke every token minted for a session: the `agent_session` JWTs and the `nexus-tools`
 /// profile token. Returns how many were revoked.
 pub fn revoke_session(session_id: &str) -> usize {
     set_out_of_trust(session_id, false);
+    UNSCOPED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id);
     let tools = usize::from(
         TOOLS_LIVE
             .write()

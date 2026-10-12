@@ -849,6 +849,8 @@ impl Worker {
         .to_json_string();
         let now = chrono::Utc::now();
         let node = ChatSessionNode {
+            // A mirror has no process and no tools: never lifted.
+            file_scope_lifted: false,
             id: Uuid::new_v4(),
             cli_session_id: None,
             project_slug: parent.project_slug.clone(),

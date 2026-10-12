@@ -137,6 +137,9 @@ impl From<EnvelopeError> for crate::api::handlers::AppError {
 /// strings and the neutral ones (decision A43) are understood. An unknown mode
 /// ranks as `default`, which is also what `PermissionConfig::to_nexus_mode`
 /// turns it into.
+/// The rank of trust (`trust`, `bypassPermissions`): [`mode_rank`] of the most permissive mode.
+pub const TRUST_RANK: u8 = 4;
+
 pub fn mode_rank(mode: &str) -> u8 {
     match mode {
         "plan" | "plan_only" => 0,
@@ -230,7 +233,77 @@ pub struct ParentEnvelope {
     pub workspace_slug: Option<String>,
 }
 
+/// The git directory of the repository that `dir` is a linked WORKTREE of, as git records it.
+///
+/// `dir` or one of its ancestors holds a `.git` FILE (`gitdir: <repo>/.git/worktrees/<name>`).
+/// That admin directory must point back at this very `.git` file (its `gitdir` file, written by
+/// `git worktree add`), so a `.git` file planted anywhere cannot borrow a repository. Its
+/// `commondir` then names the repository's `.git`. `None`: not a linked worktree (no `.git`, a
+/// `.git` DIRECTORY, a broken or forged link). Pure file reads: no `git` process.
+fn worktree_repository(dir: &str) -> Option<(PathBuf, PathBuf)> {
+    let start = resolve_path(dir);
+    for candidate in start.ancestors() {
+        let dot_git = candidate.join(".git");
+        let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        if !meta.is_file() {
+            // An ordinary repository (or a link): not a worktree.
+            return None;
+        }
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let admin = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))?
+            .trim();
+        let admin = std::fs::canonicalize(candidate.join(admin)).ok()?;
+        let back = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+        let back = std::fs::canonicalize(candidate.join(back.trim())).ok()?;
+        if back != std::fs::canonicalize(&dot_git).ok()? {
+            return None;
+        }
+        let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
+        let repository = std::fs::canonicalize(admin.join(common.trim())).ok()?;
+        return Some((candidate.to_path_buf(), repository));
+    }
+    None
+}
+
+/// Whether `worktree` (a resolved worktree root) is too broad to be a child's working directory:
+/// the filesystem root, the home directory or one of its ancestors, or an ancestor of a place no
+/// file tool may reach. A parent in trust with a shell could otherwise fake a worktree there
+/// (`~/.git` plus an admin directory in its own repository) to give its child `cwd = ~`.
+fn too_broad_for_a_worktree(worktree: &Path, home: Option<&Path>, denied: &[PathBuf]) -> bool {
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    worktree.parent().is_none()
+        || home.is_some_and(|home| real(home).starts_with(worktree) || home.starts_with(worktree))
+        || denied
+            .iter()
+            .any(|place| real(place).starts_with(worktree) || place.starts_with(worktree))
+}
+
 impl ParentEnvelope {
+    /// Whether `cwd` is a linked git worktree of a repository whose `.git` lies under one of the
+    /// parent's directories ([`worktree_repository`]).
+    fn is_worktree_of_a_root_repo(&self, cwd: &str) -> bool {
+        self.worktree_allowed(
+            cwd,
+            dirs::home_dir().as_deref(),
+            &crate::chat::provider::nexus_tools::host_deny_paths(None),
+        )
+    }
+
+    /// [`Self::is_worktree_of_a_root_repo`] for a given home and deny list: a linked worktree of a
+    /// repository under the parent's directories, whose root is not too broad
+    /// ([`too_broad_for_a_worktree`]).
+    fn worktree_allowed(&self, cwd: &str, home: Option<&Path>, denied: &[PathBuf]) -> bool {
+        worktree_repository(cwd).is_some_and(|(worktree, repo)| {
+            let repo = repo.to_string_lossy();
+            !too_broad_for_a_worktree(&worktree, home, denied)
+                && self.roots.iter().any(|root| is_within(root, &repo))
+        })
+    }
+
     /// Fit a new-session request inside the envelope: clamp what can be
     /// clamped (permission mode), fill what is inherited (project, workspace),
     /// refuse what would escape (directories, project, workspace).
@@ -242,8 +315,15 @@ impl ParentEnvelope {
         request: &mut ChatRequest,
         default_mode: &str,
     ) -> Result<(), EnvelopeError> {
-        // Directories: the child works inside what the parent can already see.
-        if !self.roots.iter().any(|r| is_within(r, &request.cwd)) {
+        // Directories: the child works inside what the parent can already see. One exception,
+        // for a parent in trust (`trust` or `bypassPermissions`, by rank): its child may work in
+        // a git WORKTREE of a repository under the parent's directories (one another harness
+        // created next to the repository). Never anywhere else, and extra directories never
+        // leave the parent's: the child keeps its directories after the parent leaves trust.
+        let parent_in_trust = mode_rank(&self.ceiling) >= TRUST_RANK;
+        let cwd_allowed = self.roots.iter().any(|r| is_within(r, &request.cwd))
+            || (parent_in_trust && self.is_worktree_of_a_root_repo(&request.cwd));
+        if !cwd_allowed {
             return Err(EnvelopeError::CwdOutsideParent {
                 cwd: request.cwd.clone(),
             });
@@ -524,6 +604,7 @@ mod tests {
 
     fn request(cwd: &str, mode: Option<&str>) -> ChatRequest {
         ChatRequest {
+            file_scope_lifted: false,
             access: None,
             routing_pool: None,
             routing_mode: None,
@@ -667,6 +748,173 @@ mod tests {
                 dir: "/home/me/.ssh".into()
             }
         );
+    }
+
+    /// A repository under `parent_root` and a linked worktree of it OUTSIDE, laid out as
+    /// `git worktree add` writes them (no `git` process needed): `<wt>/.git` names the admin
+    /// directory, whose `gitdir` points back and whose `commondir` names the repository.
+    fn repo_with_outside_worktree() -> (tempfile::TempDir, tempfile::TempDir, String, String) {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        let admin = repo.join(".git").join("worktrees").join("feat");
+        std::fs::create_dir_all(&admin).unwrap();
+        let wt = outside.path().join("feat");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let root = parent.path().display().to_string();
+        let wt = wt.display().to_string();
+        (parent, outside, root, wt)
+    }
+
+    fn envelope_over(ceiling: &str, root: &str) -> ParentEnvelope {
+        ParentEnvelope {
+            roots: vec![root.to_owned()],
+            ..envelope(ceiling)
+        }
+    }
+
+    #[test]
+    fn a_parent_in_trust_may_open_its_child_in_a_worktree_of_its_repository_whatever_the_spelling()
+    {
+        let (_p, _o, root, wt) = repo_with_outside_worktree();
+        // `trust` and `bypassPermissions` are the same mode (by rank, not by the literal).
+        for ceiling in ["trust", "bypassPermissions"] {
+            let mut req = request(&wt, None);
+            envelope_over(ceiling, &root)
+                .apply(&mut req, "default")
+                .unwrap_or_else(|e| panic!("{ceiling}: {e}"));
+            // A directory inside the worktree is the worktree too.
+            let mut req = request(&format!("{wt}/src"), None);
+            envelope_over(ceiling, &root)
+                .apply(&mut req, "default")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_parent_in_trust_cannot_open_its_child_anywhere_else() {
+        let (_p, outside, root, _wt) = repo_with_outside_worktree();
+        let plain = outside.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        for ceiling in ["trust", "bypassPermissions"] {
+            for cwd in ["/", "/tmp", plain.to_str().unwrap()] {
+                let mut req = request(cwd, None);
+                assert!(
+                    matches!(
+                        envelope_over(ceiling, &root).apply(&mut req, "default"),
+                        Err(EnvelopeError::CwdOutsideParent { .. })
+                    ),
+                    "{ceiling} {cwd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extra_directories_never_leave_the_parents_even_in_trust() {
+        let (_p, _o, root, wt) = repo_with_outside_worktree();
+        for ceiling in ["trust", "bypassPermissions"] {
+            for dir in ["/home/me/.ssh", "/", wt.as_str()] {
+                let mut req = request(&root, None);
+                req.add_dirs = Some(vec![dir.into()]);
+                assert!(
+                    matches!(
+                        envelope_over(ceiling, &root).apply(&mut req, "default"),
+                        Err(EnvelopeError::AddDirOutsideParent { .. })
+                    ),
+                    "{ceiling} {dir}"
+                );
+            }
+        }
+    }
+
+    /// Follow-up review of #729 (point 4): a parent in trust with a shell can fake a worktree
+    /// (`~/.git` plus an admin directory in its own repository). Its root may not be the
+    /// filesystem root, the home directory or one of its ancestors, nor an ancestor of a place
+    /// no file tool may reach.
+    #[test]
+    fn a_worktree_root_may_not_be_the_root_the_home_or_above_a_denied_place() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let home = base.join("home");
+        let elsewhere = base.join("elsewhere");
+        let secrets = elsewhere.join("vault");
+        for dir in [&home, &secrets] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let denied = vec![secrets.join("vault.json")];
+        for broad in [
+            Path::new("/"),
+            home.as_path(),
+            base.as_path(),
+            elsewhere.as_path(),
+            secrets.as_path(),
+        ] {
+            assert!(
+                too_broad_for_a_worktree(broad, Some(&home), &denied),
+                "{broad:?}"
+            );
+        }
+        for fine in [home.join("src/wt"), elsewhere.join("wt")] {
+            assert!(
+                !too_broad_for_a_worktree(&fine, Some(&home), &denied),
+                "{fine:?}"
+            );
+        }
+    }
+
+    /// The same rule through the envelope: a worktree faked AT the home (a `.git` file pointing at
+    /// a real admin directory of the parent's repository, back-link included) is refused; the
+    /// same worktree elsewhere is accepted.
+    #[test]
+    fn a_worktree_faked_at_the_home_is_refused() {
+        let (_p, outside, root, wt) = repo_with_outside_worktree();
+        let envelope = envelope_over("trust", &root);
+        let wt_path = std::fs::canonicalize(&wt).unwrap();
+        let unrelated_home = outside.path().join("not-home");
+        assert!(envelope.worktree_allowed(&wt, Some(&unrelated_home), &[]));
+        // The worktree root is the home itself, or the home lies below it.
+        assert!(!envelope.worktree_allowed(&wt, Some(&wt_path), &[]));
+        assert!(!envelope.worktree_allowed(&wt, Some(&wt_path.join("me")), &[]));
+        // A denied place below the worktree root.
+        assert!(!envelope.worktree_allowed(&wt, Some(&unrelated_home), &[wt_path.join(".aws")]));
+    }
+
+    #[test]
+    fn a_planted_git_file_does_not_borrow_the_parents_repository() {
+        let (_p, outside, root, _wt) = repo_with_outside_worktree();
+        // Points at the real admin directory, but the admin directory points at another `.git`.
+        let fake = outside.path().join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        let admin = std::path::Path::new(&root).join("repo/.git/worktrees/feat");
+        std::fs::write(fake.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let mut req = request(fake.to_str().unwrap(), None);
+        assert!(matches!(
+            envelope_over("trust", &root).apply(&mut req, "default"),
+            Err(EnvelopeError::CwdOutsideParent { .. })
+        ));
+    }
+
+    #[test]
+    fn a_parent_out_of_trust_cannot_open_its_child_in_an_outside_worktree() {
+        let (_p, _o, root, wt) = repo_with_outside_worktree();
+        for ceiling in ["default", "acceptEdits", "auto", "plan"] {
+            let mut req = request(&wt, None);
+            assert!(
+                matches!(
+                    envelope_over(ceiling, &root).apply(&mut req, "default"),
+                    Err(EnvelopeError::CwdOutsideParent { .. })
+                ),
+                "{ceiling}"
+            );
+        }
     }
 
     #[test]

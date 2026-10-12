@@ -74,6 +74,7 @@ async fn answer(ws: &mut Client, request_id: &str) -> Value {
 #[tokio::test]
 async fn another_persons_answer_is_refused_by_the_websocket_loop() {
     let session = ChatSessionNode {
+        file_scope_lifted: false,
         owner: Some(uuid::Uuid::new_v4().to_string()),
         ..test_chat_session(None)
     };
@@ -153,6 +154,32 @@ fn only_a_person_signed_in_answers_always_on_the_websocket() {
             Some(AnswerRefusal::NotAPerson)
         );
     }
+}
+
+/// Decision fce98b8a, review of #729 (point 6): `set_permission_mode` is refused to anyone but
+/// the session's owner (here the anonymous user of a server without authentication, on a session
+/// someone owns), before the mode changes; nothing is persisted, the scope is not lifted.
+#[tokio::test]
+async fn another_persons_set_permission_mode_is_refused_by_the_websocket_loop() {
+    let session = ChatSessionNode {
+        file_scope_lifted: false,
+        owner: Some(uuid::Uuid::new_v4().to_string()),
+        permission_mode: Some("default".into()),
+        ..test_chat_session(None)
+    };
+    let (graph, mut ws) = connected(&session).await;
+    let frame = json!({"type": "set_permission_mode", "mode": "bypassPermissions"});
+    ws.send(WsMessage::text(frame.to_string())).await.unwrap();
+    let refused = frame_where(&mut ws, |v| v["type"] == "error").await;
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not_owner")),
+        "{refused}"
+    );
+    let stored = graph.get_chat_session(session.id).await.unwrap().unwrap();
+    assert_eq!(stored.permission_mode.as_deref(), Some("default"));
+    assert!(!stored.file_scope_lifted);
 }
 
 // ── P18c: a read-only mirror of a Claude Code sub-agent refuses every write ─────────

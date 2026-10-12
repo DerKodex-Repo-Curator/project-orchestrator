@@ -221,6 +221,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
 
 pub(super) fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatRequest {
     ChatRequest {
+        file_scope_lifted: false,
         access: None,
         routing_pool: None,
         routing_mode: None,
@@ -9341,6 +9342,7 @@ mod permission_scopes {
             )
         };
         let session = |id: Uuid| ChatSessionNode {
+            file_scope_lifted: false,
             mirror_of: None,
             id,
             cli_session_id: None,
@@ -13454,6 +13456,133 @@ mod legacy_turn_end_at_boot {
         );
         assert_eq!(cli.closed_at_next_boot().await, 0);
         cli.manager.close_session(&cli.sid).await.unwrap();
+    }
+}
+
+/// Decision fce98b8a end to end: the launch line `attach` builds for a session whose trust a
+/// person lifted (`--unscoped`, the signed `unscoped` claim, `--deny-path`) is accepted by the
+/// REAL `nexus-tools` at the pinned revision, which then reaches outside the session's
+/// directories but never into a denied place; the launch line of a session nobody lifted
+/// stays scoped.
+mod file_scope_lift {
+    use super::*;
+    use crate::chat::provider::nexus_tools as nt;
+    use nexus_claude::agent::{McpServerSpec, PolicyMode, ToolPolicy};
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    /// `initialize`, then one `Read` per path; the text of each answer and whether it is an error.
+    fn read_through(server: &McpServerSpec, paths: &[&std::path::Path]) -> Vec<(String, bool)> {
+        let McpServerSpec::Stdio { command, args, env } = server else {
+            panic!("nexus-tools is a stdio server");
+        };
+        let mut child = std::process::Command::new(command)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}})
+        )
+        .unwrap();
+        for (index, path) in paths.iter().enumerate() {
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({"jsonrpc":"2.0","id":index + 1,"method":"tools/call","params":{"name":"Read","arguments":{"file_path": path.display().to_string()}}})
+            )
+            .unwrap();
+        }
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut answers: Vec<serde_json::Value> = Vec::new();
+        while answers.len() < paths.len() + 1 {
+            let mut line = String::new();
+            if stdout.read_line(&mut line).unwrap() == 0 {
+                let mut stderr = String::new();
+                std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).ok();
+                panic!("nexus-tools stopped early (refused its launch line?): {stderr}");
+            }
+            answers.push(serde_json::from_str(&line).unwrap());
+        }
+        drop(stdin);
+        child.wait().unwrap();
+        answers.sort_by_key(|a| a["id"].as_u64());
+        answers
+            .iter()
+            .skip(1)
+            .map(|a| {
+                (
+                    a["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    a["result"]["isError"] == true,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_real_server_accepts_a_lifted_launch_line_and_keeps_its_deny_list() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("w.txt"), "worktree\n").unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "PRIVATE KEY\n").unwrap();
+        let config = nt::NexusToolsConfig {
+            program: fake_bin("nexus-tools"),
+            browser: None,
+            deny_paths: vec![ssh.clone()],
+        };
+        let consents = nt::GraphConsents(Arc::new(crate::neo4j::mock::MockGraphStore::new()));
+        let policy =
+            ToolPolicy::from_patterns(PolicyMode::Trust, &["Read"], &[] as &[&str]).unwrap();
+        let outside = worktree.path().join("w.txt");
+        let key = ssh.join("id_ed25519");
+        for (sid, lifted) in [("lift-e2e-yes", true), ("lift-e2e-no", false)] {
+            let attachment = nt::attach(
+                &config,
+                &consents,
+                None,
+                nt::AttachInput {
+                    session_id: sid,
+                    cwd: root.path(),
+                    extra_dirs: &[],
+                    access: crate::chat::provider::policy::SessionAccess::Normal,
+                    lifted_by_person: lifted,
+                    policy: &policy,
+                    ceiling: None,
+                    project: None,
+                    ttl_secs: 600,
+                    now: chrono::Utc::now(),
+                },
+            )
+            .await;
+            assert_eq!(attachment.unscoped, lifted, "{sid}");
+            let answers = read_through(&attachment.servers["nexus"], &[&outside, &key]);
+            let (text, is_error) = &answers[0];
+            if lifted {
+                assert!(!is_error && text.contains("worktree"), "{sid}: {text}");
+            } else {
+                assert!(
+                    *is_error && text.contains("outside the directories"),
+                    "{sid}: {text}"
+                );
+            }
+            let (text, is_error) = &answers[1];
+            assert!(*is_error && !text.contains("PRIVATE KEY"), "{sid}: {text}");
+            crate::auth::agent_tokens::revoke_session(sid);
+        }
     }
 }
 

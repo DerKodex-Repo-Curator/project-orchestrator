@@ -451,6 +451,12 @@ pub struct ChatRequest {
     /// Not deserialized from HTTP requests (internal use only).
     #[serde(skip)]
     pub spawned_by: Option<String>,
+    /// A PERSON asked for this session in trust: the REST handler sets it, never the request
+    /// body (decision fce98b8a). Persisted as [`crate::neo4j::models::ChatSessionNode::file_scope_lifted`];
+    /// a native session in trust then launches `nexus-tools --unscoped`. The runner,
+    /// `delegate_task`, protocol runs and every agent caller leave it false.
+    #[serde(skip)]
+    pub file_scope_lifted: bool,
     /// Task context for sub-agent sessions — provides the task description
     /// to `build_system_prompt` so the routing intent detection can produce
     /// a task-aware system prompt instead of a generic one.

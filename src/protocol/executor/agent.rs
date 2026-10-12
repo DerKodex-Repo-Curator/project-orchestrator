@@ -303,6 +303,7 @@ async fn execute_via_agent(
     // 1. Create a chat session
     let cwd = project_root.unwrap_or(".");
     let request = ChatRequest {
+        file_scope_lifted: false,
         access: None,
         routing_pool: None,
         routing_mode: None,

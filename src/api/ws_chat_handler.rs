@@ -1044,9 +1044,29 @@ async fn handle_ws_chat_loop(
 
                                     WsChatClientMessage::SetPermissionMode { mode } => {
                                         info!(session_id = %session_id, mode = %mode, "WS: Received set_permission_mode");
-                                        if chat_manager.is_session_active(&session_id).await {
+                                        // The session's owner only (or anyone on a session without
+                                        // one), like the answers to its permission requests. Fails
+                                        // closed when the owner cannot be read.
+                                        if let Err(refusal) = may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
+                                            warn!(session_id = %session_id, reason = refusal.reason(), "set_permission_mode refused: not the session's owner");
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": format!("Permission mode not changed: {}", refusal.reason()),
+                                            });
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                        } else if chat_manager.is_session_active(&session_id).await {
                                             match chat_manager.set_session_permission_mode(&session_id, &mode).await {
                                                 Ok(()) => {
+                                                    // A PERSON putting their session in trust lifts its
+                                                    // file scope (decision fce98b8a); anyone else
+                                                    // changes the mode only.
+                                                    let owner = match session_id.parse::<uuid::Uuid>() {
+                                                        Ok(id) => state.orchestrator.neo4j().get_chat_session(id).await.ok().flatten().and_then(|node| node.owner),
+                                                        Err(_) => None,
+                                                    };
+                                                    if lifts_file_scope_on_switch(&claims, &mode, owner.as_deref()) {
+                                                        chat_manager.lift_file_scope(&session_id).await;
+                                                    }
                                                     // Send confirmation back to frontend
                                                     let confirmation = serde_json::json!({
                                                         "type": "permission_mode_changed",
@@ -1420,6 +1440,18 @@ pub(crate) async fn may_answer_permissions(
     }
 }
 
+/// Whether a WebSocket switch to `mode` by `claims` lifts the file scope of a session owned by
+/// `owner` (decision fce98b8a): a person ([`Claims::may_lift_file_scope`]) choosing trust
+/// (`trust` or `bypassPermissions`) on a session THEY own. [`may_answer_permissions`] lets anyone
+/// change the mode of a session without an owner (runner, delegation and protocol sessions):
+/// such a session is never lifted, whoever switches it.
+pub(crate) fn lifts_file_scope_on_switch(claims: &Claims, mode: &str, owner: Option<&str>) -> bool {
+    use crate::chat::envelope::{mode_rank, TRUST_RANK};
+    claims.may_lift_file_scope()
+        && owner == Some(claims.sub.as_str())
+        && mode_rank(mode) >= TRUST_RANK
+}
+
 /// An `always` answer these claims may not give (`Claims::may_keep_lasting_approvals`),
 /// checked before delivery like the owner.
 pub(crate) fn lasting_answer_refused(
@@ -1719,6 +1751,55 @@ mod tests {
         );
     }
 
+    /// Decision fce98b8a, the WebSocket half: a switch to trust lifts the file scope only for a
+    /// person; an MCP token, an agent session, the server's account or the anonymous user change
+    /// the mode only.
+    #[test]
+    fn only_a_person_switching_to_trust_lifts_the_file_scope() {
+        let person = Claims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            ..Claims::anonymous()
+        };
+        let mine = Some(person.sub.as_str());
+        assert!(lifts_file_scope_on_switch(&person, "trust", mine));
+        assert!(lifts_file_scope_on_switch(
+            &person,
+            "bypassPermissions",
+            mine
+        ));
+        // Follow-up review of #729 (point 2): a session without an owner (runner, delegation,
+        // protocol) or someone else's is never lifted, whoever switches it.
+        assert!(!lifts_file_scope_on_switch(&person, "trust", None));
+        assert!(!lifts_file_scope_on_switch(
+            &person,
+            "trust",
+            Some("someone-else")
+        ));
+        for mode in ["default", "acceptEdits", "auto", "plan"] {
+            assert!(!lifts_file_scope_on_switch(&person, mode, mine), "{mode}");
+        }
+        let mcp = Claims {
+            token_type: Some(crate::auth::jwt::TOKEN_TYPE_MCP.into()),
+            ..person.clone()
+        };
+        let agent = Claims {
+            token_type: Some(crate::auth::jwt::TOKEN_TYPE_AGENT_SESSION.into()),
+            ..person.clone()
+        };
+        for (who, claims) in [
+            ("mcp", mcp),
+            ("agent", agent),
+            ("service", Claims::service_account("protocol-agent:x")),
+            ("anonymous", Claims::anonymous()),
+        ] {
+            let theirs = Some(claims.sub.clone());
+            assert!(
+                !lifts_file_scope_on_switch(&claims, "trust", theirs.as_deref()),
+                "{who}"
+            );
+        }
+    }
+
     /// Review #679 finding 6, the WebSocket twin of the REST 403: another person's
     /// `permission_response` is refused (an `error` frame naming the request), the owner's
     /// and anyone's on a session nobody owns go through.
@@ -1728,6 +1809,7 @@ mod tests {
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let owner = uuid::Uuid::new_v4().to_string();
         let owned = crate::neo4j::models::ChatSessionNode {
+            file_scope_lifted: false,
             owner: Some(owner.clone()),
             ..crate::test_helpers::test_chat_session(None)
         };

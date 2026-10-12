@@ -749,6 +749,14 @@ impl AgentSessionHandle {
             capabilities.get_or_insert_with(|| {
                 serde_json::to_value(self.offered_capabilities()).unwrap_or_default()
             });
+            // A native session whose `nexus-tools` runs with its file scope lifted says so
+            // (decision fce98b8a): its file tools reach outside its directories, the deny list
+            // apart. Absent otherwise (the scope is the session's directories).
+            if crate::auth::agent_tokens::is_scope_lifted(&self.session_id) {
+                if let Some(object) = capabilities.as_mut().and_then(|c| c.as_object_mut()) {
+                    object.insert("file_scope".to_owned(), serde_json::json!("unscoped"));
+                }
+            }
             tool_policy.get_or_insert_with(|| self.tool_policy.clone());
         }
         let mut covered = None;
