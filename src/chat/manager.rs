@@ -14889,6 +14889,12 @@ impl ChatManager {
                         &nt::NexusToolsConfig {
                             program,
                             browser,
+                            // The same rule as the others: an absolute, executable path.
+                            obscura: self
+                                .config
+                                .obscura_path
+                                .as_deref()
+                                .and_then(runnable_nexus_tools),
                             deny_paths: nt::host_deny_paths(self.config_yaml_path.as_deref()),
                         },
                         &nt::GraphConsents(self.graph.clone()),
@@ -16751,6 +16757,7 @@ mod tests {
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),

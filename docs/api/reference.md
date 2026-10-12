@@ -434,7 +434,8 @@ session of the project is offered `WebFetch` once any origin is consented; each 
 ### PUT /api/projects/{slug}/network-tools/browser -- Protected (human only)
 
 `{"allowed": true|false}` → `{allowed, authorized_by?, authorized_at?}`. 400 `invalid_browser_setting`.
-The browser is attached only when its executable is configured too (N23).
+The browser is attached only when its executable is found too: `obscura` on the `PATH`, or the Obscura
+executable with `chat.obscura_browser: true` / `OBSCURA_BROWSER=1`.
 
 ### GET /api/chat/search-engines[?project={slug}] -- Protected
 
@@ -444,7 +445,9 @@ The search engines (tool providers), each with `origin`, `grant_id` (`tool:<id>`
 ### POST /api/chat/search-engines -- Protected (human only)
 
 `{"id": "brave", "engine": "brave", "credential_ref": "vault:brave"}` or
-`{"id": "home", "engine": "searxng", "base_url": "http://localhost:8888"}`. 201 with the engine.
+`{"id": "home", "engine": "searxng", "base_url": "http://localhost:8888"}` or
+`{"id": "obscura", "engine": "obscura", "credential_ref": "none"}` (keyless, no `base_url`: the executable is
+the server's `chat.obscura_path` / `OBSCURA_BIN` / `PATH`; origin `https://html.duckduckgo.com`). 201 with the engine.
 Codes: `secret_value_refused` (a `key`, `api_key`, `token`... field), `invalid_search_engine`,
 `invalid_search_engine_id`, `unknown_search_engine`, `invalid_search_engine_url`, `invalid_credential_ref`,
 `credential_ref_required`; 409 `search_engine_exists`. The key is then granted with `POST /api/vault/grants`,

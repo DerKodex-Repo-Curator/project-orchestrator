@@ -166,6 +166,12 @@ pub struct ChatConfig {
     /// The browser (Obscura, N23) found on the `PATH` at start. Found is not authorised:
     /// a project must authorise it (`nexus_tools::BROWSER_KEY`) before a session gets it.
     pub nexus_browser_path: Option<PathBuf>,
+    /// Obscura (`dsh-obscura-nav`): the executable of the keyless `obscura` search engine
+    /// (`--search-engine obscura:<path>`). Server configuration only, never a request's:
+    /// `OBSCURA_BIN`, overridden by `chat.obscura_path` in config.yaml, else found on the `PATH`
+    /// (`dsh-obscura-nav`, then `obscura`). With `chat.obscura_browser: true` it is also the
+    /// browser (N23) when none named `obscura` was found.
+    pub obscura_path: Option<PathBuf>,
     /// Default model to use when not specified in request
     pub default_model: String,
     /// Maximum number of concurrent active sessions
@@ -235,6 +241,9 @@ pub const PROVIDER_PATH_VAR: &str = "CHAT_PROVIDER_PATH";
 
 /// Variable naming the `nexus-tools` executable of the native sessions (B40).
 pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
+
+/// Variable naming the Obscura executable (`dsh-obscura-nav`) of the `obscura` search engine.
+pub const OBSCURA_BIN_VAR: &str = "OBSCURA_BIN";
 
 /// Variable listing the third-party MCP tools declared read-only
 /// ([`ChatConfig::read_only_mcp_tools`]).
@@ -306,6 +315,7 @@ impl ChatConfig {
             nexus_tools_path: Self::detect_nexus_tools_path(),
             nexus_browser_path: nexus_claude::providers::native::BrowserTools::locate()
                 .map(|browser| browser.program),
+            obscura_path: Self::detect_obscura_path(),
             default_model: std::env::var("CHAT_DEFAULT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-5".into()),
             max_sessions: std::env::var("CHAT_MAX_SESSIONS")
@@ -451,6 +461,14 @@ impl ChatConfig {
         nexus_claude::providers::native::DefaultTools::locate().map(|tools| tools.program)
     }
 
+    /// [`Self::obscura_path`] from the environment: `OBSCURA_BIN`, else the `PATH`.
+    pub fn detect_obscura_path() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os(OBSCURA_BIN_VAR).filter(|p| !p.is_empty()) {
+            return Some(PathBuf::from(path));
+        }
+        nexus_tools::search::ObscuraBackend::locate().map(|o| o.program().to_path_buf())
+    }
+
     fn detect_mcp_server_path() -> PathBuf {
         // Try environment variable first
         if let Ok(path) = std::env::var("MCP_SERVER_PATH") {
@@ -514,6 +532,7 @@ mod tests {
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),

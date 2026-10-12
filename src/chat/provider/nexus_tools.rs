@@ -75,6 +75,9 @@ pub const SEARCH_PROVIDER_PREFIX: &str = "search_provider:";
 pub const TOOL_PROVIDER_PREFIX: &str = "tool:";
 /// Origin of the Brave Search API, the one engine with a fixed endpoint.
 pub const BRAVE_ORIGIN: &str = "https://api.search.brave.com";
+/// Origin Obscura's keyless `serp` reaches (DuckDuckGo's HTML results page): what a project
+/// consents to for the `obscura` engine.
+pub const OBSCURA_SEARCH_ORIGIN: &str = "https://html.duckduckgo.com";
 
 /// Why a tool call or a launch is refused. `code` is stable; no message carries a URL beyond its
 /// origin, a token or a key.
@@ -113,6 +116,12 @@ pub enum ToolAccessError {
     /// The consent could not be read: refused (never an allow on an ignorance).
     #[error("the project's consents cannot be read")]
     ConsentUnavailable,
+    /// The engine's executable is not configured or not found on this server.
+    #[error("the executable of search engine {engine} is not installed on this server")]
+    EngineNotInstalled {
+        /// Engine name (`obscura`).
+        engine: String,
+    },
 }
 
 impl ToolAccessError {
@@ -127,6 +136,7 @@ impl ToolAccessError {
             Self::CredentialsLocked { .. } => "credentials_locked",
             Self::CredentialRequired { .. } => "tool_credential_required",
             Self::ConsentUnavailable => "tool_consent_unavailable",
+            Self::EngineNotInstalled { .. } => "tool_engine_not_installed",
         }
     }
 
@@ -166,7 +176,8 @@ pub struct BrowserAuthorization {
 pub struct SearchProviderRecord {
     /// Identifier. The grant is `Provider("tool:<id>")`.
     pub id: String,
-    /// `brave` (keyed API) or `searxng` (self-hosted, `base_url`).
+    /// `brave` (keyed API), `searxng` (self-hosted, `base_url`) or `obscura` (keyless, its
+    /// executable configured on the server: [`NexusToolsConfig::obscura`]).
     pub engine: String,
     /// The SearXNG instance, for `searxng`.
     #[serde(default)]
@@ -190,6 +201,7 @@ impl SearchProviderRecord {
     pub fn origin(&self) -> Option<String> {
         match self.engine.as_str() {
             "brave" => Some(BRAVE_ORIGIN.to_owned()),
+            "obscura" => Some(OBSCURA_SEARCH_ORIGIN.to_owned()),
             "searxng" => self.base_url.as_deref().and_then(origin_of),
             _ => None,
         }
@@ -619,6 +631,10 @@ pub struct NexusToolsConfig {
     pub program: PathBuf,
     /// The browser, when its executable was found. Present does not mean authorised.
     pub browser: Option<BrowserTools>,
+    /// Obscura (`dsh-obscura-nav`), for the keyless `obscura` search engine: the server's
+    /// configuration (`chat.obscura_path` / `OBSCURA_BIN`, else found on the `PATH`), never a
+    /// request's. `None`: a declared `obscura` engine is skipped (`tool_engine_not_installed`).
+    pub obscura: Option<PathBuf>,
     /// Places no file tool of the session may reach, scoped or not (`--deny-path`, nexus #93):
     /// [`host_deny_paths`] in production.
     pub deny_paths: Vec<PathBuf>,
@@ -937,6 +953,22 @@ pub async fn attach(
                         engine_args.push(format!("searxng:{url}"));
                     }
                 }
+                // Keyless: the executable is the server's, one argv element after the flag.
+                ("obscura", Ok(_)) => match config.obscura.as_deref() {
+                    Some(program) => {
+                        engine_args.push("--search-engine".to_owned());
+                        engine_args.push(format!("obscura:{}", program.display()));
+                    }
+                    None => {
+                        attachment.skipped_engines.push((
+                            provider.id.clone(),
+                            ToolAccessError::EngineNotInstalled {
+                                engine: "obscura".to_owned(),
+                            },
+                        ));
+                        continue;
+                    }
+                },
                 (_, Err(refusal)) => attachment
                     .skipped_engines
                     .push((provider.id.clone(), refusal)),
@@ -1134,6 +1166,7 @@ mod tests {
         NexusToolsConfig {
             program: PathBuf::from("/opt/nexus/nexus-tools"),
             browser: None,
+            obscura: None,
             deny_paths: vec![PathBuf::from("/home/me/.ssh")],
         }
     }
@@ -2142,6 +2175,7 @@ mod tests {
         let with = |browser: Option<BrowserTools>| NexusToolsConfig {
             program: PathBuf::from("/opt/nexus/nexus-tools"),
             browser,
+            obscura: None,
             deny_paths: Vec::new(),
         };
         // Detected, not authorised.

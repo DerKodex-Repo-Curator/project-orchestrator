@@ -705,6 +705,7 @@ impl Stage {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: Some(fake_bin("nexus-tools")),
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("parity-secret-parity-secret-parity".to_string()),
             max_sessions: 10,
             // Three model calls per turn: the turn that makes three tool calls stops

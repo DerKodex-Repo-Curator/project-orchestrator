@@ -14,6 +14,8 @@
 //!   is stored and read, the browser is attached only once its executable is configured.
 //! * `GET    /api/chat/search-engines[?project=<slug>]` — the search engines (tool providers).
 //! * `POST   /api/chat/search-engines` `{id, engine, base_url?, credential_ref}` — declare one
+//!   (`brave` with a vault key, `searxng` with its `base_url`, or `obscura`: keyless, no
+//!   `base_url`, its executable configured on the server, origin `https://html.duckduckgo.com`)
 //!   (`search_provider:<id>`, scope `global`). The key is a vault REFERENCE; a body that carries
 //!   a value is refused. The key is then granted with `POST /api/vault/grants` and the scope
 //!   `{"kind":"provider","value":"tool:<id>"}` (the grant `Provider("tool:<id>")` of A26).
@@ -51,8 +53,10 @@ use crate::vault::{GrantScope, SecretSelector};
 const SECRET_FIELDS: &[&str] = &[
     "key", "api_key", "apikey", "token", "secret", "value", "password",
 ];
-/// The engines `nexus-tools` knows (`--search-engine brave:<VAR>` / `searxng:<url>`).
-const ENGINES: &[&str] = &["brave", "searxng"];
+/// The engines `nexus-tools` knows (`--search-engine brave:<VAR>` / `searxng:<url>` /
+/// `obscura:<path>`). `obscura` is keyless and has no URL: its executable comes from the
+/// server's configuration (`chat.obscura_path` / `OBSCURA_BIN`), never from a request.
+const ENGINES: &[&str] = &["brave", "searxng", "obscura"];
 /// An origin or URL longer than this is not a consent anyone reads.
 const MAX_URL_LEN: usize = 2048;
 
@@ -448,7 +452,7 @@ pub(crate) fn engine_record(body: &Value) -> Result<SearchProviderRecord, AppErr
     if !ENGINES.contains(&draft.engine.as_str()) {
         return Err(bad(
             "unknown_search_engine",
-            "the engine is `brave` or `searxng`",
+            "the engine is `brave`, `searxng` or `obscura`",
         ));
     }
     let credential_ref = draft.credential_ref.unwrap_or_else(|| "none".to_owned());
@@ -473,6 +477,22 @@ pub(crate) fn engine_record(body: &Value) -> Result<SearchProviderRecord, AppErr
                 return Err(bad(
                     "credential_ref_required",
                     "brave needs its key: credential_ref `vault:<name>`",
+                ));
+            }
+        }
+        "obscura" => {
+            // The executable is the server's configuration: a request never names a program
+            // the server will start.
+            if draft.base_url.is_some() {
+                return Err(bad(
+                    "invalid_search_engine",
+                    "obscura has no base_url: its executable is configured on the server (chat.obscura_path or OBSCURA_BIN)",
+                ));
+            }
+            if vault_name.is_some() {
+                return Err(bad(
+                    "invalid_credential_ref",
+                    "obscura takes no key: credential_ref `none`",
                 ));
             }
         }

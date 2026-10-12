@@ -212,6 +212,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
         mcp_server_path: fake_bin("fake_mcp"),
         nexus_tools_path: None,
         nexus_browser_path: None,
+        obscura_path: None,
         jwt_secret: secure.then(|| "test-secret-test-secret-test-secret".to_string()),
         max_sessions: 10,
         ..Default::default()
@@ -599,6 +600,7 @@ fn manager_without_claude_cli(graph: Arc<MockGraphStore>) -> ChatManager {
         mcp_server_path: fake_bin("fake_mcp"),
         nexus_tools_path: None,
         nexus_browser_path: None,
+        obscura_path: None,
         jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
         claude_cli_path: Some("/nonexistent/m1/claude".to_string()),
         max_sessions: 10,
@@ -1053,6 +1055,7 @@ async fn a_nexus_tools_that_cannot_run_does_not_refuse_the_native_session() {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: Some(program.clone()),
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -2883,6 +2886,7 @@ mod turn_routing {
             mcp_server_path: PathBuf::from("/nonexistent/mcp"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             max_sessions: 10,
             ..Default::default()
         };
@@ -3976,6 +3980,7 @@ mod provider_switch {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -6504,6 +6509,7 @@ mod legacy_nats_permission {
                 mcp_server_path: fake_bin("fake_mcp"),
                 nexus_tools_path: None,
                 nexus_browser_path: None,
+                obscura_path: None,
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 ..Default::default()
@@ -6589,6 +6595,7 @@ mod legacy_nats_permission {
                 mcp_server_path: fake_bin("fake_mcp"),
                 nexus_tools_path: None,
                 nexus_browser_path: None,
+                obscura_path: None,
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 ..Default::default()
@@ -7495,6 +7502,7 @@ mod attached_images {
                     mcp_server_path: fake_bin("fake_mcp"),
                     nexus_tools_path: None,
                     nexus_browser_path: None,
+                    obscura_path: None,
                     jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                     max_sessions: 10,
                     retry: super::super::super::config::RetryConfig {
@@ -7835,6 +7843,7 @@ mod legacy_session_record {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -8360,6 +8369,7 @@ mod legacy_interrupt_stale_result {
                 mcp_server_path: fake_bin("fake_mcp"),
                 nexus_tools_path: None,
                 nexus_browser_path: None,
+                obscura_path: None,
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 ..Default::default()
@@ -8564,6 +8574,7 @@ mod legacy_oob_lag {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -8793,6 +8804,7 @@ mod permission_scopes {
                 mcp_server_path: fake_bin("fake_mcp"),
                 nexus_tools_path: None,
                 nexus_browser_path: None,
+                obscura_path: None,
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 ..Default::default()
@@ -9034,6 +9046,7 @@ mod permission_scopes {
                 mcp_server_path: fake_bin("fake_mcp"),
                 nexus_tools_path: None,
                 nexus_browser_path: None,
+                obscura_path: None,
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 lasting_rules_dir: Some(rules.path().join("rules")),
@@ -9229,6 +9242,7 @@ mod permission_scopes {
                 mcp_server_path: fake_bin("fake_mcp"),
                 nexus_tools_path: None,
                 nexus_browser_path: None,
+                obscura_path: None,
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 lasting_rules_dir: Some(rules.path().join("rules")),
@@ -9593,6 +9607,7 @@ mod permission_scopes {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: Some(fake_bin("nexus-tools")),
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             // A third-party MCP tool is granted for the session only when the operator
@@ -10175,6 +10190,7 @@ mod background_tasks {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: Some(fake_bin("nexus-tools")),
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -11171,6 +11187,7 @@ mod agent_lifecycle {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -13258,6 +13275,7 @@ mod legacy_turn_end_at_boot {
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -13542,6 +13560,7 @@ mod file_scope_lift {
         let config = nt::NexusToolsConfig {
             program: fake_bin("nexus-tools"),
             browser: None,
+            obscura: None,
             deny_paths: vec![ssh.clone()],
         };
         let consents = nt::GraphConsents(Arc::new(crate::neo4j::mock::MockGraphStore::new()));

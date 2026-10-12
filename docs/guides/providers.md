@@ -204,8 +204,19 @@ policy. The network tools follow the project's consent, per **origin** (scheme, 
    `{"kind":"provider","value":"tool:brave"}`, naming exactly that secret. The project then consents to
    the engine's origin (`https://api.search.brave.com` for Brave). A locked vault or a missing grant
    leaves the engine out of the session; no fallback.
+
+   **Keyless: Obscura.** `{"id": "obscura", "engine": "obscura", "credential_ref": "none"}` (no
+   `base_url`, no key). Each query runs `<obscura> serp --max-results N -- <query>` (the
+   `dsh-obscura-nav` build of the Obscura headless browser, an external executable,
+   never linked in). The server finds the executable in `chat.obscura_path` (config.yaml) or `OBSCURA_BIN`,
+   else on its `PATH` (`dsh-obscura-nav`, then `obscura`); a request never names it. The project consents
+   to `https://html.duckduckgo.com`, the page Obscura reads the results from. Without the executable the
+   engine is left out (`tool_engine_not_installed`) and `WebSearch` with it.
 3. The browser: `PUT /api/projects/{slug}/network-tools/browser` with `{"allowed": true}`. It is attached
-   only once its executable is also configured (N23, not shipped yet).
+   only once its executable is also found: `obscura` on the server's `PATH`, or the Obscura executable
+   above with `chat.obscura_browser: true` (or `OBSCURA_BROWSER=1`), started as `<path> mcp`. Its
+   `browser_*` tools then go through the same permission gate as the other MCP tools; navigation needs the
+   destination's origin to be consented too.
 
 `GET /api/projects/{slug}/network-tools` shows all three. Only a signed-in person changes them (an agent
 token gets `403`).

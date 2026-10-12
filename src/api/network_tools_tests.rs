@@ -442,6 +442,18 @@ async fn search_engine_refuses_a_raw_key_and_invalid_drafts_with_typed_codes() {
             json!({"id": "sx", "engine": "searxng", "base_url": "https://sx.example", "label": "x"}),
             "invalid_search_engine",
         ),
+        (
+            json!({"id": "ob", "engine": "obscura", "base_url": "https://html.duckduckgo.com"}),
+            "invalid_search_engine",
+        ),
+        (
+            json!({"id": "ob", "engine": "obscura", "credential_ref": "vault:k"}),
+            "invalid_credential_ref",
+        ),
+        (
+            json!({"id": "ob", "engine": "obscura", "path": "/tmp/evil"}),
+            "invalid_search_engine",
+        ),
         (json!("brave"), "invalid_search_engine"),
     ] {
         let (status, got) = call(&app, human("POST", ENGINES, Some(body.clone()))).await;
@@ -532,6 +544,19 @@ async fn search_engine_key_is_granted_under_tool_id_only_by_its_reference_and_re
 /// The `nexus-tools` tools a native session of `proj` is opened with (`--tools` of its `nexus`
 /// server; empty when nothing is attached).
 async fn native_session_tools(graph: Arc<MockGraphStore>, sid: &str) -> Vec<String> {
+    let args = native_session_args(graph, sid, None).await;
+    args.windows(2)
+        .find(|w| w[0] == "--tools")
+        .map(|w| w[1].split(',').map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// The argv of the session's `nexus-tools`, with `obscura` as the server's Obscura executable.
+async fn native_session_args(
+    graph: Arc<MockGraphStore>,
+    sid: &str,
+    obscura: Option<std::path::PathBuf>,
+) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;
     let bin = tempfile::TempDir::new().unwrap();
     let program = bin.path().join("nexus-tools");
@@ -542,6 +567,7 @@ async fn native_session_tools(graph: Arc<MockGraphStore>, sid: &str) -> Vec<Stri
     config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
     config.nexus_tools_path = Some(program);
     config.nexus_browser_path = None;
+    config.obscura_path = obscura;
     let manager =
         crate::chat::manager::ChatManager::new_without_memory(state.neo4j, state.meili, config);
     let claims = crate::auth::jwt::Claims::service_account("p6");
@@ -573,13 +599,93 @@ async fn native_session_tools(graph: Arc<MockGraphStore>, sid: &str) -> Vec<Stri
         .mcp_servers
         .get(nexus_claude::providers::native::NEXUS_TOOLS_SERVER)
     {
-        Some(nexus_claude::agent::McpServerSpec::Stdio { args, .. }) => args
-            .windows(2)
-            .find(|w| w[0] == "--tools")
-            .map(|w| w[1].split(',').map(str::to_owned).collect())
-            .unwrap_or_default(),
+        Some(nexus_claude::agent::McpServerSpec::Stdio { args, .. }) => args.clone(),
         _ => Vec::new(),
     }
+}
+
+fn tools_of(args: &[String]) -> Vec<String> {
+    args.windows(2)
+        .find(|w| w[0] == "--tools")
+        .map(|w| w[1].split(',').map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_obscura_engine_is_declared_keyless_and_gives_websearch_once_duckduckgo_is_consented() {
+    use std::os::unix::fs::PermissionsExt;
+    let (app, graph) = app().await;
+    let bin = tempfile::TempDir::new().unwrap();
+    let obscura = bin.path().join("dsh-obscura-nav");
+    std::fs::write(&obscura, "#!/bin/sh\necho '[]'\n").unwrap();
+    std::fs::set_permissions(&obscura, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (status, got) = call(
+        &app,
+        human(
+            "POST",
+            ENGINES,
+            Some(json!({"id": "obscura", "engine": "obscura", "credential_ref": "none"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{got}");
+    let (_, listed) = call(
+        &app,
+        human("GET", &format!("{ENGINES}?project={PROJECT}"), None),
+    )
+    .await;
+    let listed = listed.to_string();
+    assert!(
+        listed.contains("https://html.duckduckgo.com"),
+        "the origin a project consents to: {listed}"
+    );
+
+    // Declared, not consented: no engine on argv, no WebSearch.
+    let before = native_session_args(graph.clone(), "obs-before", Some(obscura.clone())).await;
+    assert!(
+        !before.iter().any(|a| a.starts_with("obscura:")),
+        "{before:?}"
+    );
+    assert!(
+        !tools_of(&before).iter().any(|t| t == "WebSearch"),
+        "{before:?}"
+    );
+
+    let (status, _) = call(
+        &app,
+        human(
+            "PUT",
+            ORIGINS,
+            Some(json!({"origin": "https://html.duckduckgo.com"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let after = native_session_args(graph.clone(), "obs-after", Some(obscura.clone())).await;
+    let at = after
+        .iter()
+        .position(|a| a == "--search-engine")
+        .expect("an engine is passed");
+    // The configured path, resolved like nexus-tools' own (absolute, symlinks followed).
+    let resolved = std::fs::canonicalize(&obscura).unwrap();
+    assert_eq!(after[at + 1], format!("obscura:{}", resolved.display()));
+    assert!(
+        tools_of(&after).iter().any(|t| t == "WebSearch"),
+        "{after:?}"
+    );
+
+    // Consented but no executable on this server: the engine is skipped, WebSearch goes with it.
+    let missing = native_session_args(graph, "obs-missing", None).await;
+    assert!(
+        !missing.iter().any(|a| a.starts_with("obscura:")),
+        "{missing:?}"
+    );
+    assert!(
+        !tools_of(&missing).iter().any(|t| t == "WebSearch"),
+        "{missing:?}"
+    );
 }
 
 #[cfg(unix)]
