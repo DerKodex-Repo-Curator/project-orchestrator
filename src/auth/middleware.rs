@@ -1142,6 +1142,7 @@ mod tests {
             mcp_server_path: std::path::PathBuf::from("/nonexistent/mcp"),
             nexus_tools_path: None,
             nexus_browser_path: None,
+            obscura_path: None,
             max_sessions: 4,
             ..Default::default()
         };

@@ -497,6 +497,29 @@ pub struct ChatYamlConfig {
     /// Token budget of a native session, cache reads not counted
     /// (`CHAT_NATIVE_SESSION_MAX_TOKENS` wins). Unset by default: no budget, as in Claude Code.
     pub native_session_max_tokens: Option<u64>,
+    /// Obscura's executable (`dsh-obscura-nav`), for the keyless `obscura` search engine of
+    /// native sessions. Default: `OBSCURA_BIN`, else found on the `PATH`.
+    pub obscura_path: Option<String>,
+    /// Also attach that executable as the native sessions' browser (`<path> mcp`, the
+    /// `browser_*` tools), still only for a project that authorised the browser. Default false.
+    pub obscura_browser: Option<bool>,
+}
+
+/// Obscura's place in the chat configuration: `path` (from `OBSCURA_BIN` or
+/// `chat.obscura_path`) replaces what `ChatConfig::from_env` found on the `PATH`; with
+/// `browser` true it is also the browser (`<path> mcp`) when no `obscura` was found. The browser
+/// is still attached only to a project that authorised it (`PUT .../network-tools/browser`).
+pub(crate) fn apply_obscura(
+    chat_config: &mut chat::ChatConfig,
+    path: Option<&str>,
+    browser: Option<bool>,
+) {
+    if let Some(path) = path.filter(|p| !p.trim().is_empty()) {
+        chat_config.obscura_path = Some(std::path::PathBuf::from(path.trim()));
+    }
+    if browser == Some(true) && chat_config.nexus_browser_path.is_none() {
+        chat_config.nexus_browser_path = chat_config.obscura_path.clone();
+    }
 }
 
 /// Embedding provider configuration section.
@@ -828,6 +851,11 @@ pub struct Config {
     /// Token budget of a native session (cache reads not counted).
     /// Priority: env var (CHAT_NATIVE_SESSION_MAX_TOKENS) > YAML (chat.native_session_max_tokens) > None (no budget).
     pub chat_native_session_max_tokens: Option<u64>,
+    /// Obscura's executable. Priority: env var (OBSCURA_BIN) > YAML (chat.obscura_path) > PATH.
+    pub chat_obscura_path: Option<String>,
+    /// Obscura as the browser (N23). Priority: env var (OBSCURA_BROWSER) > YAML
+    /// (chat.obscura_browser) > false.
+    pub chat_obscura_browser: Option<bool>,
 
     // ── Embedding provider config ────────────────────────────────────────
     /// Embedding provider type: "local", "http", or "disabled".
@@ -957,6 +985,14 @@ impl Config {
                 chat::config::NATIVE_SESSION_MAX_TOKENS_VAR,
             )
             .or(yaml.chat.native_session_max_tokens.filter(|n| *n > 0)),
+            chat_obscura_path: std::env::var("OBSCURA_BIN")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or(yaml.chat.obscura_path),
+            chat_obscura_browser: std::env::var("OBSCURA_BROWSER")
+                .ok()
+                .map(|v| v == "true" || v == "1")
+                .or(yaml.chat.obscura_browser),
             // Embedding provider config (env var > YAML > None)
             embedding_provider: std::env::var("EMBEDDING_PROVIDER")
                 .ok()
@@ -1693,6 +1729,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(auto_update_app) = config.chat_auto_update_app {
             chat_config.auto_update_app = auto_update_app;
         }
+        apply_obscura(
+            &mut chat_config,
+            config.chat_obscura_path.as_deref(),
+            config.chat_obscura_browser,
+        );
         // Inject auth context for MCP session token generation.
         // When auth is enabled, build_options() will generate a JWT session token
         // and inject PO_AUTH_TOKEN + PO_SERVER_URL into the MCP server env vars.
@@ -3430,6 +3471,31 @@ chat:
         assert!(
             msg.contains(&file_path.display().to_string()),
             "error should name the file: {msg}"
+        );
+    }
+
+    #[test]
+    fn obscura_comes_from_the_configuration_and_is_the_browser_only_when_asked() {
+        let mut chat = crate::chat::ChatConfig::from_env();
+        chat.obscura_path = None;
+        chat.nexus_browser_path = None;
+        apply_obscura(&mut chat, None, Some(true));
+        assert_eq!(chat.obscura_path, None);
+        assert_eq!(chat.nexus_browser_path, None, "nothing to attach");
+        apply_obscura(&mut chat, Some(" /opt/obscura/dsh-obscura-nav "), None);
+        assert_eq!(
+            chat.obscura_path.as_deref(),
+            Some(std::path::Path::new("/opt/obscura/dsh-obscura-nav"))
+        );
+        assert_eq!(chat.nexus_browser_path, None, "the browser is opt-in");
+        apply_obscura(&mut chat, None, Some(true));
+        assert_eq!(chat.nexus_browser_path, chat.obscura_path);
+        // A browser found as `obscura` is kept.
+        chat.nexus_browser_path = Some("/usr/bin/obscura".into());
+        apply_obscura(&mut chat, Some("/x/dsh-obscura-nav"), Some(true));
+        assert_eq!(
+            chat.nexus_browser_path.as_deref(),
+            Some(std::path::Path::new("/usr/bin/obscura"))
         );
     }
 }

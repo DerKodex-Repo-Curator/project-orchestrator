@@ -122,13 +122,15 @@ flowchart TD
         NXREV["✅ jeton lié à la session et révocable : agent_tokens::register_tools / tools_live, revoke_session (tous les chemins de fermeture) ;<br/>ToolAccessHooks refuse tout outil `nexus` d'une session révoquée<br/>test : a_revoked_token_stops_every_nexus_tool_call_of_the_session"]
         NXCONS["✅ WebFetch / WebSearch / browser_navigate : consentement du PROJET lié à l'ORIGINE (tool_origin:&lt;origine&gt;), lu à chaque appel ;<br/>WebFetch offert seulement si le projet a consenti à au moins une origine, WebSearch seulement avec un moteur d origine consentie ;<br/>refus typé tool_origin_not_allowed AVANT l'outil (HookVerdict::Deny) ; http exige aussi l'origine https (montée en https) ; échec de lecture = refus<br/>test : webfetch_to_an_origin_without_consent_is_refused_with_a_typed_error ;<br/>the_session_hooks_refuse_webfetch_to_an_origin_the_project_did_not_consent_to"]
         NXKEY["✅ clé d'un moteur de recherche : read_for_provider sous le grant Provider(tool:&lt;id&gt;), jamais session ni harnais ;<br/>coffre verrouillé → credentials_locked, pas de grant → tool_credential_required, moteur écarté et WebSearch retiré du jeton<br/>test : the_search_key_is_read_for_the_tool_provider_never_for_the_session_or_the_harness"]
-        NXBR["✅ navigateur : offert seulement si l'exécutable est trouvé ET autorisé pour le projet (document `browser`) ; aucun argument : jamais --stealth<br/>test : the_browser_is_offered_only_if_detected_and_authorised_for_the_project"]
+        NXBR["✅ navigateur : offert seulement si l'exécutable est trouvé ET autorisé pour le projet (document `browser`) ; aucun argument : jamais --stealth ;<br/>exécutable : obscura sur le PATH, ou celui de chat.obscura_path / OBSCURA_BIN si chat.obscura_browser / OBSCURA_BROWSER (opt-in)<br/>test : the_browser_is_offered_only_if_detected_and_authorised_for_the_project, obscura_comes_from_the_configuration_and_is_the_browser_only_when_asked"]
+        NXOBS["✅ moteur obscura : --search-engine obscura:&lt;chemin absolu exécutable de la configuration&gt; (jamais d'une requête), origine https://html.duckduckgo.com ;<br/>exécutable absent → moteur écarté (tool_engine_not_installed) et WebSearch retiré du jeton<br/>test : an_obscura_engine_is_declared_keyless_and_gives_websearch_once_duckduckgo_is_consented"]
         NXTODO["🟠 pas de route HTTP pour créer un moteur, consentir à une origine ou autoriser le navigateur (documents lus, pas écrits) ;<br/>nexus-tools ne connaît pas la révocation (signature + expiration) : elle est appliquée côté hôte ;<br/>le binaire nexus-tools (feature tls) n'est ni construit ni livré par ce dépôt (NEXUS_TOOLS_PATH, à côté de l'exécutable, PATH)"]
     end
     NXATT --> NXPROF
     NXATT --> NXREV
     NXATT --> NXKEY
     NXATT --> NXBR
+    NXATT --> NXOBS
     NXREV --> NXCONS
     NXCONS -.-> NXTODO
     TODO["🟠 non branché : create_session / resume_session / runner n'appellent pas encore resolve ;<br/>system_init ne porte pas tool_policy ; VaultCredentialResolver n'est passé à aucun registre"]

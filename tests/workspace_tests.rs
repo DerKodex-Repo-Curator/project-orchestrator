@@ -38,6 +38,8 @@ fn test_config() -> Config {
         chat_auto_update_app: None,
         chat_native_turn_timeout_secs: None,
         chat_native_session_max_tokens: None,
+        chat_obscura_path: None,
+        chat_obscura_browser: None,
         embedding_provider: None,
         embedding_fastembed_model: None,
         embedding_fastembed_cache_dir: None,

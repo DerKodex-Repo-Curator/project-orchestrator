@@ -136,6 +136,10 @@ chat:
   session_timeout_secs: 1800           # CHAT_SESSION_TIMEOUT_SECS env override
   max_turns: 50                        # CHAT_MAX_TURNS env override
   prompt_builder_model: "claude-opus-4-7"  # PROMPT_BUILDER_MODEL env override
+  # Obscura (dsh-obscura-nav), the keyless search engine "obscura" of native sessions
+  # (POST /api/chat/search-engines {"id":"obscura","engine":"obscura","credential_ref":"none"}).
+  # obscura_path: "/usr/local/bin/dsh-obscura-nav"   # OBSCURA_BIN env override; default: PATH lookup
+  # obscura_browser: false                            # OBSCURA_BROWSER env override; true = also the browser (browser_* tools)
 
 # -----------------------------------------------------------------------------
 # Neural Routing — Trajectory-based route learning (optional)
