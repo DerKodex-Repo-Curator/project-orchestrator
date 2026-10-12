@@ -221,6 +221,13 @@ async fn a_question_answer_to_a_mirror_is_refused_by_the_websocket_loop() {
         .await;
 }
 
+/// A change of model or of permission mode (M7).
+#[tokio::test]
+async fn a_model_or_mode_change_on_a_mirror_is_refused_by_the_websocket_loop() {
+    refused_by_a_mirror(json!({"type": "set_model", "model": "other"})).await;
+    refused_by_a_mirror(json!({"type": "set_permission_mode", "mode": "plan"})).await;
+}
+
 /// The routing's own refusals reach the socket as the same flat frame, whichever way
 /// they come: its `MirrorReadOnly`, or carried by a failed resume (`Resume`) or by a send
 /// then a resume that both failed (`SendAndResume`). Any other failure keeps its text.

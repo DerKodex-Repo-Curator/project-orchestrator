@@ -35,10 +35,10 @@
 //! access and engine, the title from the call's `description` (else its prompt), and the
 //! marker [`ChatSessionNode::mirror_of`](crate::neo4j::models::ChatSessionNode::mirror_of)
 //! `= "claude_code"` — on the wire `"mirror_of": "claude_code"` in every session response,
-//! omitted for every other session. One CRUD `created` is emitted with the trimmed payload
-//! every session gets (`{project_slug, spawned_by: {type, parent_session_id}}`) plus
-//! `spawned_by.tool_use_id` and `mirror_of` ([`created_payload`]: the client links the mirror
-//! to the Agent card at once), then `updated {is_streaming: true}`.
+//! omitted for every other session. One CRUD `created` is emitted with exactly the payload
+//! every session gets (decision ed628dad: `{project_slug, spawned_by: {type,
+//! parent_session_id}}`; the client reads `tool_use_id` and `mirror_of` from `/children` and
+//! the session), then `updated {is_streaming: true}`.
 //!
 //! Its thread: the call's prompt as its first `user_message`, then every event carrying
 //! `parent_tool_use_id = X`, in order, WITHOUT that parent id (the child shows them at its top
@@ -51,29 +51,55 @@
 //! the parent, else when the parent's turn ends, else when the parent session closes (its
 //! tap is dropped). Events of X arriving after the close are dropped.
 //!
+//! A BACKGROUND call (`run_in_background: true`) answers its `tool_result` at once ("launched"):
+//! that result does not close its mirror. It is closed by the CLI's `task_notification` when
+//! that names the call (`tool_use_id`), else when the parent's turn ends — at the latest. Not
+//! later: what a background sub-agent does after the turn reaches the parent out of turn, on
+//! the historical engine through a path no tap sees (`oob_listener`), and nothing ties its
+//! notification to its call on every CLI version; a mirror kept open past the turn could stay
+//! "streaming" for good. Such a mirror ends `success`, saying the rest shows in the parent.
+//!
 //! Only FIRST-LEVEL calls of a session are mirrored: a sub-agent's own `Task` call (an
 //! event whose parent is a call made inside a mirror) goes into its first-level mirror's
 //! thread, keeping its parent id so it shows nested there.
 //!
-//! # Idempotency
+//! # One writer per mirror, and idempotency
 //!
-//! Never two mirrors for one (parent, call): the manager's [`MirrorRegistry`] knows every
-//! mirror this process wrote (a resume replaces a tap, never the registry), and the graph is
-//! asked before writing one (the parent's children whose `spawned_by.tool_use_id` is X and
-//! that carry the marker): a mirror found is reused — its thread continued when open, its
-//! late events dropped when it already has its `result`. Nothing is created on a reconnect
-//! or a replay: those read stored events, they do not emit them again.
+//! The manager's [`MirrorRegistry`] holds a CLAIM per (parent, call), taken atomically by one
+//! tap (its owner token): a second live tap of the same parent (an old turn's tap still
+//! finishing after a resume) is refused and leaves the call alone, and a tap only ever closes
+//! or forgets what it owns — a stale tap can never remove a newer tap's entry. Before writing
+//! a mirror, the claiming tap asks the graph (the parent's children whose
+//! `spawned_by.tool_use_id` is X and that carry the marker): a mirror found is reused (its
+//! thread continued) unless it already ends on its `result` (its late events are then
+//! dropped). Nothing is created on a reconnect or a replay: those read stored events, they do
+//! not emit them again.
+//!
+//! Bounded: a tap forgets every claim it owns when it ends (its parent closed), and the
+//! registry drops the claims of closed mirrors past [`MAX_CLAIMS`]; the graph remains the
+//! truth for a claim forgotten. A tap clones only the parent's top-level tool events of the
+//! sub-agent calls it watches (never the output of a Read or a Bash).
 //!
 //! # Read-only
 //!
-//! A mirror has no process: a message sent to it is refused before anything starts a turn
-//! ([`MirrorReadOnly`]: HTTP 409 `{error, code: "mirror_read_only", retryable: false}` on
-//! REST — a send, a resume through `POST /api/chat/sessions`, a permission answer; on the
-//! WebSocket the flat frame `{type: "error", code: "mirror_read_only", message}` for a
-//! message, queued or not, and an answer to a permission or a question), and the restart
-//! recovery never resumes one (`manager::recovery`).
+//! A mirror has no process: anything that would write to it is refused
+//! ([`MirrorReadOnly`]: HTTP 409 `{error, code: "mirror_read_only", retryable: false}`) — a
+//! message (REST, `POST /api/chat/sessions` with its `session_id`, i.e. `chat(send_message)`),
+//! a resume, a permission answer, `switch-provider` (refused by `relay_conversation` itself),
+//! a change of model or of permission mode; on the WebSocket the flat frame
+//! `{type: "error", code: "mirror_read_only", message}` for a message (queued or not), an
+//! answer to a permission or a question, a change of model or mode. An interrupt or a cancel
+//! is a harmless no-op. Deleting an open mirror makes its tap drop it: never written again,
+//! never written anew for its call. The restart recovery never resumes one
+//! (`manager::recovery`). The refusal reads no graph for a session live here (it is not a
+//! mirror) nor for a mirror a live tap knows.
+//!
+//! Known limit: a client that joins an OPEN mirror reads its stored events, then follows it
+//! live; an event stored between the two is shown only after a reload (a normal session
+//! fills that gap from its streaming snapshot, a mirror has none).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -215,63 +241,196 @@ fn result_text(result: &serde_json::Value) -> String {
     }
 }
 
-/// The CRUD `created` payload of a mirror: every session's trimmed payload
-/// (`{project_slug, spawned_by: {type, parent_session_id}}`), plus what lets a client link
-/// the mirror at once to the Agent card of its parent: `spawned_by.tool_use_id` (the call)
-/// and `mirror_of`. Neither names a path, a model nor an origin id.
-pub(crate) fn created_payload(
-    spawned_by: &str,
-    project_slug: Option<&str>,
-    call: &str,
-) -> serde_json::Value {
-    let mut payload = super::manager::session_created_payload_of(Some(spawned_by), project_slug);
-    if let Some(spawned_by) = payload
-        .get_mut("spawned_by")
-        .and_then(|v| v.as_object_mut())
-    {
-        spawned_by.insert("tool_use_id".into(), call.into());
-    }
-    payload["mirror_of"] = MIRROR_OF_CLAUDE_CODE.into();
-    payload
+/// How many claims the registry keeps at most: past it, the claims of closed mirrors are
+/// forgotten first (a forgotten claim is found again in the graph, never written twice).
+const MAX_CLAIMS: usize = 4096;
+
+/// Capacity of the live broadcast of one open mirror.
+const MIRROR_BROADCAST: usize = 1024;
+
+/// The owner tokens of the taps (one per tap, never reused in a process).
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+
+/// One (parent, call) a tap took: by whom, its mirror once written, whether it is over.
+struct Claim {
+    owner: u64,
+    mirror: Option<Uuid>,
+    closed: bool,
 }
 
-/// What the manager knows of the mirrors of this process, shared by every tap.
+/// What the registry answers a tap that wants the mirror of a call.
+enum ClaimOutcome {
+    /// Nobody holds it in this process: it is now this tap's (look in the graph, then write).
+    Claimed,
+    /// Another live tap holds it, or it is over: this tap leaves it alone.
+    Refused,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    /// (parent session, call id) -> who holds it: never two mirrors, nor two writers.
+    claims: HashMap<(String, String), Claim>,
+    /// The open mirrors: owner and live broadcast (what `ChatManager::subscribe` hands).
+    open: HashMap<Uuid, (u64, broadcast::Sender<ChatEvent>)>,
+    /// The mirrors this process wrote or found, while their parent's tap lives: the
+    /// refusal of a write needs no graph read for them (`ChatManager::refuse_if_mirror`).
+    known: HashMap<Uuid, u64>,
+    /// Open mirrors deleted under their tap: it drops them at its next look.
+    deleted: HashSet<Uuid>,
+}
+
+/// What the manager knows of the mirrors of this process, shared by every tap. Every
+/// operation is ONE critical section (a `std` mutex, never held across an `await`): a claim
+/// and its check are atomic, and a tap only ever closes or forgets what it owns.
 #[derive(Default)]
 pub struct MirrorRegistry {
-    /// (parent session, call id) -> mirror id: never two mirrors for one call.
-    by_call: std::sync::Mutex<HashMap<(String, String), Uuid>>,
-    /// The mirrors that already have their `result`.
-    closed: std::sync::Mutex<HashSet<Uuid>>,
-    /// The open mirrors and their live broadcast (what `ChatManager::subscribe` hands).
-    open: std::sync::Mutex<HashMap<String, broadcast::Sender<ChatEvent>>>,
+    state: std::sync::Mutex<RegistryState>,
 }
 
 impl MirrorRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// A live receiver of the open mirror `session_id`.
     pub fn subscribe(&self, session_id: &str) -> Option<broadcast::Receiver<ChatEvent>> {
-        self.open
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(session_id)
-            .map(broadcast::Sender::subscribe)
+        let id = Uuid::parse_str(session_id).ok()?;
+        self.lock().open.get(&id).map(|(_, tx)| tx.subscribe())
     }
 
     /// Whether `session_id` is a mirror still open here.
     pub fn is_open(&self, session_id: &str) -> bool {
-        self.open
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(session_id)
+        Uuid::parse_str(session_id).is_ok_and(|id| self.lock().open.contains_key(&id))
+    }
+
+    /// Whether `session_id` is a mirror this process knows (written or found by a live tap).
+    pub fn is_known_mirror(&self, session_id: &str) -> bool {
+        Uuid::parse_str(session_id).is_ok_and(|id| self.lock().known.contains_key(&id))
     }
 
     /// The open mirrors.
     pub fn open_ids(&self) -> Vec<Uuid> {
-        self.open
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .filter_map(|id| Uuid::parse_str(id).ok())
-            .collect()
+        self.lock().open.keys().copied().collect()
+    }
+
+    /// The mirror `id` is being deleted: it stops being open now, and its tap drops it at its
+    /// next look, never writing to it again nor writing another one for its call. `true`:
+    /// it was open here.
+    pub fn deleted(&self, id: Uuid) -> bool {
+        let mut state = self.lock();
+        let was_open = state.open.remove(&id).is_some();
+        if was_open {
+            state.deleted.insert(id);
+        }
+        for claim in state.claims.values_mut() {
+            if claim.mirror == Some(id) {
+                claim.closed = true;
+            }
+        }
+        was_open
+    }
+
+    fn claim(&self, parent: &str, call: &str, owner: u64) -> ClaimOutcome {
+        let mut state = self.lock();
+        let key = (parent.to_string(), call.to_string());
+        if state.claims.contains_key(&key) {
+            return ClaimOutcome::Refused;
+        }
+        if state.claims.len() >= MAX_CLAIMS {
+            state.claims.retain(|_, c| !c.closed);
+        }
+        state.claims.insert(
+            key,
+            Claim {
+                owner,
+                mirror: None,
+                closed: false,
+            },
+        );
+        ClaimOutcome::Claimed
+    }
+
+    /// The claim of `owner` on (parent, call) failed or found the mirror over: marked over
+    /// (`mirror` known) or given back (nothing to remember).
+    fn settle(&self, parent: &str, call: &str, owner: u64, mirror: Option<Uuid>) {
+        let mut state = self.lock();
+        let key = (parent.to_string(), call.to_string());
+        if state.claims.get(&key).is_some_and(|c| c.owner == owner) {
+            match mirror {
+                Some(id) => {
+                    let claim = state.claims.get_mut(&key).expect("checked");
+                    claim.mirror = Some(id);
+                    claim.closed = true;
+                }
+                None => {
+                    state.claims.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// `owner` opens the mirror `id` of (parent, call).
+    fn bind(
+        &self,
+        parent: &str,
+        call: &str,
+        owner: u64,
+        id: Uuid,
+        tx: broadcast::Sender<ChatEvent>,
+    ) {
+        let mut state = self.lock();
+        if let Some(claim) = state
+            .claims
+            .get_mut(&(parent.to_string(), call.to_string()))
+            .filter(|c| c.owner == owner)
+        {
+            claim.mirror = Some(id);
+        }
+        state.open.insert(id, (owner, tx));
+        state.known.insert(id, owner);
+    }
+
+    /// `owner` closed the mirror `id` of (parent, call). Nothing another owner holds is touched.
+    fn closed(&self, parent: &str, call: &str, owner: u64, id: Uuid) {
+        let mut state = self.lock();
+        if let Some(claim) = state
+            .claims
+            .get_mut(&(parent.to_string(), call.to_string()))
+            .filter(|c| c.owner == owner)
+        {
+            claim.closed = true;
+        }
+        if state.open.get(&id).is_some_and(|(o, _)| *o == owner) {
+            state.open.remove(&id);
+        }
+    }
+
+    /// Whether the open mirror `id` was deleted (consumed: asked once).
+    fn take_deleted(&self, id: Uuid) -> bool {
+        self.lock().deleted.remove(&id)
+    }
+
+    /// The tap `owner` ended (its parent session closed): everything it held is forgotten.
+    /// Its mirrors are found in the graph again if the parent ever comes back.
+    fn forget_owner(&self, owner: u64) {
+        let mut state = self.lock();
+        let mine: Vec<Uuid> = state
+            .claims
+            .values()
+            .filter(|c| c.owner == owner)
+            .filter_map(|c| c.mirror)
+            .collect();
+        state.claims.retain(|_, c| c.owner != owner);
+        state.open.retain(|_, (o, _)| *o != owner);
+        state.known.retain(|_, o| *o != owner);
+        for id in mine {
+            state.deleted.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn claims_len(&self) -> usize {
+        self.lock().claims.len()
     }
 }
 
@@ -287,12 +446,18 @@ pub(crate) struct MirrorDeps {
 enum Msg {
     Event(Box<ChatEvent>),
     TurnEnded,
+    #[cfg(test)]
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 /// The passive observer of ONE Claude Code session's events ([module documentation](self)).
 /// Dropping the last handle closes the mirrors still open.
 pub struct MirrorTap {
     tx: mpsc::UnboundedSender<Msg>,
+    /// The top-level sub-agent calls still waiting for their result: what `observe` keeps
+    /// of the parent's top-level tool events (the result of a Read or a Bash is never
+    /// cloned). Touched by `observe` only, one short lock, never awaited.
+    watched: std::sync::Mutex<HashSet<String>>,
 }
 
 impl MirrorTap {
@@ -301,6 +466,7 @@ impl MirrorTap {
         let (tx, rx) = mpsc::unbounded_channel();
         let worker = Worker {
             parent: parent_session_id.to_string(),
+            owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             deps,
             calls: HashMap::new(),
             nested: HashMap::new(),
@@ -309,7 +475,10 @@ impl MirrorTap {
             parent_node: None,
         };
         tokio::spawn(worker.run(rx));
-        Arc::new(Self { tx })
+        Arc::new(Self {
+            tx,
+            watched: std::sync::Mutex::new(HashSet::new()),
+        })
     }
 
     /// Sees one event of the parent, after it was emitted. Never blocks, never fails: what
@@ -317,10 +486,16 @@ impl MirrorTap {
     pub fn observe(&self, event: &ChatEvent) {
         let wanted = match event {
             _ if parent_of(event).is_some() => true,
-            ChatEvent::ToolUse { tool, .. } => is_subagent_tool(tool),
-            ChatEvent::ToolUseInputResolved { .. }
-            | ChatEvent::ToolResult { .. }
-            | ChatEvent::ToolCancelled { .. } => true,
+            ChatEvent::ToolUse { id, tool, .. } if is_subagent_tool(tool) => {
+                self.watch().insert(id.clone());
+                true
+            }
+            ChatEvent::ToolUseInputResolved { id, .. } => self.watch().contains(id),
+            ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+                self.watch().remove(id)
+            }
+            // A background sub-agent's end, as the CLI notifies it.
+            ChatEvent::Workflow { subtype, .. } => subtype == "task_notification",
             ChatEvent::Result { .. }
             | ChatEvent::StreamingStatus {
                 is_streaming: false,
@@ -335,9 +510,22 @@ impl MirrorTap {
         }
     }
 
+    fn watch(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.watched.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// The parent's turn ended (the historical engine says it explicitly).
     pub fn turn_ended(&self) {
         let _ = self.tx.send(Msg::TurnEnded);
+    }
+
+    /// Waits until the worker handled everything observed before (tests: no fixed sleep).
+    #[cfg(test)]
+    pub(crate) async fn flushed(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Msg::Flush(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 }
 
@@ -349,17 +537,38 @@ struct Mirror {
     opened: Instant,
 }
 
+/// A top-level sub-agent call of the parent.
+struct Call {
+    /// Its input as last known.
+    input: serde_json::Value,
+    /// Its immediate `tool_result` (a background launch) was seen.
+    launched: bool,
+}
+
+impl Call {
+    /// Launched with `run_in_background: true`: its `tool_result` only says it started.
+    fn background(&self) -> bool {
+        self.input
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+}
+
 /// The tap's state, owned by its task: every write happens here, in order.
 struct Worker {
     parent: String,
+    /// This tap's token in the registry.
+    owner: u64,
     deps: MirrorDeps,
-    /// Top-level sub-agent calls of the parent: id -> input as last known.
-    calls: HashMap<String, serde_json::Value>,
+    /// Top-level sub-agent calls of the parent not yet over.
+    calls: HashMap<String, Call>,
     /// Calls made INSIDE a mirror (any depth): id -> the first-level call.
     nested: HashMap<String, String>,
     /// Open mirrors by first-level call id.
     mirrors: HashMap<String, Mirror>,
-    /// First-level calls whose mirror is closed (or could not be written).
+    /// First-level sub-agent calls that are over here (their mirror closed, held by another
+    /// tap, deleted, or not writable): their later events are dropped. Only sub-agent calls.
     closed: HashSet<String>,
     parent_node: Option<ChatSessionNode>,
 }
@@ -369,15 +578,17 @@ impl Worker {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Msg::Event(event) => self.handle(*event).await,
-                Msg::TurnEnded => {
-                    self.close_all("The parent turn ended before the sub-agent answered.")
-                        .await
+                Msg::TurnEnded => self.turn_ended().await,
+                #[cfg(test)]
+                Msg::Flush(done) => {
+                    let _ = done.send(());
                 }
             }
         }
         // The parent session is gone (every handle of the tap dropped).
         self.close_all("The parent session closed before the sub-agent answered.")
             .await;
+        self.deps.registry.forget_owner(self.owner);
     }
 
     async fn handle(&mut self, mut event: ChatEvent) {
@@ -386,11 +597,17 @@ impl Worker {
                 ChatEvent::ToolUse {
                     id, tool, input, ..
                 } if is_subagent_tool(tool) => {
-                    self.calls.insert(id.clone(), input.clone());
+                    self.calls.insert(
+                        id.clone(),
+                        Call {
+                            input: input.clone(),
+                            launched: false,
+                        },
+                    );
                 }
                 ChatEvent::ToolUseInputResolved { id, input, .. } => {
-                    if let Some(known) = self.calls.get_mut(id) {
-                        *known = input.clone();
+                    if let Some(call) = self.calls.get_mut(id) {
+                        call.input = input.clone();
                     }
                 }
                 ChatEvent::ToolResult {
@@ -399,15 +616,43 @@ impl Worker {
                     is_error,
                     ..
                 } => {
+                    let Some(call) = self.calls.get_mut(id) else {
+                        return;
+                    };
+                    if call.background() && !*is_error {
+                        // Only the launch (decision M3): the sub-agent goes on after it. Its
+                        // mirror stays open until the CLI notifies its end, or the turn ends.
+                        call.launched = true;
+                        return;
+                    }
                     let (id, text, is_error) = (id.clone(), result_text(result), *is_error);
-                    self.calls.remove(&id);
                     self.close(&id, text, is_error, false).await;
                 }
-                ChatEvent::ToolCancelled { id, .. } => {
+                ChatEvent::ToolCancelled { id, .. } if self.calls.contains_key(id) => {
                     let id = id.clone();
-                    self.calls.remove(&id);
                     self.close(&id, "The sub-agent was cancelled.".to_string(), true, true)
                         .await;
+                }
+                ChatEvent::Workflow { data, .. } => {
+                    // The end of a background sub-agent, when the notification names its call.
+                    let Some(id) = data
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|id| self.calls.get(*id).is_some_and(|c| c.launched))
+                        .map(str::to_string)
+                    else {
+                        return;
+                    };
+                    let text = ["summary", "result", "output"]
+                        .iter()
+                        .find_map(|k| data.get(*k).and_then(|v| v.as_str()))
+                        .unwrap_or("The background sub-agent ended.")
+                        .to_string();
+                    let failed = data
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .is_some_and(|s| s != "completed");
+                    self.close(&id, text, failed, false).await;
                 }
                 _ => {}
             },
@@ -441,6 +686,39 @@ impl Worker {
         }
     }
 
+    /// The parent's turn ended: every mirror still open is closed. A background sub-agent
+    /// whose end was not notified is closed too (decision M3): what it does after the turn
+    /// reaches the parent out of turn — on the historical engine through a path no tap
+    /// sees (`oob_listener`) — and nothing ties its notification to its call reliably on
+    /// every CLI version; a mirror left open past the turn could stay "streaming" for good.
+    async fn turn_ended(&mut self) {
+        let open: Vec<String> = self.mirrors.keys().cloned().collect();
+        for call in open {
+            if self.calls.get(&call).is_some_and(|c| c.launched) {
+                self.close(
+                    &call,
+                    "The sub-agent runs in the background: what it does after this turn shows in the parent conversation."
+                        .to_string(),
+                    false,
+                    true,
+                )
+                .await;
+            } else {
+                self.close(
+                    &call,
+                    "The parent turn ended before the sub-agent answered.".to_string(),
+                    true,
+                    true,
+                )
+                .await;
+            }
+        }
+        // A call of the ended turn that never got a mirror is over too.
+        self.calls.clear();
+        self.nested.clear();
+        self.closed.clear();
+    }
+
     /// The parent's node (read once).
     async fn parent_node(&mut self) -> Option<ChatSessionNode> {
         if self.parent_node.is_none() {
@@ -450,44 +728,33 @@ impl Worker {
         self.parent_node.clone()
     }
 
-    /// The mirror of `call`, found or written. `false`: there is none to write into (it is
-    /// closed already, or could not be written).
+    /// The mirror of `call`, found or written, held by this tap alone. `false`: there is none
+    /// to write into here (another tap holds it, it is over, or it could not be written).
     async fn open_mirror(&mut self, call: &str) -> bool {
-        let key = (self.parent.clone(), call.to_string());
-        let known = self
-            .deps
-            .registry
-            .by_call
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&key)
-            .copied();
-        let existing = match known {
-            Some(id) => Some(id),
-            None => self.stored_mirror(call).await,
-        };
+        let registry = Arc::clone(&self.deps.registry);
+        if let ClaimOutcome::Refused = registry.claim(&self.parent, call, self.owner) {
+            self.closed.insert(call.to_string());
+            return false;
+        }
+        // Claimed: nobody else in this process writes it. A mirror written before (another
+        // process, a tap since gone) is in the graph.
+        let existing = self.stored_mirror(call).await;
         let id = match existing {
-            Some(id) => {
-                if self.is_closed(id).await {
-                    self.closed.insert(call.to_string());
-                    return false;
-                }
-                id
+            Some(id) if self.ended_on_its_result(id).await => {
+                registry.settle(&self.parent, call, self.owner, Some(id));
+                self.closed.insert(call.to_string());
+                return false;
             }
+            Some(id) => id,
             None => match self.write_mirror(call).await {
                 Some(id) => id,
                 None => {
+                    registry.settle(&self.parent, call, self.owner, None);
                     self.closed.insert(call.to_string());
                     return false;
                 }
             },
         };
-        self.deps
-            .registry
-            .by_call
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key, id);
         let next_seq = self
             .deps
             .graph
@@ -495,13 +762,8 @@ impl Worker {
             .await
             .unwrap_or(0)
             + 1;
-        let (tx, _) = broadcast::channel(256);
-        self.deps
-            .registry
-            .open
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id.to_string(), tx.clone());
+        let (tx, _) = broadcast::channel(MIRROR_BROADCAST);
+        registry.bind(&self.parent, call, self.owner, id, tx.clone());
         self.mirrors.insert(
             call.to_string(),
             Mirror {
@@ -536,18 +798,8 @@ impl Worker {
         })
     }
 
-    /// Whether the mirror `id` already has its `result`.
-    async fn is_closed(&self, id: Uuid) -> bool {
-        if self
-            .deps
-            .registry
-            .closed
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&id)
-        {
-            return true;
-        }
+    /// Whether the stored mirror `id` already ends on its `result`.
+    async fn ended_on_its_result(&self, id: Uuid) -> bool {
         let Ok(latest) = self.deps.graph.get_latest_chat_event_seq(id).await else {
             return false;
         };
@@ -563,7 +815,7 @@ impl Worker {
     fn prompt(&self, call: &str) -> Option<String> {
         self.calls
             .get(call)
-            .and_then(|input| input.get("prompt"))
+            .and_then(|c| c.input.get("prompt"))
             .and_then(|p| p.as_str())
             .filter(|p| !p.trim().is_empty())
             .map(str::to_string)
@@ -572,7 +824,11 @@ impl Worker {
     /// Writes the mirror node of `call`, and announces it.
     async fn write_mirror(&mut self, call: &str) -> Option<Uuid> {
         let parent = self.parent_node().await?;
-        let input = self.calls.get(call).cloned().unwrap_or_default();
+        let input = self
+            .calls
+            .get(call)
+            .map(|c| c.input.clone())
+            .unwrap_or_default();
         let prompt = self.prompt(call);
         let description = input
             .get("description")
@@ -640,10 +896,15 @@ impl Worker {
             tracing::warn!(mirror = %node.id, error = %e, "SPAWNED_BY of a mirror not written");
         }
         if let Some(emitter) = &self.deps.event_emitter {
+            // Exactly the payload of every session (decision ed628dad): the client reads
+            // `tool_use_id` and `mirror_of` from `/children` and the session itself.
             emitter.emit_created(
                 crate::events::EntityType::ChatSession,
                 &node.id.to_string(),
-                created_payload(&spawned_by, node.project_slug.as_deref(), call),
+                super::manager::session_created_payload_of(
+                    Some(&spawned_by),
+                    node.project_slug.as_deref(),
+                ),
                 None,
             );
         }
@@ -651,8 +912,26 @@ impl Worker {
         Some(node.id)
     }
 
+    /// Whether the mirror of `call` was deleted under this tap: it is then dropped, never
+    /// written again, and its call is over here.
+    fn dropped_if_deleted(&mut self, call: &str) -> bool {
+        let Some(id) = self.mirrors.get(call).map(|m| m.id) else {
+            return false;
+        };
+        if !self.deps.registry.take_deleted(id) {
+            return false;
+        }
+        self.mirrors.remove(call);
+        self.forget_call(call);
+        tracing::info!(parent = %self.parent, call, mirror = %id, "deleted mirror dropped by its tap");
+        true
+    }
+
     /// Stores (but a delta) and broadcasts one event of the mirror of `call`.
     async fn append(&mut self, call: &str, event: ChatEvent) {
+        if self.dropped_if_deleted(call) {
+            return;
+        }
         let Some(mirror) = self.mirrors.get_mut(call) else {
             return;
         };
@@ -692,10 +971,17 @@ impl Worker {
         }
     }
 
-    /// Ends the mirror of `call` on its result. Nothing when it has none open.
-    async fn close(&mut self, call: &str, text: String, is_error: bool, interrupted: bool) {
+    /// `call` is over here: its state goes, its later events are dropped.
+    fn forget_call(&mut self, call: &str) {
+        self.calls.remove(call);
+        self.nested.retain(|_, first| first != call);
         self.closed.insert(call.to_string());
-        if !self.mirrors.contains_key(call) {
+    }
+
+    /// Ends the mirror of the sub-agent call `call` on its result.
+    async fn close(&mut self, call: &str, text: String, is_error: bool, interrupted: bool) {
+        if self.dropped_if_deleted(call) || !self.mirrors.contains_key(call) {
+            self.forget_call(call);
             return;
         }
         let (id, elapsed) = {
@@ -737,16 +1023,8 @@ impl Worker {
         }
         self.deps
             .registry
-            .closed
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id);
-        self.deps
-            .registry
-            .open
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&id.to_string());
+            .closed(&self.parent, call, self.owner, id);
+        self.forget_call(call);
         self.streaming(id, false);
         tracing::info!(parent = %self.parent, call, mirror = %id, "mirror of a Claude Code sub-agent closed");
     }
@@ -969,10 +1247,9 @@ mod tests {
                 "spawned_by": {
                     "type": "conversation",
                     "parent_session_id": w.parent.id.to_string(),
-                    "tool_use_id": CALL,
                 },
-                "mirror_of": "claude_code",
-            })
+            }),
+            "exactly the payload of every session (decision ed628dad)"
         );
         assert_eq!(
             crud[1],
@@ -1057,8 +1334,8 @@ mod tests {
         for event in task_turn() {
             fresh.observe(&event);
         }
-        drop((again, fresh));
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        again.flushed().await;
+        fresh.flushed().await;
         assert_eq!(mirrors_of(w.graph.as_ref(), w.parent.id).await.len(), 1);
         assert_eq!(thread(w.graph.as_ref(), mirror.id).await.len(), stored);
         let created = w
@@ -1138,8 +1415,7 @@ mod tests {
         tap.observe(&said("not a sub-agent", Some("toolu_bash")));
         tap.observe(&said("unknown call", Some("toolu_unknown")));
         tap.observe(&answered("toolu_bash", "ok", None));
-        drop(tap);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tap.flushed().await;
         assert!(mirrors_of(w.graph.as_ref(), w.parent.id).await.is_empty());
         assert!(w.emitter.events.lock().unwrap().is_empty());
     }
@@ -1156,21 +1432,11 @@ mod tests {
             None,
         ));
         tap.observe(&said("working", Some(CALL)));
-        let mut id = None;
-        for _ in 0..200 {
-            if let Some(m) = mirrors_of(w.graph.as_ref(), w.parent.id).await.first() {
-                id = Some(m.id.to_string());
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let id = id.expect("a mirror");
-        for _ in 0..200 {
-            if w.registry.is_open(&id) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        tap.flushed().await;
+        let id = mirrors_of(w.graph.as_ref(), w.parent.id).await[0]
+            .id
+            .to_string();
+        assert!(w.registry.is_open(&id));
         let mut rx = w.registry.subscribe(&id).expect("followed live");
         assert!(w.registry.open_ids().iter().any(|o| o.to_string() == id));
         tap.observe(&said("more", Some(CALL)));
@@ -1184,6 +1450,268 @@ mod tests {
         tap.observe(&answered(CALL, "done", None));
         closed_mirrors(w.graph.as_ref(), w.parent.id, 1).await;
         assert!(!w.registry.is_open(&id));
+    }
+
+    /// Two Task calls of one turn, their sub-agents speaking in turns: two mirrors, each
+    /// with its own events only, each closed by its own result.
+    #[tokio::test]
+    async fn two_parallel_task_calls_get_two_mirrors() {
+        let w = world().await;
+        let tap = w.tap();
+        for event in [
+            call(
+                "toolu_a",
+                "Task",
+                serde_json::json!({"description": "A", "prompt": "do A"}),
+                None,
+            ),
+            call(
+                "toolu_b",
+                "Task",
+                serde_json::json!({"description": "B", "prompt": "do B"}),
+                None,
+            ),
+            said("a1", Some("toolu_a")),
+            said("b1", Some("toolu_b")),
+            said("a2", Some("toolu_a")),
+            answered("toolu_b", "B done", None),
+            said("b-late", Some("toolu_b")),
+            said("a3", Some("toolu_a")),
+            answered("toolu_a", "A done", None),
+        ] {
+            tap.observe(&event);
+        }
+        let mirrors = closed_mirrors(w.graph.as_ref(), w.parent.id, 2).await;
+        assert_eq!(mirrors.len(), 2);
+        for mirror in mirrors {
+            let events = thread(w.graph.as_ref(), mirror.id).await;
+            let said: Vec<String> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::AssistantText { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect();
+            let result = match events.last() {
+                Some(ChatEvent::Result { result_text, .. }) => result_text.clone().unwrap(),
+                other => panic!("{other:?}"),
+            };
+            match mirror.title.as_deref() {
+                Some("A") => {
+                    assert_eq!(said, ["a1", "a2", "a3"]);
+                    assert_eq!(result, "A done");
+                }
+                Some("B") => {
+                    assert_eq!(said, ["b1"], "nothing after its result");
+                    assert_eq!(result, "B done");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// The user stops the parent in the middle of a sub-agent: the call is cancelled, the
+    /// mirror ends `interrupted`, stops streaming, and nothing is written after.
+    #[tokio::test]
+    async fn an_interrupt_in_the_middle_of_a_sub_agent_closes_its_mirror() {
+        let w = world().await;
+        let tap = w.tap();
+        tap.observe(&call(
+            CALL,
+            "Task",
+            serde_json::json!({"prompt": "go"}),
+            None,
+        ));
+        tap.observe(&said("working", Some(CALL)));
+        tap.observe(&ChatEvent::ToolCancelled {
+            id: CALL.into(),
+            parent_tool_use_id: None,
+        });
+        tap.observe(&said("too late", Some(CALL)));
+        tap.observe(&ChatEvent::StreamingStatus {
+            is_streaming: false,
+        });
+        tap.flushed().await;
+        let mirror = mirrors_of(w.graph.as_ref(), w.parent.id).await[0].clone();
+        let events = thread(w.graph.as_ref(), mirror.id).await;
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result { is_error: true, stop_reason: Some(r), .. }) if r == "interrupted"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ChatEvent::Result { .. }))
+                .count(),
+            1
+        );
+        assert!(!w.registry.is_open(&mirror.id.to_string()));
+        let crud = w.emitter.of(&mirror.id.to_string());
+        assert_eq!(
+            crud.last().unwrap(),
+            &(
+                CrudAction::Updated,
+                serde_json::json!({"is_streaming": false})
+            )
+        );
+    }
+
+    /// A background call (`run_in_background`): its immediate result (the launch) does not
+    /// close the mirror; the sub-agent's later events still go in; the CLI's notification
+    /// naming the call closes it with its summary. Without one, the turn's end closes it as a
+    /// success that says the rest shows in the parent.
+    #[tokio::test]
+    async fn a_background_agent_call_keeps_its_mirror_open_past_its_launch() {
+        let w = world().await;
+        let tap = w.tap();
+        let input =
+            serde_json::json!({"description": "bg", "prompt": "go", "run_in_background": true});
+        tap.observe(&call(CALL, "Agent", input.clone(), None));
+        tap.observe(&said("started", Some(CALL)));
+        tap.observe(&answered(CALL, "Async agent launched successfully", None));
+        tap.observe(&said("still working", Some(CALL)));
+        tap.flushed().await;
+        let mirror = mirrors_of(w.graph.as_ref(), w.parent.id).await[0].clone();
+        assert!(
+            w.registry.is_open(&mirror.id.to_string()),
+            "open past its launch"
+        );
+        tap.observe(&ChatEvent::Workflow {
+            subtype: "task_notification".into(),
+            data: serde_json::json!({"tool_use_id": CALL, "status": "completed", "summary": "bg done"}),
+        });
+        tap.flushed().await;
+        let events = thread(w.graph.as_ref(), mirror.id).await;
+        assert!(events.iter().any(
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content == "still working")
+        ));
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result { is_error: false, result_text: Some(t), .. }) if t == "bg done"),
+            "{events:?}"
+        );
+
+        // No notification: the end of the turn closes it, as a success.
+        let w = world().await;
+        let tap = w.tap();
+        tap.observe(&call(CALL, "Agent", input, None));
+        tap.observe(&said("started", Some(CALL)));
+        tap.observe(&answered(CALL, "Async agent launched successfully", None));
+        tap.observe(&ChatEvent::StreamingStatus {
+            is_streaming: false,
+        });
+        let mirror = closed_mirrors(w.graph.as_ref(), w.parent.id, 1).await[0].clone();
+        assert!(matches!(
+            thread(w.graph.as_ref(), mirror.id).await.last(),
+            Some(ChatEvent::Result { is_error: false, result_text: Some(t), .. }) if t.contains("background")
+        ));
+    }
+
+    /// Two live taps of one parent (an old turn's tap still finishing after a resume): only
+    /// the one that claimed the call writes its mirror; the other neither writes into it nor,
+    /// when it ends, removes what the first holds. Once the first ends, the registry keeps
+    /// nothing of it.
+    #[tokio::test]
+    async fn a_second_live_tap_never_writes_into_a_mirror_the_first_holds() {
+        let w = world().await;
+        let first = w.tap();
+        first.observe(&call(
+            CALL,
+            "Task",
+            serde_json::json!({"prompt": "go"}),
+            None,
+        ));
+        first.observe(&said("from the first", Some(CALL)));
+        first.flushed().await;
+        let mirror = mirrors_of(w.graph.as_ref(), w.parent.id).await[0].clone();
+        let stored = thread(w.graph.as_ref(), mirror.id).await.len();
+
+        let second = w.tap();
+        second.observe(&call(
+            CALL,
+            "Task",
+            serde_json::json!({"prompt": "go"}),
+            None,
+        ));
+        second.observe(&said("from the second", Some(CALL)));
+        second.observe(&answered(CALL, "second's result", None));
+        second.flushed().await;
+        drop(second);
+        // The second ended: the first still holds its open mirror.
+        first.flushed().await;
+        assert_eq!(thread(w.graph.as_ref(), mirror.id).await.len(), stored);
+        assert!(w.registry.is_open(&mirror.id.to_string()));
+
+        first.observe(&answered(CALL, "first's result", None));
+        first.flushed().await;
+        assert!(matches!(
+            thread(w.graph.as_ref(), mirror.id).await.last(),
+            Some(ChatEvent::Result { result_text: Some(t), .. }) if t == "first's result"
+        ));
+        assert_eq!(mirrors_of(w.graph.as_ref(), w.parent.id).await.len(), 1);
+        drop(first);
+        for _ in 0..400 {
+            if w.registry.claims_len() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            w.registry.claims_len(),
+            0,
+            "a tap that ends forgets its claims"
+        );
+        assert!(!w.registry.is_known_mirror(&mirror.id.to_string()));
+    }
+
+    /// An open mirror deleted under its tap: never written again, not written anew for its
+    /// call, no longer open.
+    #[tokio::test]
+    async fn a_deleted_open_mirror_is_dropped_by_its_tap() {
+        let w = world().await;
+        let tap = w.tap();
+        tap.observe(&call(
+            CALL,
+            "Task",
+            serde_json::json!({"prompt": "go"}),
+            None,
+        ));
+        tap.observe(&said("working", Some(CALL)));
+        tap.flushed().await;
+        let mirror = mirrors_of(w.graph.as_ref(), w.parent.id).await[0].clone();
+        assert!(w.registry.deleted(mirror.id), "it was open");
+        w.graph.delete_chat_session(mirror.id).await.unwrap();
+        assert!(!w.registry.is_open(&mirror.id.to_string()));
+        tap.observe(&said("after the delete", Some(CALL)));
+        tap.observe(&answered(CALL, "done", None));
+        tap.flushed().await;
+        assert!(
+            mirrors_of(w.graph.as_ref(), w.parent.id).await.is_empty(),
+            "not written anew"
+        );
+        assert!(
+            !thread(w.graph.as_ref(), mirror.id)
+                .await
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AssistantText { content, .. } if content == "after the delete")),
+        );
+    }
+
+    /// The store refuses the mirror: nothing is written, nothing announced, and the tap
+    /// drops the call's events (the parent never sees any of it: the tap only observes).
+    #[tokio::test]
+    async fn a_mirror_the_store_refuses_is_dropped_quietly() {
+        let w = world().await;
+        w.graph
+            .fail_session_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let tap = w.tap();
+        for event in task_turn() {
+            tap.observe(&event);
+        }
+        tap.flushed().await;
+        assert!(mirrors_of(w.graph.as_ref(), w.parent.id).await.is_empty());
+        assert!(w.emitter.events.lock().unwrap().is_empty());
+        assert!(w.registry.open_ids().is_empty());
     }
 }
 

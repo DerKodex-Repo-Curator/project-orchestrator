@@ -962,6 +962,8 @@ pub struct ChatManager {
     /// The read-only mirrors of Claude Code sub-agents this process wrote (`chat::mirror`,
     /// P18c): idempotency across the taps of a session, and the live view of the open ones.
     pub(crate) mirrors: Arc<super::mirror::MirrorRegistry>,
+    /// Whether the Claude Code sessions opened here get a mirror tap (always, but in tests).
+    pub(crate) subagent_mirrors: bool,
 }
 
 // ============================================================================
@@ -3237,6 +3239,7 @@ impl ChatManager {
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
             mirrors: Default::default(),
+            subagent_mirrors: true,
         }
     }
 
@@ -3333,6 +3336,7 @@ impl ChatManager {
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
             mirrors: Default::default(),
+            subagent_mirrors: true,
         }
     }
 
@@ -6374,8 +6378,11 @@ impl ChatManager {
 
     /// The passive observer that mirrors the sub-agents of the Claude Code session
     /// `session_id` into read-only child conversations (`chat::mirror`, P18c).
-    pub(crate) fn mirror_tap(&self, session_id: &str) -> Arc<super::mirror::MirrorTap> {
-        super::mirror::MirrorTap::spawn(
+    pub(crate) fn mirror_tap(&self, session_id: &str) -> Option<Arc<super::mirror::MirrorTap>> {
+        if !self.subagent_mirrors {
+            return None;
+        }
+        Some(super::mirror::MirrorTap::spawn(
             session_id,
             super::mirror::MirrorDeps {
                 graph: self.graph.clone(),
@@ -6383,7 +6390,15 @@ impl ChatManager {
                 nats: self.nats.clone(),
                 registry: Arc::clone(&self.mirrors),
             },
-        )
+        ))
+    }
+
+    /// No sub-agent mirror for the sessions this manager opens (tests: the parent's stream
+    /// compared with and without the tap).
+    #[cfg(test)]
+    pub(crate) fn without_subagent_mirrors(mut self) -> Self {
+        self.subagent_mirrors = false;
+        self
     }
 
     /// Refuses a message to a read-only mirror of a Claude Code sub-agent
@@ -6391,8 +6406,14 @@ impl ChatManager {
     /// resumes or proxies it. A session that cannot be read is not refused here (what
     /// follows reports it).
     pub async fn refuse_if_mirror(&self, session_id: &str) -> Result<()> {
-        if self.mirrors.is_open(session_id) {
+        if self.mirrors.is_known_mirror(session_id) || self.mirrors.is_open(session_id) {
             return Err(super::mirror::MirrorReadOnly.into());
+        }
+        // A session live here is a normal one (a mirror has no process): no graph read on
+        // the path of every write of a live session (a parent answering its sub-agent's
+        // permission never waits on the store).
+        if self.is_session_active(session_id).await {
+            return Ok(());
         }
         let Ok(uuid) = Uuid::parse_str(session_id) else {
             return Ok(());
@@ -7050,7 +7071,7 @@ impl ChatManager {
                 session_id.to_string(),
                 ActiveSession {
                     anchor: self.anchor_session(),
-                    mirror_tap: Some(mirror_tap.clone()),
+                    mirror_tap: mirror_tap.clone(),
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
                     cli_session_id: None,
@@ -10268,6 +10289,7 @@ impl ChatManager {
     /// it awaits the lock while stream_response holds it, so broadcast events
     /// can no longer be forwarded to the frontend.
     pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
+        self.refuse_if_mirror(session_id).await?;
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             let pair = super::provider::policy::parse_mode(mode)
                 .ok_or_else(|| anyhow!("Unknown permission mode '{mode}'"))?;
@@ -10423,6 +10445,9 @@ impl ChatManager {
         use super::relay;
         use super::types::SwitchProviderError;
 
+        // A read-only mirror never moves to another provider (P18c): the move would open a
+        // writable session holding the same `tool_use_id`, and write into the mirror's thread.
+        self.refuse_if_mirror(session_id).await?;
         let previous = Uuid::parse_str(session_id)
             .map_err(|_| anyhow::Error::new(SwitchProviderError::InvalidSession))?;
         if message.trim().is_empty() {
@@ -10634,6 +10659,7 @@ impl ChatManager {
     /// Returns `false` for a dormant session, which has no subscribers: the
     /// caller confirms to the asker directly.
     pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<bool> {
+        self.refuse_if_mirror(session_id).await?;
         self.set_session_model_inner(session_id, model, true).await
     }
 
@@ -11117,8 +11143,6 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         from: ResumeFrom,
     ) -> Result<()> {
-        // A mirror has no process to resume (P18c).
-        self.refuse_if_mirror(session_id).await?;
         let mut opened_on: Option<String> = None;
         let result = self
             .resume_session_on(session_id, message, user_claims, from, &mut opened_on)
@@ -11150,6 +11174,10 @@ impl ChatManager {
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
+        // A read-only mirror of a Claude Code sub-agent has no process to resume (P18c).
+        if session_node.mirror_of.is_some() {
+            return Err(super::mirror::MirrorReadOnly.into());
+        }
         *opened_on = Some(
             session_node
                 .provider_id
@@ -11433,7 +11461,7 @@ impl ChatManager {
                 session_id.to_string(),
                 ActiveSession {
                     anchor: self.anchor_session(),
-                    mirror_tap: Some(mirror_tap.clone()),
+                    mirror_tap: mirror_tap.clone(),
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
                     cli_session_id: cli_session_id.map(|s| s.to_string()),
@@ -15327,7 +15355,8 @@ impl ChatManager {
                         // Claude Code runs its sub-agents itself: they get read-only mirrors
                         // (P18c). A native session's sub-agents are real children already.
                         matches!(kind, nexus_claude::agent::ProviderKind::ClaudeCode)
-                            .then(|| self.mirror_tap(session_id)),
+                            .then(|| self.mirror_tap(session_id))
+                            .flatten(),
                     ),
                 ),
                 host_missing,
@@ -15819,6 +15848,8 @@ impl ChatManager {
     /// that cannot be removed fails the deletion (the conversation would stay on disk
     /// with nothing left to find it); a retry removes both.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
+        // An open mirror of a Claude Code sub-agent: its tap drops it and never writes it again.
+        self.mirrors.deleted(session_id);
         let _ = self.close_session(&session_id.to_string()).await;
         if let Some(node) = self.graph.get_chat_session(session_id).await? {
             if let (Some(root), Some(provider), Some(token)) = (

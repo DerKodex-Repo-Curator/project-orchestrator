@@ -5252,6 +5252,18 @@ mod parity {
         anchor_mode: Option<crate::chat::anchor_resolver::AnchorContextMode>,
         neutral: bool,
     ) -> Rig {
+        rig_tweaked(kind, turns, nats, anchor_mode, neutral, |m| m).await
+    }
+
+    /// [`rig_full`], the manager passed through `tweak` before the session opens.
+    pub(super) async fn rig_tweaked(
+        kind: ProviderKind,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        anchor_mode: Option<crate::chat::anchor_resolver::AnchorContextMode>,
+        neutral: bool,
+        tweak: impl FnOnce(ChatManager) -> ChatManager,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let mut project = crate::test_helpers::test_project();
@@ -5285,6 +5297,7 @@ mod parity {
         if let Some(mode) = anchor_mode {
             manager = manager.with_anchor_context_mode(mode);
         }
+        let manager = tweak(manager);
         let mut req = request(None, Some(&project.slug), "default");
         req.message = String::new();
         req.cwd = project.root_path.clone();
@@ -13457,7 +13470,7 @@ mod claude_code_mirror {
     use nexus_claude::testkit::scripted::steps;
     use nexus_claude::testkit::Step;
 
-    use super::parity::{caps, rig};
+    use super::parity::{caps, rig, rig_tweaked};
     use super::*;
     use crate::chat::manager::MessageDeliveryError;
     use crate::chat::mirror::test_support::{closed_mirrors, mirrors_of, thread, RecordingEmitter};
@@ -13574,6 +13587,33 @@ mod claude_code_mirror {
             !manager.is_session_active(&sid).await,
             "no process was started"
         );
+        // Nor moved to another provider, nor given another model or mode (M1, M7).
+        let refused = |r: anyhow::Result<()>| {
+            crate::chat::provider::errors::classify_open_error(&r.unwrap_err(), None)
+                .map(|f| (f.status, f.code))
+        };
+        assert_eq!(
+            refused(
+                manager
+                    .switch_session_provider(&sid, "claude-code", None, "go on", None)
+                    .await
+                    .map(|_| ())
+            ),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert_eq!(
+            refused(manager.set_session_model(&sid, "other").await.map(|_| ())),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert_eq!(
+            refused(manager.set_session_permission_mode(&sid, "plan").await),
+            Some((409, MIRROR_READ_ONLY))
+        );
+        assert_eq!(
+            graph.get_session_children(parent).await.unwrap().len(),
+            1,
+            "no second child holds the call"
+        );
         mirror
     }
 
@@ -13613,7 +13653,7 @@ mod claude_code_mirror {
         let mut r = rig(ProviderKind::Native, vec![task_turn()]).await;
         r.manager.send_message(&r.sid, "find it").await.unwrap();
         r.turn_end().await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // No tap at all on a native session: nothing can still be on its way.
         let parent = Uuid::parse_str(&r.sid).unwrap();
         assert!(mirrors_of(r.graph.as_ref(), parent).await.is_empty());
     }
@@ -13719,13 +13759,11 @@ mod claude_code_mirror {
         let crud = emitter.of(&mirror.id.to_string());
         assert_eq!(crud.len(), 3, "{crud:?}");
         assert_eq!(crud[0].0, CrudAction::Created);
+        // Exactly the payload of every session (decision ed628dad).
         assert_eq!(
-            crud[0].1["spawned_by"]["tool_use_id"], CALL,
-            "{:?}",
-            crud[0].1
+            crud[0].1,
+            json!({"project_slug": null, "spawned_by": {"type": "conversation", "parent_session_id": sid}})
         );
-        assert_eq!(crud[0].1["spawned_by"]["parent_session_id"], sid);
-        assert_eq!(crud[0].1["mirror_of"], MIRROR_OF_CLAUDE_CODE);
         assert_eq!(
             crud[1],
             (CrudAction::Updated, json!({"is_streaming": true}))
@@ -13751,5 +13789,109 @@ mod claude_code_mirror {
             "{own:?}"
         );
         manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The parent's events without what differs from one run to another (its own id, the
+    /// durations, the clock of its tool calls).
+    fn normalized(events: &[ChatEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .filter(|e| !matches!(e, ChatEvent::ToolTiming { .. }))
+            .map(|e| {
+                let mut v = serde_json::to_value(e).unwrap();
+                if let Some(o) = v.as_object_mut() {
+                    for k in [
+                        "session_id",
+                        "duration_ms",
+                        "duration_api_ms",
+                        "cli_session_id",
+                    ] {
+                        o.remove(k);
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// One parent turn running [`task_turn`] on the agent engine: what its clients saw live,
+    /// what its thread holds, and the parent's id and store.
+    async fn parent_run(
+        mirrors: bool,
+        store_down: bool,
+    ) -> (Vec<Value>, Vec<Value>, Uuid, Arc<MockGraphStore>) {
+        let mut r = rig_tweaked(
+            ProviderKind::ClaudeCode,
+            vec![task_turn()],
+            None,
+            None,
+            false,
+            |m| {
+                if mirrors {
+                    m
+                } else {
+                    m.without_subagent_mirrors()
+                }
+            },
+        )
+        .await;
+        if store_down {
+            r.graph
+                .fail_session_writes
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        r.manager.send_message(&r.sid, "find it").await.unwrap();
+        let mut live = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), r.rx.recv())
+                .await
+                .expect("the turn ends")
+                .unwrap();
+            let end = matches!(
+                event,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            live.push(event);
+            if end {
+                break;
+            }
+        }
+        let parent = Uuid::parse_str(&r.sid).unwrap();
+        let stored = thread(r.graph.as_ref(), parent).await;
+        (
+            normalized(&live),
+            normalized(&stored),
+            parent,
+            r.graph.clone(),
+        )
+    }
+
+    /// Strictly passive: the parent's live stream and stored thread are the SAME, event for
+    /// event, with the tap and without it.
+    #[tokio::test]
+    async fn the_parents_stream_is_the_same_with_and_without_the_tap() {
+        let (live_off, stored_off, parent_off, graph_off) = parent_run(false, false).await;
+        let (live_on, stored_on, parent_on, graph_on) = parent_run(true, false).await;
+        assert!(mirrors_of(graph_off.as_ref(), parent_off).await.is_empty());
+        closed_mirrors(graph_on.as_ref(), parent_on, 1).await;
+        assert_eq!(live_on, live_off, "the live stream");
+        assert_eq!(stored_on, stored_off, "the stored thread");
+        assert!(
+            live_on.iter().any(|e| e["parent_tool_use_id"] == CALL),
+            "the sub-agent, nested"
+        );
+    }
+
+    /// The store refuses the mirror (a failed write): no mirror, and the parent's stream and
+    /// thread are untouched — the same as without the tap.
+    #[tokio::test]
+    async fn a_failed_mirror_write_leaves_the_parents_events_untouched() {
+        let (live_off, stored_off, _, _) = parent_run(false, false).await;
+        let (live_down, stored_down, parent, graph) = parent_run(true, true).await;
+        assert_eq!(live_down, live_off, "the live stream");
+        assert_eq!(stored_down, stored_off, "the stored thread");
+        assert!(mirrors_of(graph.as_ref(), parent).await.is_empty());
     }
 }

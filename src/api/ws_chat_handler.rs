@@ -1434,13 +1434,16 @@ pub(crate) fn lasting_answer_refused(
 }
 
 /// Whether a client frame writes to the session (a message, queued or not, an answer to a
-/// permission or a question): what a read-only mirror refuses (P18c).
+/// permission or a question, a change of model or permission mode): what a read-only mirror
+/// refuses (P18c). An interrupt or a cancel stays a harmless no-op on a mirror.
 pub(crate) fn writes_to_session(msg: &WsChatClientMessage) -> bool {
     matches!(
         msg,
         WsChatClientMessage::UserMessage { .. }
             | WsChatClientMessage::PermissionResponse { .. }
             | WsChatClientMessage::InputResponse { .. }
+            | WsChatClientMessage::SetModel { .. }
+            | WsChatClientMessage::SetPermissionMode { .. }
     )
 }
 

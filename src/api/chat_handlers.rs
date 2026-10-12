@@ -1185,7 +1185,7 @@ pub async fn send_session_message(
     if body.content.trim().is_empty() {
         return Err(AppError::BadRequest("content must not be empty".into()));
     }
-    state
+    let node = state
         .orchestrator
         .neo4j()
         .get_chat_session(session_id)
@@ -1195,11 +1195,13 @@ pub async fn send_session_message(
 
     let sid = session_id.to_string();
     // A read-only mirror of a Claude Code sub-agent takes no message (P18c): 409
-    // `mirror_read_only`, before anything is composed, extracted or routed.
-    chat_manager
-        .refuse_if_mirror(&sid)
-        .await
-        .map_err(|e| AppError::from_open_error(e, None))?;
+    // `mirror_read_only`, before anything is composed, extracted or routed (read from the
+    // node just read: no second lookup).
+    if node.mirror_of.is_some() {
+        return Err(AppError::Provider(Box::new(
+            crate::chat::mirror::MirrorReadOnly::failure(),
+        )));
+    }
     let claims = claims.map(|axum::Extension(c)| c);
     let content = crate::refs::compose::compose_user_message(
         &state.orchestrator.neo4j_arc(),
@@ -5225,6 +5227,11 @@ mod tests {
                     .to_string(),
             ),
             auth_post(&perm_uri(mirror, "r1"), r#"{"allow":true}"#),
+            // M1: a move to another provider would open a writable session holding the call.
+            auth_post(
+                &format!("/api/chat/sessions/{mirror}/switch-provider"),
+                r#"{"provider":"claude-code","message":"go on"}"#,
+            ),
         ] {
             let (status, body) = call(&h.app, req).await;
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -5238,6 +5245,66 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(!h.manager.is_session_active(&mirror.to_string()).await);
+        assert_eq!(
+            h.graph.get_session_children(_parent).await.unwrap().len(),
+            1,
+            "no second child holds the call"
+        );
+    }
+
+    /// P18c (M7): deleting an OPEN mirror ends it for its tap — never written again, never
+    /// written anew for its call — and it is no longer live.
+    #[tokio::test]
+    async fn deleting_an_open_mirror_stops_its_tap() {
+        let h = action_harness(None).await;
+        let parent = seed_session(&h).await;
+        let tap = h.manager.mirror_tap(&parent.to_string()).expect("a tap");
+        tap.observe(&ChatEvent::ToolUse {
+            id: "toolu_task".into(),
+            tool: "Task".into(),
+            input: serde_json::json!({"prompt": "go"}),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: None,
+        });
+        let said = |t: &str| ChatEvent::AssistantText {
+            content: t.into(),
+            parent_tool_use_id: Some("toolu_task".into()),
+        };
+        tap.observe(&said("working"));
+        tap.flushed().await;
+        let mirror =
+            crate::chat::mirror::test_support::mirrors_of(h.graph.as_ref(), parent).await[0].id;
+        assert!(h.manager.is_session_streaming(&mirror.to_string()).await);
+
+        let (status, body) = call(
+            &h.app,
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/chat/sessions/{mirror}"))
+                .header("authorization", test_bearer_token())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!h.manager.is_session_streaming(&mirror.to_string()).await);
+        tap.observe(&said("after the delete"));
+        tap.flushed().await;
+        assert!(h.graph.get_chat_session(mirror).await.unwrap().is_none());
+        assert!(
+            !crate::chat::mirror::test_support::thread(h.graph.as_ref(), mirror)
+                .await
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AssistantText { content, .. } if content == "after the delete")),
+            "never written again"
+        );
+        assert!(
+            crate::chat::mirror::test_support::mirrors_of(h.graph.as_ref(), parent)
+                .await
+                .is_empty(),
+            "not written anew for its call"
+        );
     }
 
     /// P18c: the session object (GET) and the parent's children carry `mirror_of`; a normal
