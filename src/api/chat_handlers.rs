@@ -3271,16 +3271,15 @@ mod tests {
         let session = crate::test_helpers::test_chat_session(None);
         h.graph.create_chat_session(&session).await.unwrap();
         let sid = session.id;
-        let record = |seq: i64, kind: &str, data: serde_json::Value| {
-            crate::neo4j::models::ChatEventRecord {
+        let record =
+            |seq: i64, kind: &str, data: serde_json::Value| crate::neo4j::models::ChatEventRecord {
                 id: Uuid::new_v4(),
                 session_id: sid,
                 seq,
                 event_type: kind.to_string(),
                 data: data.to_string(),
                 created_at: chrono::Utc::now(),
-            }
-        };
+            };
         h.graph
             .store_chat_events(
                 sid,
@@ -3299,13 +3298,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let (status, body) = call(&h.app, auth_get(&format!("/api/chat/sessions/{sid}/usage"))).await;
+        let (status, body) =
+            call(&h.app, auth_get(&format!("/api/chat/sessions/{sid}/usage"))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["turns"], 2, "{body}");
         assert_eq!(body["input_tokens"], 4200);
         assert_eq!(body["output_tokens"], 150);
         assert_eq!(body["cache_read_tokens"], 3800);
-        assert!(body["cache_creation_tokens"].is_null(), "never reported: {body}");
+        assert!(
+            body["cache_creation_tokens"].is_null(),
+            "never reported: {body}"
+        );
         assert_eq!(body["by_turn"][1]["seq"], 3);
         assert_eq!(body["by_turn"][1]["cache_hit_ratio"], 0.95);
         let (status, _) = call(
