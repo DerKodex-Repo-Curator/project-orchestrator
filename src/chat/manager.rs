@@ -14855,6 +14855,20 @@ impl ChatManager {
             .collect()
     }
 
+    /// Whether this server's `nexus-tools` (the one native sessions get) embeds Obscura: then the
+    /// built-in `obscura` search engine exists ([`super::provider::nexus_tools::BUILTIN_OBSCURA_ID`]).
+    pub async fn nexus_tools_embeds_obscura(&self) -> bool {
+        match self
+            .config
+            .nexus_tools_path
+            .as_deref()
+            .and_then(super::provider::native_factory::runnable_nexus_tools)
+        {
+            Some(program) => super::provider::nexus_tools::embeds_obscura(&program).await,
+            None => false,
+        }
+    }
+
     /// The `SessionSpec` of a session of the agent path: working directory,
     /// model, system prompt, the neutral tool policy of the permission mode,
     /// the project-orchestrator MCP server (same environment as the Claude
@@ -15026,13 +15040,25 @@ impl ChatManager {
                 .and_then(runnable_nexus_tools)
             {
                 Some(program) => {
-                    // The browser is held to the same rule: an absolute, executable path.
+                    // Built with the `obscura` feature, nexus-tools carries the keyless search
+                    // engine and the browser (decision 1e9d7501): asked once per executable.
+                    let embedded_obscura = nt::embeds_obscura(&program).await;
+                    // The browser is held to the same rule: an absolute, executable path. Without
+                    // one, the copy embedded in nexus-tools (`nexus-tools obscura mcp`). Found is
+                    // still not authorised: `attach` gives it only to a project that allowed it.
                     let browser = self
                         .config
                         .nexus_browser_path
                         .as_deref()
                         .and_then(runnable_nexus_tools)
-                        .map(nexus_claude::providers::native::BrowserTools::new);
+                        .map(nexus_claude::providers::native::BrowserTools::new)
+                        .or_else(|| {
+                            embedded_obscura.then(|| {
+                                nexus_claude::providers::native::BrowserTools::embedded_in_nexus_tools(
+                                    program.clone(),
+                                )
+                            })
+                        });
                     let attachment = nt::attach(
                         &nt::NexusToolsConfig {
                             program,
@@ -15043,6 +15069,7 @@ impl ChatManager {
                                 .obscura_path
                                 .as_deref()
                                 .and_then(runnable_nexus_tools),
+                            embedded_obscura,
                             deny_paths: nt::host_deny_paths(self.config_yaml_path.as_deref()),
                         },
                         &nt::GraphConsents(self.graph.clone()),

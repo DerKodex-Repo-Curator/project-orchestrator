@@ -8,7 +8,8 @@
 #   1. the Rust crates of this workspace's binaries (orchestrator, orch, mcp_server, desktop app):
 #      cargo-about over the workspace, with about.toml (targets, accepted licenses, our own crates skipped);
 #   2. nexus-tools, built from the this-rs/nexus revision Cargo.toml pins (scripts/build-nexus-tools.sh),
-#      with the features it is built with: the LICENSE of that repository verbatim, then its crates;
+#      with the features it is built with (NEXUS_TOOLS_FEATURES, default tls,obscura): the LICENSE of
+#      that repository verbatim, then its crates;
 #   3. every `--cargo` component given (another binary shipped next to the server);
 #   4. the vendored notices of native libraries, licenses/third-party/<name>/ (ONNX Runtime...);
 #   5. every `--notices` path given (e.g. the web interface's own dist/third-party-licenses.txt).
@@ -160,13 +161,16 @@ ws_args=(--workspace -m "$root/Cargo.toml")
 about_json "$tmp/ws.json" "${ws_args[@]}"
 render_crates "$tmp/ws.json"
 
-# --- 2. nexus-tools, at the pinned nexus revision, with tls (as scripts/build-nexus-tools.sh builds it)
+# --- 2. nexus-tools, at the pinned nexus revision, with the features scripts/build-nexus-tools.sh builds
+#        it with (NEXUS_TOOLS_FEATURES, default tls,obscura). Obscura's own LICENSE and NOTICE and the
+#        notices of V8 are not crates: the release passes them with --notices.
 meta_args=(--format-version 1 --manifest-path "$root/Cargo.toml")
 [ "$offline" -eq 1 ] && meta_args+=(--frozen) || meta_args+=(--locked)
 nexus_tools="$(cargo metadata "${meta_args[@]}" 2>/dev/null \
   | jq -r '.packages[] | select(.name == "nexus-tools" and (.source // "" | startswith("git+"))) | .manifest_path' | head -1)"
 [ -n "$nexus_tools" ] || { echo "::error::nexus-tools not found in the dependency graph of $root/Cargo.toml" >&2; exit 1; }
-cargo_component "nexus-tools (this-rs/nexus, features: tls)" "$nexus_tools" "tls"
+nexus_features="${NEXUS_TOOLS_FEATURES:-tls,obscura}"
+cargo_component "nexus-tools (this-rs/nexus, features: $nexus_features)" "$nexus_tools" "$nexus_features"
 
 # --- 3. other Rust binaries shipped next to the server -----------------------------------------------
 for c in ${cargo_components[@]+"${cargo_components[@]}"}; do

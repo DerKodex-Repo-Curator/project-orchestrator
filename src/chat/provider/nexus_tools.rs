@@ -78,6 +78,64 @@ pub const BRAVE_ORIGIN: &str = "https://api.search.brave.com";
 /// Origin Obscura's keyless `serp` reaches (DuckDuckGo's HTML results page): what a project
 /// consents to for the `obscura` engine.
 pub const OBSCURA_SEARCH_ORIGIN: &str = "https://html.duckduckgo.com";
+/// Id of the **built-in** `obscura` engine (decision 1e9d7501): when the server's nexus-tools
+/// embeds Obscura, a keyless search engine exists without anyone declaring it. It is not stored;
+/// an engine declared with the `obscura` engine replaces it. Each project still consents to its
+/// origin ([`OBSCURA_SEARCH_ORIGIN`]) like to any other: the first search is refused with that
+/// origin named until the project allows it.
+pub const BUILTIN_OBSCURA_ID: &str = "obscura-builtin";
+
+/// The built-in engine's record (see [`BUILTIN_OBSCURA_ID`]).
+pub fn builtin_obscura_engine() -> SearchProviderRecord {
+    SearchProviderRecord {
+        id: BUILTIN_OBSCURA_ID.to_owned(),
+        engine: "obscura".to_owned(),
+        base_url: None,
+        credential_ref: "none".to_owned(),
+    }
+}
+
+/// Whether the `nexus-tools` at `program` embeds Obscura: its `--capabilities` line says
+/// `"obscura": true`. A build without the feature, an older one without the flag, one that fails or does not
+/// answer in 5 s, or one that prints something else: no. The answer is kept per path and file
+/// modification time, so a replaced executable is asked again.
+pub async fn embeds_obscura(program: &Path) -> bool {
+    use std::sync::Mutex;
+    use std::time::SystemTime;
+    static SEEN: Mutex<BTreeMap<PathBuf, (Option<SystemTime>, bool)>> = Mutex::new(BTreeMap::new());
+    let modified = std::fs::metadata(program).and_then(|m| m.modified()).ok();
+    if let Some((at, answer)) = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(program)
+    {
+        if *at == modified {
+            return *answer;
+        }
+    }
+    let mut command = tokio::process::Command::new(program);
+    command
+        .arg("--capabilities")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let answer =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                serde_json::from_slice::<Value>(&output.stdout)
+                    .ok()
+                    .and_then(|caps| caps.get("obscura").and_then(Value::as_bool))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+    SEEN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(program.to_path_buf(), (modified, answer));
+    answer
+}
 
 /// Why a tool call or a launch is refused. `code` is stable; no message carries a URL beyond its
 /// origin, a token or a key.
@@ -325,7 +383,14 @@ pub async fn check_call(
                 return Ok(());
             }
         }
-        return Err(ToolAccessError::SearchNotConsented);
+        // Name the origin to allow (the built-in engine's, before any consent): the refusal is
+        // then the same as a fetch to a new origin, and says what to allow.
+        return Err(match search_origins.first() {
+            Some(origin) => ToolAccessError::OriginNotConsented {
+                origin: origin.clone(),
+            },
+            None => ToolAccessError::SearchNotConsented,
+        });
     }
     if let Some(tool) = browser_tool {
         let project = project.ok_or(ToolAccessError::BrowserNotAuthorized)?;
@@ -635,6 +700,11 @@ pub struct NexusToolsConfig {
     /// configuration (`chat.obscura_path` / `OBSCURA_BIN`, else found on the `PATH`), never a
     /// request's. `None`: a declared `obscura` engine is skipped (`tool_engine_not_installed`).
     pub obscura: Option<PathBuf>,
+    /// `program` embeds Obscura (nexus-tools built with its `obscura` feature, what
+    /// [`embeds_obscura`] reads from `--capabilities`): a declared `obscura` engine runs in that
+    /// process when no external executable is configured, and the **built-in** `obscura` engine
+    /// ([`builtin_obscura_engine`]) is offered when no engine was declared.
+    pub embedded_obscura: bool,
     /// Places no file tool of the session may reach, scoped or not (`--deny-path`, nexus #93):
     /// [`host_deny_paths`] in production.
     pub deny_paths: Vec<PathBuf>,
@@ -953,11 +1023,16 @@ pub async fn attach(
                         engine_args.push(format!("searxng:{url}"));
                     }
                 }
-                // Keyless: the executable is the server's, one argv element after the flag.
+                // Keyless: the executable is the server's, one argv element after the flag; without
+                // one, the copy embedded in nexus-tools (`obscura` alone).
                 ("obscura", Ok(_)) => match config.obscura.as_deref() {
                     Some(program) => {
                         engine_args.push("--search-engine".to_owned());
                         engine_args.push(format!("obscura:{}", program.display()));
+                    }
+                    None if config.embedded_obscura => {
+                        engine_args.push("--search-engine".to_owned());
+                        engine_args.push("obscura".to_owned());
                     }
                     None => {
                         attachment.skipped_engines.push((
@@ -975,6 +1050,18 @@ pub async fn attach(
                 _ => continue,
             }
             attachment.search_origins.push(origin);
+        }
+        // The built-in engine (decision 1e9d7501): nexus-tools embeds Obscura and no engine was
+        // attached, so search is keyless by default. It is attached even when the project has not
+        // consented to its origin yet: the consent is judged at each call ([`check_call`]), and the
+        // first search is refused with the origin named, as a fetch to a new origin is. Never next
+        // to another engine: nexus-tools would fall back to it, to an origin nobody chose.
+        if engine_args.is_empty() && config.embedded_obscura {
+            engine_args.push("--search-engine".to_owned());
+            engine_args.push("obscura".to_owned());
+            attachment
+                .search_origins
+                .push(OBSCURA_SEARCH_ORIGIN.to_owned());
         }
     }
     // Without an engine the server has no `WebSearch`: do not name it in the token either.
@@ -1167,6 +1254,7 @@ mod tests {
             program: PathBuf::from("/opt/nexus/nexus-tools"),
             browser: None,
             obscura: None,
+            embedded_obscura: false,
             deny_paths: vec![PathBuf::from("/home/me/.ssh")],
         }
     }
@@ -1364,7 +1452,10 @@ mod tests {
         let origins = vec![BRAVE_ORIGIN.to_owned()];
         assert_eq!(
             check_call(&consents, Some("proj"), &origins, &search).await,
-            Err(ToolAccessError::SearchNotConsented)
+            // The refusal names the origin to allow (the same as a fetch to a new origin).
+            Err(ToolAccessError::OriginNotConsented {
+                origin: BRAVE_ORIGIN.to_owned()
+            })
         );
         assert_eq!(
             check_call(&consents, Some("proj"), &[], &search).await,
@@ -2157,6 +2248,147 @@ mod tests {
         crate::auth::agent_tokens::revoke_session("srch-s4");
     }
 
+    // ---- (4b) the built-in `obscura` engine (decision 1e9d7501) -------------------------------
+
+    fn embedded() -> NexusToolsConfig {
+        NexusToolsConfig {
+            embedded_obscura: true,
+            ..config()
+        }
+    }
+
+    #[tokio::test]
+    async fn with_obscura_embedded_search_is_keyless_by_default_and_its_first_call_names_the_origin(
+    ) {
+        let graph = Arc::new(MockGraphStore::new());
+        let consents = GraphConsents(graph.clone());
+        let policy = ask();
+        // Nothing declared, nothing consented: the built-in engine is attached all the same.
+        let attachment = attach(
+            &embedded(),
+            &consents,
+            None,
+            input("bi-s1", &policy, Some("proj")),
+        )
+        .await;
+        let (_, args, _) = stdio(&attachment, "nexus");
+        let at = args.iter().position(|a| a == "--search-engine").unwrap();
+        assert_eq!(
+            args[at + 1],
+            "obscura",
+            "the engine embedded in nexus-tools, no path"
+        );
+        assert!(attachment.tools.contains(&"WebSearch".to_owned()));
+        assert_eq!(attachment.search_origins, [OBSCURA_SEARCH_ORIGIN]);
+        // The project has not consented: the first search is refused with the origin to allow.
+        let search = call(
+            "mcp__nexus__WebSearch",
+            Some("WebSearch"),
+            json!({"query": "rust"}),
+        );
+        assert_eq!(
+            check_call(&consents, Some("proj"), &attachment.search_origins, &search).await,
+            Err(ToolAccessError::OriginNotConsented {
+                origin: OBSCURA_SEARCH_ORIGIN.to_owned()
+            })
+        );
+        store_consent(&graph, "proj", OBSCURA_SEARCH_ORIGIN).await;
+        check_call(&consents, Some("proj"), &attachment.search_origins, &search)
+            .await
+            .unwrap();
+        crate::auth::agent_tokens::revoke_session("bi-s1");
+        // No project, no consent possible: no built-in engine either.
+        let none = attach(&embedded(), &consents, None, input("bi-s2", &policy, None)).await;
+        assert!(!none.tools.contains(&"WebSearch".to_owned()));
+        crate::auth::agent_tokens::revoke_session("bi-s2");
+        // A nexus-tools that does not embed Obscura: no default engine, as before.
+        let plain = attach(
+            &config(),
+            &consents,
+            None,
+            input("bi-s3", &policy, Some("proj")),
+        )
+        .await;
+        assert!(!plain.tools.contains(&"WebSearch".to_owned()));
+        crate::auth::agent_tokens::revoke_session("bi-s3");
+    }
+
+    #[tokio::test]
+    async fn the_built_in_engine_never_sits_behind_a_declared_one() {
+        let graph = Arc::new(MockGraphStore::new());
+        store_provider(&graph, &brave("brave-main")).await;
+        store_consent(&graph, "proj", BRAVE_ORIGIN).await;
+        let vault = vault_with_key(Some("tool:brave-main")).await;
+        let policy = ask();
+        let attachment = attach(
+            &embedded(),
+            &GraphConsents(graph),
+            Some(&vault),
+            input("bi-s4", &policy, Some("proj")),
+        )
+        .await;
+        let (_, args, _) = stdio(&attachment, "nexus");
+        // One engine only: nexus-tools would otherwise fall back to an origin nobody chose.
+        assert_eq!(args.iter().filter(|a| *a == "--search-engine").count(), 1);
+        assert!(args.iter().all(|a| a != "obscura"));
+        assert_eq!(attachment.search_origins, [BRAVE_ORIGIN]);
+        crate::auth::agent_tokens::revoke_session("bi-s4");
+    }
+
+    #[tokio::test]
+    async fn a_declared_obscura_engine_runs_embedded_when_no_executable_is_configured() {
+        let graph = Arc::new(MockGraphStore::new());
+        let declared = SearchProviderRecord {
+            id: "ddg".into(),
+            engine: "obscura".into(),
+            base_url: None,
+            credential_ref: "none".into(),
+        };
+        store_provider(&graph, &declared).await;
+        store_consent(&graph, "proj", OBSCURA_SEARCH_ORIGIN).await;
+        let policy = ask();
+        let attachment = attach(
+            &embedded(),
+            &GraphConsents(graph),
+            None,
+            input("bi-s5", &policy, Some("proj")),
+        )
+        .await;
+        let (_, args, _) = stdio(&attachment, "nexus");
+        let at = args.iter().position(|a| a == "--search-engine").unwrap();
+        assert_eq!(args[at + 1], "obscura");
+        assert_eq!(args.iter().filter(|a| *a == "--search-engine").count(), 1);
+        assert!(attachment.skipped_engines.is_empty());
+        crate::auth::agent_tokens::revoke_session("bi-s5");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedding_is_read_from_the_capabilities_of_nexus_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let with = write(
+            "with",
+            r#"[ "$1" = --capabilities ] && echo '{"version":"0.5.1","tls":true,"obscura":true}'"#,
+        );
+        let without = write(
+            "without",
+            r#"echo '{"version":"0.5.1","tls":true,"obscura":false}'"#,
+        );
+        // An older nexus-tools: "unknown argument", exit 2.
+        let older = write("older", "echo 'unknown argument' >&2; exit 2");
+        assert!(embeds_obscura(&with).await);
+        assert!(!embeds_obscura(&without).await);
+        assert!(!embeds_obscura(&older).await);
+        assert!(!embeds_obscura(&dir.path().join("missing")).await);
+    }
+
     // ---- (5) the browser -----------------------------------------------------------------
 
     fn fake_obscura() -> (tempfile::TempDir, BrowserTools) {
@@ -2176,6 +2408,7 @@ mod tests {
             program: PathBuf::from("/opt/nexus/nexus-tools"),
             browser,
             obscura: None,
+            embedded_obscura: false,
             deny_paths: Vec::new(),
         };
         // Detected, not authorised.
