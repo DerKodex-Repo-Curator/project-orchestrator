@@ -9141,6 +9141,8 @@ mod permission_scopes {
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 lasting_rules_dir: Some(rules.path().join("rules")),
+                native_turn_timeout_secs: None,
+                native_session_max_tokens: None,
                 ..Default::default()
             };
             ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
@@ -9336,6 +9338,8 @@ mod permission_scopes {
                 jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
                 max_sessions: 10,
                 lasting_rules_dir: Some(rules.path().join("rules")),
+                native_turn_timeout_secs: None,
+                native_session_max_tokens: None,
                 ..Default::default()
             };
             ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
@@ -12472,6 +12476,8 @@ mod native_subagents {
             mcp_server_path: PathBuf::from("/nonexistent/mcp"),
             max_sessions: 20,
             lasting_rules_dir: Some(rules.path().join("rules")),
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
             ..Default::default()
         };
         // A native harness asks its permissions of the user (and takes their answers).
