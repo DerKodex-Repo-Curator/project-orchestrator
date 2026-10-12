@@ -78,6 +78,7 @@ impl Neo4jClient {
                     execution_place: $execution_place,
                     access: $access,
                     owner: $owner,
+                    mirror_of: $mirror_of,
                     shell_moved: false
                 })
                 WITH s
@@ -117,6 +118,7 @@ impl Neo4jClient {
                     execution_place: $execution_place,
                     access: $access,
                     owner: $owner,
+                    mirror_of: $mirror_of,
                     shell_moved: false
                 })
                 "#,
@@ -184,7 +186,8 @@ impl Neo4jClient {
                     )
                     .param("execution_place", session.execution_place.as_str())
                     .param("access", session.access.as_str())
-                    .param("owner", session.owner.clone().unwrap_or_default()),
+                    .param("owner", session.owner.clone().unwrap_or_default())
+                    .param("mirror_of", session.mirror_of.clone().unwrap_or_default()),
             )
             .await?;
 
@@ -1095,6 +1098,7 @@ impl Neo4jClient {
                 &node.get::<String>("access").unwrap_or_default(),
             ),
             owner: non_empty("owner"),
+            mirror_of: non_empty("mirror_of"),
         })
     }
 
