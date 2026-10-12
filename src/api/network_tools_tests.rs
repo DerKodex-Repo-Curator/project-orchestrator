@@ -18,6 +18,14 @@ use uuid::Uuid;
 const PROJECT: &str = "proj";
 
 async fn state_on(graph: Arc<MockGraphStore>) -> OrchestratorState {
+    state_on_with(graph, None).await
+}
+
+/// [`state_on`] with a chat manager (its nexus-tools decides whether the built-in engine exists).
+async fn state_on_with(
+    graph: Arc<MockGraphStore>,
+    chat_manager: Option<Arc<crate::chat::manager::ChatManager>>,
+) -> OrchestratorState {
     let app_state = mock_app_state_with_graph(graph);
     let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
     let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -26,7 +34,7 @@ async fn state_on(graph: Arc<MockGraphStore>) -> OrchestratorState {
     Arc::new(ServerState {
         orchestrator,
         watcher,
-        chat_manager: None,
+        chat_manager,
         event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
             crate::events::EventBus::default(),
         ))),
@@ -757,5 +765,82 @@ async fn a_nexus_tools_that_embeds_obscura_gives_a_keyless_websearch_by_default(
     assert!(
         !tools_of(&plain).iter().any(|t| t == "WebSearch"),
         "{plain:?}"
+    );
+}
+
+/// The built-in engine is LISTED by `GET /api/chat/search-engines` when the server's nexus-tools
+/// embeds Obscura (decision 1e9d7501): `obscura-builtin`, `builtin: true`, its origin not yet
+/// consented. A declared `obscura` engine replaces it, and a nexus-tools without the feature
+/// lists none.
+#[tokio::test]
+async fn the_engine_list_shows_the_built_in_obscura_only_when_nexus_tools_embeds_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let with_tools = |script: &'static str| async move {
+        let graph = Arc::new(MockGraphStore::new());
+        graph
+            .create_project(&test_project_named(PROJECT))
+            .await
+            .unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        let program = bin.path().join("nexus-tools");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = crate::chat::config::ChatConfig::from_env();
+        config.nexus_tools_path = Some(program);
+        let state = mock_app_state_with_graph(graph.clone());
+        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            config,
+        ));
+        (
+            create_router(state_on_with(graph, Some(manager)).await),
+            bin,
+        )
+    };
+
+    let embeds = "#!/bin/sh\n[ \"$1\" = --capabilities ] && echo '{\"version\":\"0.5.1\",\"tls\":true,\"obscura\":true}'\n";
+    let (app, _bin) = with_tools(embeds).await;
+    let (status, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let builtin = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "obscura-builtin")
+        .unwrap_or_else(|| panic!("the built-in engine is listed: {listed}"));
+    assert_eq!(builtin["builtin"], true, "{builtin}");
+    assert_eq!(builtin["engine"], "obscura", "{builtin}");
+
+    // A declared obscura engine replaces the built-in one.
+    let (status, body) = call(
+        &app,
+        human(
+            "POST",
+            ENGINES,
+            Some(json!({"id": "obscura", "engine": "obscura", "credential_ref": "none"})),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    let ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["obscura"], "{listed}");
+
+    // A nexus-tools without the feature: no built-in engine.
+    let (app, _bin) = with_tools("#!/bin/sh\necho '{\"version\":\"0.5.1\",\"tls\":true}'\n").await;
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == "obscura-builtin"),
+        "{listed}"
     );
 }
