@@ -10409,6 +10409,9 @@ impl ChatManager {
     /// logged: the live state still confines.
     pub async fn set_file_scope_lifted(&self, session_id: &str, lifted: bool) {
         crate::auth::agent_tokens::set_scope_lift_live(session_id, lifted);
+        // The same two places set and clear a person's choice of trust, which Rock'n roll's
+        // network gate reads (`trust_opens_network`).
+        crate::auth::agent_tokens::set_person_trust(session_id, lifted);
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             if let Err(e) = self
                 .graph
@@ -15224,7 +15227,7 @@ impl ChatManager {
         // The consent of the project and the revocation of the token are checked before ANY
         // other hook, and whether or not the session has the knowledge-graph hooks.
         if let Some(search_origins) = gate {
-            let mut access = super::provider::nexus_tools::ToolAccessHooks::new(
+            let mut gate_hooks = super::provider::nexus_tools::ToolAccessHooks::new(
                 spec.hooks.take(),
                 Arc::new(super::provider::nexus_tools::GraphConsents(
                     self.graph.clone(),
@@ -15241,47 +15244,51 @@ impl ChatManager {
                     .chain(gate_temp_dir)
                     .collect(),
             );
-            // Rock'n roll (trust) is autonomy: the network tools do not wait for a consent of the
-            // project, they tell the person what they reached (a public origin only).
+            // Rock'n roll is autonomy: a public origin lacking the project's consent is opened
+            // and the person is told. It opens the network of a session only when a PERSON put
+            // it in trust, with a normal access (the rule of the file-scope lift, decision
+            // fce98b8a): never the runner, a protocol executor, a delegated task or a session
+            // nobody owns, which run in `bypassPermissions` with nobody in front of them.
+            // `set_file_scope_lifted` keeps the flag live from there on.
+            crate::auth::agent_tokens::set_person_trust(
+                session_id,
+                super::provider::nexus_tools::lifts_file_scope(
+                    &spec.policy,
+                    access,
+                    file_scope_lifted,
+                ),
+            );
             if let Some(manager) = self.weak_self() {
-                let opened_in_trust = spec.policy.mode == nexus_claude::agent::PolicyMode::Trust;
-                let (probe_manager, probe_session) = (manager.clone(), session_id.to_owned());
+                let probe_session = session_id.to_owned();
                 let in_trust: super::provider::nexus_tools::TrustProbe = Arc::new(move || {
-                    let Some(manager) = probe_manager.upgrade() else {
-                        return false;
-                    };
-                    let live = manager
-                        .agent_modes
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&probe_session)
-                        .cloned();
-                    // The mode set while the session runs wins; without one, the opening mode.
-                    match live {
-                        Some(mode) => {
-                            super::provider::policy::parse_mode(&mode).is_some_and(|pair| {
-                                pair.neutral == nexus_claude::agent::PolicyMode::Trust
-                            })
-                        }
-                        None => opened_in_trust,
-                    }
+                    super::provider::nexus_tools::trust_opens_network(
+                        access,
+                        crate::auth::agent_tokens::person_trust(&probe_session)
+                            && !crate::auth::agent_tokens::is_out_of_trust(&probe_session),
+                    )
                 });
                 let notice_session = session_id.to_owned();
                 let notice: super::provider::nexus_tools::TrustNotice =
                     Arc::new(move |content: String| {
                         let (manager, session_id) = (manager.clone(), notice_session.clone());
-                        tokio::spawn(async move {
-                            let Some(manager) = manager.upgrade() else {
-                                return;
-                            };
-                            if let Some(handle) = manager.agent_runtime.get(&session_id).await {
+                        Box::pin(async move {
+                            // Bounded: the call waits for the notice, never for ever.
+                            let delivered = async {
+                                let manager = manager.upgrade()?;
+                                let handle = manager.agent_runtime.get(&session_id).await?;
                                 handle.emit(ChatEvent::SystemHint { content }).await;
-                            }
-                        });
+                                Some(())
+                            };
+                            matches!(
+                                tokio::time::timeout(std::time::Duration::from_secs(2), delivered)
+                                    .await,
+                                Ok(Some(()))
+                            )
+                        })
                     });
-                access = access.with_trust(in_trust, notice);
+                gate_hooks = gate_hooks.with_trust(in_trust, notice);
             }
-            spec.hooks = Some(Arc::new(access));
+            spec.hooks = Some(Arc::new(gate_hooks));
         }
         Ok(spec)
     }
