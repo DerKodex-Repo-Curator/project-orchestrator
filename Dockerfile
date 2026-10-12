@@ -43,7 +43,7 @@ RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
 # Trixie (Debian 13) provides glibc 2.40, required because ort-sys prebuilt
 # ONNX Runtime binaries reference __isoc23_* symbols (glibc ≥ 2.38).
 # Bookworm (glibc 2.36) fails with "undefined symbol: __isoc23_strtoll".
-FROM rust:1.98-trixie AS builder
+FROM rust:1.99-trixie AS builder
 
 WORKDIR /app
 
@@ -123,7 +123,7 @@ RUN cargo build --release
 # =============================================================================
 # Built at the nexus revision Cargo.toml pins, with https (`--features tls`), by the same script as
 # the release archives and the CI. Its own stage: it only reruns when Cargo.toml changes.
-FROM rust:1.98-trixie AS nexus-tools-builder
+FROM rust:1.99-trixie AS nexus-tools-builder
 WORKDIR /src
 COPY Cargo.toml ./
 COPY scripts/build-nexus-tools.sh ./scripts/
@@ -139,8 +139,8 @@ FROM debian:trixie-slim AS runtime
 # OCI labels
 LABEL org.opencontainers.image.source="https://github.com/this-rs/project-orchestrator"
 LABEL org.opencontainers.image.description="AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter"
-LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.vendor="OpenClaw"
+LABEL org.opencontainers.image.licenses="MIT AND BUSL-1.1"
+LABEL org.opencontainers.image.vendor="FFS SASU"
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -155,6 +155,11 @@ COPY --from=builder /app/target/release/orch /app/orch
 COPY --from=builder /app/target/release/mcp_server /app/mcp_server
 # nexus-tools NEXT TO the server: it finds it there (NEXUS_TOOLS_PATH overrides)
 COPY --from=nexus-tools-builder /opt/nexus-tools/bin/nexus-tools /app/nexus-tools
+
+# Our license and the third-party notices of the binaries (scripts/third-party-licenses.sh). The release
+# puts THIRD-PARTY-LICENSES.txt in the build context; the wildcard lets a local build without it go on
+# (that image then carries our LICENSE files only).
+COPY LICENSE LICENSE-MIT LICENSE-EE THIRD-PARTY-LICENSES.tx[t] /app/licenses/
 
 # Copy tree-sitter queries if they exist (optional)
 COPY querie[s] ./queries/

@@ -5,6 +5,8 @@ edition = "2021"
 description = "Project Orchestrator — Desktop application"
 authors = ["Elun <contact@ffs.holdings>"]
 license = "MIT AND BUSL-1.1"
+# First-party: not published, and skipped by the third-party notices (about.toml, private.ignore).
+publish = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -39,7 +41,7 @@ serde_yaml = "0.9"
 rand = "0.10"
 
 # Platform directories (config path)
-dirs = "6"
+dirs = "7"
 
 # Docker management
 bollard = "0.21"
@@ -59,7 +61,7 @@ tauri-plugin-websocket = "2"
 
 # macOS native rounded corners
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa = "0.26"
+cocoa = "0.27"
 objc = "0.2"
 
 [features]
