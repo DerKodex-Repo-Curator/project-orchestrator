@@ -124,6 +124,17 @@ fn issuer(state: &OrchestratorState) -> String {
     state
         .public_url
         .clone()
+        // Backward compat: many configs expose the public origin via
+        // `auth.frontend_url` instead of `server.public_url` (see
+        // `allowed_origins()`). The issuer must agree with the origin the
+        // frontend actually uses, otherwise OAuth discovery falls back to
+        // http://localhost and remote clients can only reach the server there.
+        .or_else(|| {
+            state
+                .auth_config
+                .as_ref()
+                .and_then(|a| a.frontend_url.clone())
+        })
         .unwrap_or_else(|| format!("http://localhost:{}", state.server_port))
         .trim_end_matches('/')
         .to_string()

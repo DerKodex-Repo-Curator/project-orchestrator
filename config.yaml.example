@@ -26,6 +26,10 @@
 server:
   port: 8080                    # SERVER_PORT env override
   workspace_path: "."           # WORKSPACE_PATH env override
+  # Public URL of this server (e.g. https://po.ffs.dev), used when the server is
+  # exposed behind a reverse proxy on a public domain. Single source of truth for
+  # the OAuth issuer, /.well-known/oauth-* metadata and the /mcp resource URL.
+  # public_url: "https://po.ffs.dev"   # PUBLIC_URL env override
   # Serve the frontend React app as static files (default: true)
   # Set to false for API-only mode (equivalent to --no-frontend CLI flag)
   serve_frontend: true          # SERVE_FRONTEND env override
