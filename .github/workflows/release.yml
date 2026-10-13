@@ -495,7 +495,14 @@ jobs:
   # ==========================================================================
   package-deb:
     name: Package .deb (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (NOT ubuntu-latest), matching build-backend: `cargo deb
+    # --no-build` runs dpkg-shlibdeps on the packaging host to resolve
+    # `depends = "$auto"`. On ubuntu-latest (now 24.04) it resolves the shared
+    # libraries of the 22.04-built binaries against 24.04's package database —
+    # notably libssl.so.3 → libssl3t64 (the 24.04 time_t-transition name) — and
+    # emits a .deb whose Depends cannot be satisfied on Ubuntu 22.04/20.04
+    # (DGX OS 6/5), so `dpkg -i`/`apt install` fails before the binary ever runs.
+    runs-on: ubuntu-22.04
     needs: [build-backend]
     if: always()
     strategy:
@@ -593,7 +600,11 @@ jobs:
   # ==========================================================================
   package-rpm:
     name: Package .rpm (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (NOT ubuntu-latest), matching build-backend: the binaries
+    # are compiled on 22.04, so cargo-generate-rpm's dependency auto-detection
+    # must run against 22.04's package database too, not 24.04's (the time_t-
+    # transition names like libssl3t64 do not exist on Ubuntu 22.04/20.04).
+    runs-on: ubuntu-22.04
     needs: [build-backend]
     if: always()
     strategy:
