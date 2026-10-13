@@ -177,7 +177,24 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
 /// `*.js`/`*.css` request makes the browser fail module loading with a cryptic
 /// "MIME type text/html" error that hides the real "frontend out of sync" cause.
 pub(crate) fn is_static_asset(path: &str) -> bool {
-    path.starts_with("assets/") || std::path::Path::new(path).extension().is_some()
+    if path.starts_with("assets/") {
+        return true;
+    }
+    // Known static file extensions (favicon, manifest, fonts, images, wasm…).
+    // Deliberately NOT "any extension": SPA routes can legitimately contain dots
+    // (e.g. /projects/my.repo, /user/john.doe) and must fall back to index.html,
+    // not 404.
+    const STATIC_EXT: &[&str] = &[
+        "js", "mjs", "css", "map", "wasm",
+        "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif",
+        "woff", "woff2", "ttf", "otf", "eot",
+        "webmanifest", "xml", "txt", "json",
+    ];
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| STATIC_EXT.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
 }
 
 /// Build CORS layer with credentials support for cookie-based auth.
@@ -2178,6 +2195,22 @@ fn protected_routes() -> Router<OrchestratorState> {
 mod tests {
     use super::*;
     use crate::events::EventBus;
+
+    #[test]
+    fn static_assets_detected_but_spa_routes_with_dots_are_not() {
+        // Vite hashed assets and known static files are assets (404 when missing).
+        assert!(is_static_asset("assets/index-abc.js"));
+        assert!(is_static_asset("favicon.ico"));
+        assert!(is_static_asset("site.webmanifest"));
+        assert!(is_static_asset("assets/logo-123.svg"));
+        // Extension-less SPA routes fall back to index.html.
+        assert!(!is_static_asset("login"));
+        assert!(!is_static_asset("projects/my-org/my-app"));
+        // SPA routes with a dot must NOT be treated as static assets.
+        assert!(!is_static_asset("projects/my.repo"));
+        assert!(!is_static_asset("user/john.doe"));
+    }
+
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_auth_config};
     use axum::body::Body;
