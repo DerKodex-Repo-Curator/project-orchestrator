@@ -47,6 +47,16 @@ pub async fn serve_embedded(uri: Uri) -> impl IntoResponse {
         if let Some(file) = FrontendAssets::get(path) {
             return serve_file(path, &file.data);
         }
+        // A missing static asset must 404 — serving index.html here would
+        // return text/html for a *.js/*.css request and the browser rejects it
+        // (Strict MIME checking), masking the real "frontend out of sync" cause
+        // as a cryptic module-load failure.
+        if crate::api::routes::is_static_asset(path) {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("Not found"))
+                .unwrap();
+        }
     }
 
     // Fallback to index.html for SPA routing
@@ -88,6 +98,16 @@ fn serve_file(path: &str, data: &[u8]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing static asset must 404, not fall back to index.html: serving
+    /// index.html (text/html) for a *.js request makes the browser fail module
+    /// loading with "MIME type text/html", masking the real frontend mismatch.
+    #[tokio::test]
+    async fn missing_static_asset_returns_404_not_index() {
+        let uri: Uri = "/assets/definitely-missing-abc.js".parse().unwrap();
+        let resp = serve_embedded(uri).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 
     /// Regression test: intelligence dashboard grids must NOT use inline
     /// `gridTemplateColumns: repeat(auto-fill, minmax(...))` which overflows

@@ -47,7 +47,7 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 #[cfg(not(feature = "embedded-frontend"))]
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 /// Create the API router with public + protected route groups.
@@ -121,7 +121,37 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
         // Uses `fallback()` (not `not_found_service()`) to preserve 200 status
         // on SPA routes — `not_found_service` would force 404 on every fallback.
         let index_path = format!("{}/index.html", state.frontend_path);
-        let serve_dir = ServeDir::new(&state.frontend_path).fallback(ServeFile::new(index_path));
+
+        // SPA fallback: serve index.html for client-side routes, but 404 for a
+        // missing static asset. Serving index.html (text/html) for a *.js/*.css
+        // request makes the browser fail module loading with a cryptic "MIME type
+        // text/html" error that hides the real "frontend out of sync" cause.
+        let fallback = tower::service_fn(move |req: axum::http::Request<axum::body::Body>| {
+            let index_path = index_path.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let path = req.uri().path().trim_start_matches('/').to_string();
+                if is_static_asset(&path) {
+                    return Ok::<_, std::convert::Infallible>(
+                        (axum::http::StatusCode::NOT_FOUND, "Not found").into_response(),
+                    );
+                }
+                match tokio::fs::read(&index_path).await {
+                    Ok(data) => Ok::<_, std::convert::Infallible>(
+                        axum::response::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header(axum::http::header::CONTENT_TYPE, "text/html")
+                            .body(axum::body::Body::from(data))
+                            .unwrap(),
+                    ),
+                    Err(_) => Ok::<_, std::convert::Infallible>(
+                        (axum::http::StatusCode::NOT_FOUND, "Frontend not found").into_response(),
+                    ),
+                }
+            }
+        });
+
+        let serve_dir = ServeDir::new(&state.frontend_path).fallback(fallback);
 
         // Prevent stale caching: WKWebView (Tauri desktop) aggressively caches
         // HTTP responses using heuristic expiration when no Cache-Control is set.
@@ -139,6 +169,15 @@ fn attach_frontend(router: Router, state: &OrchestratorState) -> Router {
     } else {
         router
     }
+}
+
+/// True when a request path targets a static file (JS/CSS/font/image/manifest…)
+/// rather than a client-side SPA route. Missing static assets must return 404,
+/// not the index.html SPA fallback: serving index.html (text/html) for a
+/// `*.js`/`*.css` request makes the browser fail module loading with a cryptic
+/// "MIME type text/html" error that hides the real "frontend out of sync" cause.
+pub(crate) fn is_static_asset(path: &str) -> bool {
+    path.starts_with("assets/") || std::path::Path::new(path).extension().is_some()
 }
 
 /// Build CORS layer with credentials support for cookie-based auth.
