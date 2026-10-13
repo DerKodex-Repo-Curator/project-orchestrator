@@ -57,7 +57,7 @@ def main():
     measure('po-project',lambda:http(api+'/api/projects/po-self'),report)
     measure('cbm-before',lambda:command('cbm',['codebase-memory-mcp','cli','--json','list_projects']),report)
     measure('cbm-index',lambda:command('cbm',['codebase-memory-mcp','cli','--json','index_repository','--repo-path','/workspace/po','--name','po','--mode','full']),report)
-    measure('cbm-projects',lambda:command('cbm',['codebase-memory-mcp','cli','--json','list_projects']),report)
+    measure('cbm-projects',lambda:command('cbm',['codebase-memory-mcp','cli','--json','list_projects','--detail','stats','--format','json']),report)
     measure('reader-index',lambda:command('reader',['python3','/opt/reader/code_reader.py','index',json.dumps({'project':'po','root':'/workspace/po'})]),report)
     # Meilisearch index writes are asynchronous. Wait for its outstanding tasks.
     env=dict(line.split('=',1) for line in (BASE/'.env').read_text().splitlines() if '=' in line)
@@ -74,8 +74,9 @@ def main():
         measure('po-callers-'+symbol,lambda q=q:http(api+'/api/code/callgraph?'+q),report)
         q=urllib.parse.urlencode({'query':symbol,'project_slug':'po-self','limit':5})
         measure('po-search-'+symbol,lambda q=q:http(api+'/api/code/search?'+q),report)
-        measure('cbm-search-'+symbol,lambda symbol=symbol:command('cbm',['codebase-memory-mcp','cli','--json','search_graph','--project','po','--name-pattern','^'+symbol+'$','--label','Function']),report)
-        measure('cbm-callers-'+symbol,lambda symbol=symbol:command('cbm',['codebase-memory-mcp','cli','--json','trace_path','--project','po','--function-name',symbol,'--direction','inbound']),report)
+        # Methods and free functions have different CBM labels; do not exclude methods.
+        measure('cbm-search-'+symbol,lambda symbol=symbol:command('cbm',['codebase-memory-mcp','cli','--json','search_graph','--project','po','--name-pattern','^'+symbol+'$','--format','json']),report)
+        measure('cbm-callers-'+symbol,lambda symbol=symbol:command('cbm',['codebase-memory-mcp','cli','--json','trace_path','--project','po','--function-name',symbol,'--direction','inbound','--depth','1','--include-tests','true','--format','json']),report)
         measure('reader-callers-'+symbol,lambda symbol=symbol:command('reader',['python3','/opt/reader/code_reader.py','calls',json.dumps({'project':'po','name':symbol,'limit':100,'include_tests':True})]),report)
     headers={'Authorization':'Basic '+base64.b64encode(('neo4j:'+env['NEO4J_PASSWORD']).encode()).decode()}
     pid=project['id']
@@ -84,6 +85,16 @@ def main():
         {'statement':'MATCH (f:File {project_id:$pid})-[:CONTAINS]->(s) RETURN labels(s) AS labels,count(s) AS count','parameters':{'pid':pid}},
         {'statement':'MATCH (f:File {project_id:$pid})-[:CONTAINS]->(:Function)-[r:CALLS]->() RETURN count(r) AS calls','parameters':{'pid':pid}}]
     measure('po-graph-counts',lambda:http('http://127.0.0.1:17474/db/neo4j/tx/commit',{'statements':statements},headers),report)
+    manager='/workspace/po/src/chat/manager.rs'
+    measure('po-file-symbols',lambda:http(api+'/api/code/symbols/'+urllib.parse.quote(manager,safe='')),report)
+    measure('cbm-file-outline',lambda:command('cbm',['codebase-memory-mcp','cli','--json','get_file_outline','--project','po','--file-path','src/chat/manager.rs','--limit','15','--format','json']),report)
+    measure('cbm-code-snippet',lambda:command('cbm',['codebase-memory-mcp','cli','--json','get_code_snippet','--project','po','--qualified-name','po.src.chat.manager.ChatManager.with_cognitive_routing','--source-mode','full','--max-lines','40','--max-output-tokens','1000','--format','json']),report)
+    measure('cbm-coverage',lambda:command('cbm',['codebase-memory-mcp','cli','--json','check_index_coverage','--project','po','--paths','["src/chat/manager.rs","src/lib.rs","crates/neural-routing-runtime/src/dual_track.rs"]','--format','json']),report)
+    measure('po-architecture',lambda:http(api+'/api/code/architecture?project_slug=po-self'),report)
+    marker='INDEX_COMPARISON_FIXTURE: check qualified Self:: calls before concluding that a function has no callers.'
+    measure('po-note-create',lambda:http(api+'/api/notes',{'project_id':pid,'note_type':'context','content':marker,'tags':['index-comparison-fixture'],'anchors':[{'entity_type':'file','entity_id':manager}]}),report)
+    q=urllib.parse.urlencode({'entity_type':'file','entity_id':manager})
+    measure('po-note-context',lambda:http(api+'/api/notes/context?'+q),report)
     (OUT/'summary.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     print('Raw results saved under results/. No automated winner is inferred.')
 if __name__=='__main__': main()

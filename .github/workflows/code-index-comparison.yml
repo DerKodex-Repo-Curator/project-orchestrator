@@ -55,6 +55,12 @@ jobs:
           po=json.loads(Path('results/po-index.json').read_text())['result']
           assert po.get('files_synced',0)>0,po
           assert po.get('errors',0)==0,po
+          cbm=json.loads(Path('results/cbm-index.json').read_text())['result']
+          data=cbm.get('structuredContent') or json.loads(cbm['content'][0]['text'])
+          assert data.get('status')=='indexed' and data.get('nodes',0)>0,data
+          note=json.loads(Path('results/po-note-context.json').read_text())
+          assert note['status']=='ok',note
+          assert 'INDEX_COMPARISON_FIXTURE' in json.dumps(note['result']),note
           print(json.dumps(summary,indent=2))
           PY
       - name: Capture diagnostics

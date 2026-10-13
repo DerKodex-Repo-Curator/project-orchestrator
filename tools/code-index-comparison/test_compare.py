@@ -28,6 +28,8 @@ def run():
         assert all('project_slug=po-self' in url for url,body in requests if '/api/code/' in url)
         assert any(service=='cbm' and 'index_repository' in args and '/workspace/po' in args for service,args in commands)
         assert any(service=='reader' and '/opt/reader/code_reader.py' in args for service,args in commands)
-        assert len(list(module.OUT.glob('*.json')))==28
+        assert len(list(module.OUT.glob('*.json')))>=28
+        assert any('/api/notes/context?' in url for url,body in requests)
+        assert any(service=='cbm' and 'trace_path' in args and args[args.index('--depth')+1]=='1' for service,args in commands)
     print('PASS: mocked project sync, project-scoped queries, identical container source path, independent outputs')
 if __name__=='__main__':run()

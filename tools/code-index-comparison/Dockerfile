@@ -26,4 +26,6 @@ RUN set -eu; \
 COPY reader /opt/reader
 RUN python3 -m pip install --break-system-packages --target /opt/reader/python -r /opt/reader/requirements.txt
 WORKDIR /app
+# This exact bind-mounted checkout is created and pinned by prepare.py.
+RUN git config --system --add safe.directory /workspace/po
 CMD ["sleep", "infinity"]
