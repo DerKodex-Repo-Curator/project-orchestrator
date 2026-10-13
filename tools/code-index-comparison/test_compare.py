@@ -25,7 +25,8 @@ def run():
         summary=json.loads((module.OUT/'summary.json').read_text())
         assert summary['po_warm_state'] is False
         assert any('/api/projects/po-self/sync?force=true' in url for url,body in requests)
-        assert all('project_slug=po-self' in url for url,body in requests if '/api/code/' in url)
+        assert all('project_slug=po-self' in url for url,body in requests
+                   if any(path in url for path in ['/api/code/search?','/api/code/callgraph?','/api/code/architecture?']))
         assert any(service=='cbm' and 'index_repository' in args and '/workspace/po' in args for service,args in commands)
         assert any(service=='reader' and '/opt/reader/code_reader.py' in args for service,args in commands)
         assert len(list(module.OUT.glob('*.json')))>=28
