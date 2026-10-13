@@ -33,7 +33,7 @@ services:
   po:
     image: po-code-comparison-tools:local
     build: .
-    command: ["orchestrator", "serve", "--port", "8080", "--no-frontend"]
+    command: ["orchestrator", "--config", "/app/config.yaml", "serve", "--port", "8080", "--no-frontend"]
     environment:
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
@@ -45,15 +45,17 @@ services:
       WORKSPACE_PATH: /workspace
       SERVE_FRONTEND: 'false'
       RUST_LOG: info
+      HTTP_REQUEST_TIMEOUT_SECS: '1800'
     ports: ["127.0.0.1:18080:8080"]
     volumes:
       - ./sources/po:/workspace/po:ro
+      - ./config.yaml:/app/config.yaml:ro
       - po-data:/data
     depends_on:
       neo4j: {condition: service_healthy}
       meilisearch: {condition: service_healthy}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null && curl -fsS 'http://localhost:8080/api/projects?limit=1' >/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 60
