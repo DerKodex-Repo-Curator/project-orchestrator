@@ -349,6 +349,11 @@ assets = [
     { source = "target/release/orch", dest = "/usr/bin/orch", mode = "755" },
     { source = "target/release/mcp_server", dest = "/usr/bin/orchestrator-mcp", mode = "755" },
     { source = "target/release/nexus-tools", dest = "/usr/bin/nexus-tools", mode = "755" },
+    # aarch64 links ONNX Runtime dynamically (ORT_PREFER_DYNAMIC_LINK=1): the runtime
+    # must ship next to the binary ($ORIGIN rpath). The release copies these for
+    # aarch64 only; `missingok` skips them on x86_64 (statically linked).
+    { source = "target/release/libonnxruntime.so.1", dest = "/usr/bin/libonnxruntime.so.1", mode = "644", config = "missingok" },
+    { source = "target/release/libonnxruntime_providers_shared.so", dest = "/usr/bin/libonnxruntime_providers_shared.so", mode = "644", config = "missingok" },
     { source = "config.yaml.example", dest = "/etc/project-orchestrator/config.yaml.example", mode = "644", config = "noreplace" },
     { source = "packaging/debian/project-orchestrator.service", dest = "/lib/systemd/system/project-orchestrator.service", mode = "644" },
     { source = "packaging/debian/docker-compose.services.yml", dest = "/etc/project-orchestrator/docker-compose.services.yml", mode = "644" },

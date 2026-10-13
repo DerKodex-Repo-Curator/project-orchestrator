@@ -680,6 +680,14 @@ jobs:
           chmod +x target/${{ matrix.target }}/release/*
           # The third-party notices, from the archive (Cargo.toml packages them from target/release/).
           cp "artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" "target/${{ matrix.target }}/release/THIRD-PARTY-LICENSES.txt"
+          # aarch64 links ONNX Runtime dynamically: the archive ships libonnxruntime*.so
+          # next to the binaries. Dereference the versioned symlink into stable real
+          # files so the generate-rpm assets (missingok) can package them next to the
+          # binary ($ORIGIN).
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime.so.1" "target/${{ matrix.target }}/release/libonnxruntime.so.1"
+            cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime_providers_shared.so" "target/${{ matrix.target }}/release/libonnxruntime_providers_shared.so"
+          fi
 
       - name: Build .rpm package
         run: cargo generate-rpm --target ${{ matrix.target }}
