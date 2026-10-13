@@ -185,10 +185,28 @@ pub(crate) fn is_static_asset(path: &str) -> bool {
     // (e.g. /projects/my.repo, /user/john.doe) and must fall back to index.html,
     // not 404.
     const STATIC_EXT: &[&str] = &[
-        "js", "mjs", "css", "map", "wasm",
-        "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif",
-        "woff", "woff2", "ttf", "otf", "eot",
-        "webmanifest", "xml", "txt", "json",
+        "js",
+        "mjs",
+        "css",
+        "map",
+        "wasm",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "svg",
+        "ico",
+        "webp",
+        "avif",
+        "woff",
+        "woff2",
+        "ttf",
+        "otf",
+        "eot",
+        "webmanifest",
+        "xml",
+        "txt",
+        "json",
     ];
     std::path::Path::new(path)
         .extension()
