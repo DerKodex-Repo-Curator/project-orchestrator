@@ -108,18 +108,23 @@ impl Fingerprint {
         self.0.iter().map(String::as_str)
     }
 
-    /// Jaccard distance to `other`, in permille: 0 = same set, 1000 = nothing in common.
-    /// Two empty sets are at distance 0 (no evidence is no difference). The similarity is
-    /// rounded DOWN, so the distance is rounded up: a borderline pair counts as farther.
+    /// Distance of `other` (a turn) from `self` (the accumulated segment), in
+    /// permille: the share of the turn's labels the segment does not already know.
+    /// `0` = every label already known (no new direction), `1000` = nothing in
+    /// common. The share is rounded UP, so a borderline turn counts as farther.
+    ///
+    /// This is asymmetric on purpose: `self` is the segment (an accumulated union,
+    /// up to [`MAX_FINGERPRINT_LABELS`] labels) and `other` is a single turn. A
+    /// symmetric measure such as Jaccard would penalise a turn that is a strict
+    /// subset of the segment for the segment's size, and over-segment once the
+    /// segment has absorbed enough labels. An empty turn is no evidence (distance 0).
     pub fn distance_permille(&self, other: &Self) -> u16 {
-        let common = self.0.intersection(&other.0).count();
-        let total = self.0.len() + other.0.len() - common;
-        if total == 0 {
+        if other.0.is_empty() {
             return 0;
         }
-        let similarity = common * usize::from(PERMILLE_MAX) / total;
-        let similarity = u16::try_from(similarity).unwrap_or(PERMILLE_MAX);
-        PERMILLE_MAX - similarity.min(PERMILLE_MAX)
+        let new = other.0.difference(&self.0).count();
+        let novelty = new * usize::from(PERMILLE_MAX);
+        u16::try_from(novelty.div_ceil(other.0.len())).unwrap_or(PERMILLE_MAX)
     }
 
     /// Adds `other`'s labels, up to [`MAX_FINGERPRINT_LABELS`].
@@ -555,13 +560,27 @@ mod tests {
     }
 
     #[test]
-    fn distance_is_jaccard_in_permille() {
+    fn distance_is_the_share_of_new_labels_in_permille() {
+        // `self` is the accumulated segment, `other` the turn being placed; the
+        // distance is the share of the turn's labels the segment does not know,
+        // rounded up (a borderline turn counts as farther).
         assert_eq!(fp(&["a", "b"]).distance_permille(&fp(&["a", "b"])), 0);
         assert_eq!(fp(&["a"]).distance_permille(&fp(&["b"])), 1_000);
-        // 1 label in common out of 3 distinct: similarity 333 (rounded down) -> 667.
-        assert_eq!(fp(&["a", "b"]).distance_permille(&fp(&["b", "c"])), 667);
+        // One new label out of two: 500 — not symmetric Jaccard's 667.
+        assert_eq!(fp(&["a", "b"]).distance_permille(&fp(&["b", "c"])), 500);
+        // A turn fully contained in the segment adds no new direction.
+        assert_eq!(fp(&["a", "b", "c"]).distance_permille(&fp(&["a", "b"])), 0);
+        // A turn that is a superset is measured by how much it adds: 2 of 4 new.
+        assert_eq!(
+            fp(&["a", "b"]).distance_permille(&fp(&["a", "b", "c", "d"])),
+            500
+        );
+        // Rounded up: 2 new labels out of 3 -> 667.
+        assert_eq!(fp(&["a"]).distance_permille(&fp(&["a", "b", "c"])), 667);
         // Two empty sets say nothing: not a difference.
         assert_eq!(fp(&[]).distance_permille(&fp(&[])), 0);
+        // An empty segment cannot know any turn: fully new.
+        assert_eq!(fp(&[]).distance_permille(&fp(&["a"])), 1_000);
     }
 
     #[test]
@@ -810,5 +829,67 @@ mod tests {
         assert_eq!(json["at_turn"], 1);
         let back: Boundary = serde_json::from_value(json).unwrap();
         assert_eq!(&back, &segmenter.boundaries()[0]);
+    }
+
+    #[test]
+    fn a_fully_contained_turn_is_at_distance_zero() {
+        // Metric-level pin of the fix: a turn whose labels are all already in the
+        // segment adds no new direction, so its distance is 0 no matter how many
+        // labels the segment has absorbed (up to the cap). This is the property
+        // that keeps the segmenter from over-segmenting as a segment grows.
+        let all: Vec<String> = (0..MAX_FINGERPRINT_LABELS)
+            .map(|i| format!("l{i:02}"))
+            .collect();
+        let turn = Fingerprint::new(["l00", "l01", "l02"]);
+        for grown in turn.labels().count()..=MAX_FINGERPRINT_LABELS {
+            let segment = Fingerprint::new(all.iter().take(grown).cloned());
+            assert_eq!(
+                segment.distance_permille(&turn),
+                0,
+                "a fully contained turn must be at distance 0 (grown={grown})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_contained_turn_stays_inside_however_large_the_segment() {
+        // Integration pin of the over-segmentation fix: grow a Topic segment well
+        // past the 10-label cliff where symmetric Jaccard used to break, then feed
+        // two consecutive turns that only repeat labels the segment already knows.
+        // Neither may open a boundary — they add no new direction.
+        //
+        // Each turn brings one new label alongside a shared "core" label, so its
+        // novelty is 500 permille (under the Topic threshold of 700) and the
+        // segment absorbs it: after 20 turns it holds 21 labels.
+        let mut segmenter = Segmenter::new(SegmentPolicy::default(), 7);
+        for turn in 0..20u32 {
+            let labels = ["core".to_string(), format!("l{turn}")];
+            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let observation = obs(turn, &[(Dimension::Topic, labels.as_slice())]);
+            assert!(
+                segmenter.observe(&observation).unwrap().is_empty(),
+                "growing the segment must not open a boundary (turn={turn})"
+            );
+        }
+        assert_eq!(
+            segmenter
+                .current(Dimension::Topic)
+                .unwrap()
+                .fingerprint
+                .labels()
+                .count(),
+            21
+        );
+        // Two turns that only repeat known labels: no boundary.
+        for turn in 20..22u32 {
+            assert!(
+                segmenter
+                    .observe(&topic(turn, &["core", "l0", "l1"]))
+                    .unwrap()
+                    .is_empty(),
+                "a fully contained turn must not open a boundary (turn={turn})"
+            );
+        }
+        assert!(segmenter.boundaries().is_empty());
     }
 }
