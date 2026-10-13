@@ -47,11 +47,16 @@ traitement ne sont pas équivalents à ceux de PO. Les résultats ne prouvent pa
 équivalence de recherche sémantique. Les durées incluent les transports et le
 démarrage des commandes. Une seule exécution n'est pas un benchmark statistique.
 
-Les requêtes portent sur with_cognitive_routing, set_inference_engine,
+Les requêtes portent sur with_cognitive_routing, decision_confidence,
 build_enrichment_pipeline et close_decision_with. Inspecter les fichiers de preuve :
 un résultat vide ne démontre pas l'absence d'un appel, notamment dans des macros.
 Le nombre d'arêtes résolues n'est pas comparable directement au nombre de sites
 d'appel syntaxiques. Les tailles sont en octets UTF-8, pas en tokens mesurés.
+
+La vérité terrain des call sites (grep sur cfb58ee2, 13/10/2026) est dans
+`ground-truth.json` : 12, 7, 3 et 3 sites pour ces quatre symboles. C'est la
+référence du LECTEUR (syntaxe) ; PO (`CALLS`) et CBM (graphe) résolvent des
+arêtes et peuvent rester en dessous sans être faux.
 
 Une seconde exécution conserve les volumes et devient une expérience avec des
 états préexistants ; le rapport enregistre l'état PO avant la synchronisation et

@@ -32,9 +32,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Check scripts and prepare pinned source
         run: |
-          python3 -m py_compile prepare.py compare.py test_compare.py
+          python3 -m py_compile prepare.py compare.py test_compare.py report.py report_test.py
           bash -n run.sh
           python3 test_compare.py
+          python3 report_test.py
           python3 prepare.py
           python3 - <<'PY'
           from pathlib import Path
@@ -44,6 +45,9 @@ jobs:
           PY
       - name: Run real container indexes and queries
         run: bash run.sh
+      - name: Generate aligned report
+        if: always()
+        run: python3 report.py
       - name: Require usable indexes
         run: |
           python3 - <<'PY'

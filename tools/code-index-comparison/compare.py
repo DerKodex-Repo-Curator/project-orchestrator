@@ -4,7 +4,7 @@ import base64,json,select,subprocess,time,urllib.error,urllib.parse,urllib.reque
 from pathlib import Path
 BASE=Path(__file__).resolve().parent
 OUT=BASE/'results'
-SYMBOLS=['with_cognitive_routing','set_inference_engine','build_enrichment_pipeline','close_decision_with']
+SYMBOLS=list(json.loads((BASE/'ground-truth.json').read_text())['symbols'].keys())
 CBM_CLIENT=None
 
 class McpClient:
