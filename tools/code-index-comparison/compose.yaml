@@ -62,6 +62,7 @@ services:
       start_period: 30s
   cbm:
     image: po-code-comparison-tools:local
+    init: true
     working_dir: /workspace/po
     environment:
       CBM_ALLOWED_ROOT: /workspace
@@ -70,6 +71,7 @@ services:
       - cbm-data:/root/.cache/codebase-memory-mcp
   reader:
     image: po-code-comparison-tools:local
+    init: true
     volumes:
       - ./sources/po:/workspace/po:ro
 volumes:
