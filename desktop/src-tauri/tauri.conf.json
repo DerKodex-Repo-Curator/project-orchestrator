@@ -54,6 +54,11 @@
     "homepage": "https://github.com/this-rs/project-orchestrator",
     "shortDescription": "AI Agent Orchestrator with Knowledge Graph",
     "longDescription": "Project Orchestrator is an AI agent orchestrator with Neo4j knowledge graph, Meilisearch semantic search, and Tree-sitter code parsing. It provides a REST API, WebSocket events, and an embedded React frontend.",
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libayatana-appindicator3-1"]
+      }
+    },
     "macOS": {
       "entitlements": "entitlements.plist",
       "minimumSystemVersion": "10.15"
