@@ -1,5 +1,5 @@
 """Mocked orchestration checks only: this test does not start Docker or index code."""
-import contextlib,io,importlib.util,json,tempfile
+import contextlib,io,importlib.util,json,sys,tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,6 +30,16 @@ def run():
         assert any(service=='cbm' and 'index_repository' in args and '/workspace/po' in args for service,args in commands)
         assert any(service=='reader' and '/opt/reader/code_reader.py' in args for service,args in commands)
         assert len(list(module.OUT.glob('*.json')))>=28
+        fake=module.BASE/'fake_mcp.py'
+        fake.write_text('''import json,sys
+for line in sys.stdin:
+ r=json.loads(line)
+ if 'id' in r:
+  print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':{'ok':True}}),flush=True)
+''')
+        client=module.McpClient([sys.executable,str(fake)],module.BASE/'mcp.log')
+        try:assert client.request('tools/call',{'name':'stats','arguments':{}})=={'ok':True}
+        finally:client.close()
         assert any('/api/notes/context?' in url for url,body in requests)
         assert any(service=='cbm' and 'trace_path' in args and args[args.index('--depth')+1]=='1' for service,args in commands)
     print('PASS: mocked project sync, project-scoped queries, identical container source path, independent outputs')

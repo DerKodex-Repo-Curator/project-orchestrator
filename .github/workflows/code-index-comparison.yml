@@ -70,6 +70,7 @@ jobs:
           docker compose ps --all > results/container-status.txt || true
           docker compose logs --no-color --tail=500 > results/container-logs.txt 2>&1 || true
           docker image inspect po-code-comparison-tools:local --format '{{json .Id}}' > results/tools-image-id.txt || true
+          docker compose exec -T cbm sh -c 'find /root/.cache/codebase-memory-mcp/logs -type f -exec tail -n 100 {} \;' > results/cbm-worker-diagnostics.txt 2>&1 || true
       - name: Upload raw evidence
         if: always()
         uses: actions/upload-artifact@v7

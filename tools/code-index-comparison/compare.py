@@ -1,10 +1,52 @@
 #!/usr/bin/env python3
 """Collect raw results. No scoring, no claim that graph-edge counts equal call sites."""
-import base64,json,subprocess,time,urllib.error,urllib.parse,urllib.request
+import base64,json,select,subprocess,time,urllib.error,urllib.parse,urllib.request
 from pathlib import Path
 BASE=Path(__file__).resolve().parent
 OUT=BASE/'results'
 SYMBOLS=['with_cognitive_routing','set_inference_engine','build_enrichment_pipeline','close_decision_with']
+CBM_CLIENT=None
+
+class McpClient:
+    """One persistent stdio session; stderr is saved separately from JSON-RPC."""
+    def __init__(self,argv=None,log_path=None):
+        OUT.mkdir(parents=True,exist_ok=True)
+        self.log_path=log_path or OUT/'cbm-mcp-stderr.txt'
+        self.log=self.log_path.open('w')
+        self.proc=subprocess.Popen(argv or ['docker','compose','exec','-T','cbm','codebase-memory-mcp'],
+                                   cwd=BASE,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                   stderr=self.log,text=True,bufsize=1)
+        self.seq=0
+        self.request('initialize',{'protocolVersion':'2024-11-05','capabilities':{},
+                                  'clientInfo':{'name':'po-index-comparison','version':'1.0'}})
+        self.proc.stdin.write(json.dumps({'jsonrpc':'2.0','method':'notifications/initialized'})+'\n')
+        self.proc.stdin.flush()
+
+    def request(self,method,params):
+        self.seq+=1
+        self.proc.stdin.write(json.dumps({'jsonrpc':'2.0','id':self.seq,'method':method,'params':params})+'\n')
+        self.proc.stdin.flush()
+        deadline=time.monotonic()+1800
+        while time.monotonic()<deadline:
+            ready,_,_=select.select([self.proc.stdout],[],[],min(30,max(0,deadline-time.monotonic())))
+            if not ready:continue
+            line=self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError('MCP server exited: '+self.log_path.read_text()[-2000:])
+            response=json.loads(line)
+            if response.get('id')!=self.seq:continue
+            if 'error' in response:raise RuntimeError(json.dumps(response['error']))
+            result=response['result']
+            if result.get('isError'):raise RuntimeError(json.dumps(result))
+            return result
+        raise TimeoutError('MCP request deadline exceeded')
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.stdin.close()
+            try:self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:self.proc.terminate();self.proc.wait(timeout=10)
+        self.log.close()
 
 def http(url,body=None,headers=None):
     req=urllib.request.Request(url,data=None if body is None else json.dumps(body).encode(),
@@ -16,6 +58,17 @@ def http(url,body=None,headers=None):
         return result
 
 def command(service,args):
+    global CBM_CLIENT
+    if service=='cbm' and args[:3]==['codebase-memory-mcp','cli','--json']:
+        if CBM_CLIENT is None:CBM_CLIENT=McpClient()
+        action=args[3];parameters={}
+        for i in range(4,len(args),2):
+            key=args[i][2:].replace('-','_');value=args[i+1]
+            if value in ['true','false']:value=value=='true'
+            elif value.startswith('['):value=json.loads(value)
+            elif key in ['depth','limit','max_lines','max_output_tokens']:value=int(value)
+            parameters[key]=value
+        return CBM_CLIENT.request('tools/call',{'name':action,'arguments':parameters})
     p=subprocess.run(['docker','compose','exec','-T',service,*args],cwd=BASE,capture_output=True,text=True,timeout=1800)
     if p.returncode: raise RuntimeError(p.stderr[-2000:] or p.stdout[-2000:])
     try:
@@ -43,6 +96,7 @@ def main():
             'count_semantics':'PO CALLS edges, CBM graph edges, and reader syntactic call sites are different quantities.',
             'token_measurement':'UTF-8 response byte counts only; no tokenizer-exact token count.'}
     report['compose_files']=__import__('os').environ.get('COMPOSE_FILE','compose.yaml')
+    report['cbm_transport']='persistent MCP stdio; session startup is in cbm-before, not repeated per query'
     api='http://127.0.0.1:18080'
     try:
         project=http(api+'/api/projects/po-self')
@@ -96,5 +150,6 @@ def main():
     q=urllib.parse.urlencode({'entity_type':'file','entity_id':manager})
     measure('po-note-context',lambda:http(api+'/api/notes/context?'+q),report)
     (OUT/'summary.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+    if CBM_CLIENT is not None:CBM_CLIENT.close()
     print('Raw results saved under results/. No automated winner is inferred.')
 if __name__=='__main__': main()
