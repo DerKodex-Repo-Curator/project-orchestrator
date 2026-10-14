@@ -1775,6 +1775,10 @@ const RETRYABLE_ERROR_TYPES: &[&str] = &["api_error", "overloaded_error", "rate_
 /// **Retryable** (5xx + rate limit): `api_error`, `overloaded_error`, `rate_limit_error`
 /// **Non-retryable** (4xx): `invalid_request_error`, `authentication_error`,
 /// `not_found_error`, `permission_error`
+///
+/// **Note:** HTTP 402 (out of credit) is deliberately NOT retryable here — the
+/// cognitive router excludes the instance instead of retrying. See
+/// [`is_out_of_credit_message`] for how the legacy engine detects that case.
 pub fn classify_api_error(error_message: &str) -> ApiErrorKind {
     // Try to extract JSON from the error message and parse the error type
     if let Some(json_start) = error_message.find('{') {
@@ -1814,6 +1818,47 @@ pub fn classify_api_error(error_message: &str) -> ApiErrorKind {
     }
 
     ApiErrorKind::NonRetryable("unknown".to_string())
+}
+
+/// Whether a legacy engine error message looks like an out-of-credit refusal
+/// (case-insensitive): a `402` status, or text mentioning "insufficient
+/// credit" or "out of credit".
+///
+/// The legacy engine (Claude Code CLI) reports a 402 as raw TEXT — e.g.
+/// `"API Error: 402 {...}"` or JSON containing "insufficient" / "out of
+/// credit" — so the cognitive router's typed
+/// `ProviderError::InvalidRequest { detail: "HTTP 402 …" }` check does not
+/// see it. The manager calls this helper on the text instead.
+///
+/// Conservative: a bare `402` is matched only as a whole-number token, and a
+/// bare "credits" is deliberately NOT matched (it would false-positive on a
+/// 400 like "credits field is required").
+pub fn is_out_of_credit_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    contains_number_token(&lower, "402")
+        || lower.contains("insufficient credit")
+        || lower.contains("out of credit")
+}
+
+/// Whether `needle` appears in `haystack` as a whole-number token: the bytes
+/// immediately before and after the match are not ASCII digits. This keeps a
+/// bare `402` in an API error line meaningful while ignoring `402` embedded in
+/// unrelated numbers like `14025`.
+fn contains_number_token(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle_len = needle.len();
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let idx = start + rel;
+        let end = idx + needle_len;
+        let prev_is_digit = idx > 0 && bytes[idx - 1].is_ascii_digit();
+        let next_is_digit = end < bytes.len() && bytes[end].is_ascii_digit();
+        if !prev_is_digit && !next_is_digit {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
 }
 
 // ============================================================================
@@ -3315,6 +3360,67 @@ mod tests {
     fn test_classify_api_error_empty_message() {
         let kind = classify_api_error("");
         assert_eq!(kind, ApiErrorKind::NonRetryable("unknown".into()));
+    }
+
+    // ====================================================================
+    // is_out_of_credit_message
+    // ====================================================================
+
+    #[test]
+    fn test_is_out_of_credit_message_402_api_error() {
+        // Legacy engine reports a 402 as plain text.
+        let msg = r#"API Error: 402 {"type":"error","error":{"type":"invalid_request_error","message":"Insufficient credits"}}"#;
+        assert!(is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_insufficient_credits_json() {
+        let msg = r#"{"error":{"message":"Insufficient credits to complete this request.","type":"invalid_request_error"}}"#;
+        assert!(is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_out_of_credit() {
+        // "out of credit" is matched on its own, without a status code.
+        assert!(is_out_of_credit_message(
+            "This account is out of credit. Please top up."
+        ));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_case_insensitive() {
+        assert!(is_out_of_credit_message(
+            "API ERROR: 402 INSUFFICIENT CREDITS"
+        ));
+        assert!(is_out_of_credit_message("Out Of Credit"));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_negative_invalid_request() {
+        // A 400 invalid request is NOT an out-of-credit refusal.
+        let msg = r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Bad request"}}"#;
+        assert!(!is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_bare_credits_in_a_400_is_not_matched() {
+        // A 400 that mentions "credits" in a non-out-of-credit sense must NOT
+        // be mistaken for an out-of-credit refusal.
+        let msg = r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"credits field is required"}}"#;
+        assert!(!is_out_of_credit_message(msg));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_402_inside_unrelated_number() {
+        // "402" embedded in a larger number must NOT match.
+        assert!(!is_out_of_credit_message("request id 14025 failed"));
+        assert!(!is_out_of_credit_message("line 4025 has no credit issue"));
+    }
+
+    #[test]
+    fn test_is_out_of_credit_message_singular_credit_not_matched() {
+        // "credit" alone (not part of the recognized phrases) is NOT a match.
+        assert!(!is_out_of_credit_message("credit card declined"));
     }
 
     // ====================================================================

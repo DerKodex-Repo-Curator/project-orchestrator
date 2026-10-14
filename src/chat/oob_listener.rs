@@ -705,6 +705,10 @@ async fn maybe_trigger_stream(
             enrichment_pipeline,
             search,
             documents,
+            // The OOB-triggered turn reacts to background output; it does not
+            // carry the cognitive router (the manager's primary turn paths do),
+            // so an out-of-credit refusal here is reported without a cooldown.
+            None,
         )
         .await;
     });
@@ -721,9 +725,9 @@ async fn maybe_trigger_stream(
 /// `stream.next()` yields `None` the SDK transport's broadcast sender
 /// has been dropped, which means the CLI subprocess for this session
 /// has exited (clean shutdown OR crash). Subsequent `send_message`
-/// calls on this `session_id` will silently no-op until the session is
-/// recreated, so we surface a typed event the frontend can render
-/// prominently.
+/// calls on this `session_id` will resume the session (starting a new
+/// turn and reusing the prior conversation where possible), so we
+/// surface a typed event the frontend can render prominently.
 pub(crate) async fn emit_subprocess_death(
     session_id: &str,
     session_uuid: Option<Uuid>,
