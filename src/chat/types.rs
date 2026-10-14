@@ -776,6 +776,16 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Neutral stop reason (completed, max_turns, max_tokens, interrupted, refusal, budget_exceeded, error).
         stop_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Stable machine code of the provider error, when the turn failed with a
+        /// typed `ProviderError` (e.g. `endpoint_unreachable`, `rate_limited`,
+        /// `timeout`, `invalid_request`). Absent for a clean stop.
+        error_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Readable provider error message, when the turn failed with a typed
+        /// `ProviderError`. Never carries a credential, path or URL (it comes from
+        /// `errors.rs`, not the raw provider text).
+        error_message: Option<String>,
     },
     /// Streaming text delta (real-time token)
     StreamDelta {
@@ -2320,6 +2330,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             }
             .event_type(),
             "result"
@@ -2405,6 +2417,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
             ChatEvent::Result {
                 session_id: "cli-456".into(),
@@ -2418,6 +2432,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
             ChatEvent::Result {
                 session_id: "cli-789".into(),
@@ -2431,6 +2447,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
             ChatEvent::StreamDelta {
                 text: "Hello".into(),

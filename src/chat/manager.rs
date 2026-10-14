@@ -2816,6 +2816,8 @@ pub(crate) fn interrupted_turn_end(
             usage,
             model,
             stop_reason: Some("interrupted".to_string()),
+            error_code: None,
+            error_message: None,
         },
         _ => ChatEvent::Result {
             session_id: String::new(),
@@ -2829,6 +2831,8 @@ pub(crate) fn interrupted_turn_end(
             usage: None,
             model: None,
             stop_reason: Some("interrupted".to_string()),
+            error_code: None,
+            error_message: None,
         },
     };
     stored_interrupted_result(&ended).unwrap_or(ended)
@@ -2872,6 +2876,8 @@ pub(crate) fn stored_interrupted_result(event: &ChatEvent) -> Option<ChatEvent> 
             usage: usage.clone(),
             model: model.clone(),
             stop_reason: stop_reason.clone(),
+            error_code: None,
+            error_message: None,
         }),
         _ => None,
     }
@@ -6273,6 +6279,8 @@ impl ChatManager {
                     usage: None,
                     model: None,
                     stop_reason: None,
+                    error_code: None,
+                    error_message: None,
                 }]
             }
             Message::StreamEvent { event, .. } => match event {
@@ -20207,6 +20215,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: stop.map(str::to_string),
+            error_code: None,
+            error_message: None,
         };
         assert!(stored_interrupted_result(&result(Some("error"))).is_none());
         assert!(stored_interrupted_result(&result(None)).is_none());
@@ -25953,6 +25963,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
             ChatEvent::UserMessage {
                 content: "Hello".into(),
@@ -26116,6 +26128,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         }
     }
 

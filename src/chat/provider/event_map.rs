@@ -329,6 +329,7 @@ impl EventMapper {
                 num_turns,
                 provider_session_id,
                 model,
+                error,
                 ..
             } => vec![ChatEvent::Result {
                 session_id: provider_session_id.clone().unwrap_or_default(),
@@ -344,6 +345,10 @@ impl EventMapper {
                 usage: usage_value(usage),
                 model: model.clone(),
                 stop_reason: Some(stop_reason_name(*stop_reason).to_string()),
+                // ERR-1: surface the typed provider error that was otherwise flattened
+                // to a bare "error_during_execution", so the stored thread says WHY.
+                error_code: error.as_ref().map(|e| e.kind().to_string()),
+                error_message: error.as_ref().map(|e| e.to_string()),
             }],
             AgentEvent::Error { error } => vec![error_event(error)],
             AgentEvent::ProviderNotice { kind, .. } if kind == MASKING_FAILED_SUBTYPE => {
@@ -1043,6 +1048,36 @@ mod tests {
             (v["mode"].as_str(), v["policy_mode"].as_str()),
             (Some("acceptEdits"), Some("auto_edits"))
         );
+    }
+
+    #[test]
+    fn a_failed_done_carries_the_provider_error_code_and_message() {
+        // ERR-1: the typed provider error must reach the Result, not be flattened
+        // to a bare "error_during_execution".
+        use nexus_claude::agent::{Cost, CostBasis, Usage};
+        let mut mapper = EventMapper::new();
+        let done = AgentEvent::Done {
+            stop_reason: StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Usage::default(),
+            cost: Cost {
+                usd: None,
+                basis: CostBasis::Unknown,
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m-1".into()),
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(nexus_claude::agent::ProviderError::Timeout { after_ms: 30_000 }),
+        };
+        let v = serde_json::to_value(&mapper.map(&done)[0]).unwrap();
+        assert_eq!(v["subtype"], "error_during_execution");
+        assert_eq!(v["error_code"], "timeout");
+        assert_eq!(v["error_message"], "timed out after 30000 ms");
     }
 
     #[test]

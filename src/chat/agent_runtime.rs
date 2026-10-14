@@ -5128,6 +5128,8 @@ mod stored_interrupted_result_tests {
                 usage: None,
                 model: None,
                 stop_reason: Some("interrupted".into()),
+                error_code: None,
+                error_message: None,
             })
             .await;
         let live = rx.recv().await.unwrap();
