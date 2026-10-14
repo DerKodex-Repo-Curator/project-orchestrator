@@ -63,6 +63,9 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "routing_decision_id",
     // Plan triggers
     "trigger_signal_key",
+    // Conversation segments (episodic memory, S4)
+    "conversation_segment_key",
+    "conversation_boundary_key",
 ];
 
 /// Client for Neo4j operations
