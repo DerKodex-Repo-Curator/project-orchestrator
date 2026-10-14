@@ -71,6 +71,7 @@ use super::provider::cognitive::observe;
 use super::provider::cognitive::segment::{
     Boundary, Dimension, SegmentError, SegmentPolicy, Segmenter,
 };
+use super::provider::cognitive::segment_store::SegmentStore;
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
 use super::provider::cognitive::topic;
 use super::provider::cognitive::{
@@ -390,6 +391,11 @@ pub(crate) struct TurnRouter {
     /// harness relaxes the R-S3 "no two provider moves in a row" guard, while a harness
     /// boundary is an explicit provider change (which keeps that guard).
     segmenter: Mutex<Segmenter>,
+    /// Where the confirmed boundaries (and the segment snapshot) are persisted, when a
+    /// graph-backed store is attached (`CognitiveRouting.segment_store`). `None` keeps them
+    /// in the segmenter only (the in-memory default). Writes are best-effort and
+    /// non-blocking; replay/hydration from the store is a follow-up (out of scope).
+    segment_store: Option<Arc<dyn SegmentStore>>,
     timeout: Duration,
 }
 
@@ -440,6 +446,9 @@ pub(crate) struct TurnRouterSpec {
     pub next_turn: u32,
     /// The session continues a conversation the router moved here (`moved_by: auto`).
     pub moved_in: bool,
+    /// Where the conversation's segments and boundaries are persisted on a confirmed
+    /// boundary (`None` = in-memory only). Threaded from `CognitiveRouting.segment_store`.
+    pub segment_store: Option<Arc<dyn SegmentStore>>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -502,6 +511,7 @@ impl TurnRouter {
                 next_turn: spec.next_turn,
             }),
             segmenter: Mutex::new(Segmenter::new(SegmentPolicy::default(), seed)),
+            segment_store: spec.segment_store,
             timeout: DECIDE_TIMEOUT,
         }
     }
@@ -645,7 +655,7 @@ impl TurnRouter {
         let message = locked(&self.last_message).clone().unwrap_or_default();
         let topic = topic::topic_labels(&message);
         let observation = observe::observation(turn_index, provider_id, &self.signature(), &topic);
-        match locked(&self.segmenter).observe(&observation) {
+        let boundaries = match locked(&self.segmenter).observe(&observation) {
             Ok(boundaries) => boundaries,
             Err(SegmentError::OutOfOrder { turn, last }) => {
                 debug!(provider = %self.provider_id, turn, last, "the turn was already observed: the segmenter is not re-fed");
@@ -655,7 +665,41 @@ impl TurnRouter {
                 warn!(provider = %self.provider_id, error = %error, "segment observation refused");
                 Vec::new()
             }
+        };
+        // A confirmed boundary means the conversation's episodic memory changed: snapshot
+        // the segments and boundaries and hand them to the store. Best-effort and
+        // non-blocking (the store is async): the turn never waits on the write, and a
+        // failing write only logs. Persisted on the boundary only; replay/hydration from
+        // the store is a follow-up (out of scope).
+        if !boundaries.is_empty() {
+            self.persist_segments();
         }
+        boundaries
+    }
+
+    /// Snapshots the segmenter and persists it on a separate task, best-effort: the turn is
+    /// never blocked on the graph write. Segments are written before boundaries so the
+    /// store's `PRECEDES` links between segment nodes have their endpoints.
+    fn persist_segments(&self) {
+        let Some(store) = self.segment_store.clone() else {
+            return;
+        };
+        // The conversation key is the session id; without one (a legacy engine run with no
+        // conversation id) there is no identity to key the store by, so nothing is written
+        // (the segment ids collapse to seed 0 there too).
+        let Some(conversation) = self.session_id.map(|id| id.to_string()) else {
+            return;
+        };
+        let segments = locked(&self.segmenter).segments();
+        let boundaries = locked(&self.segmenter).boundaries().to_vec();
+        tokio::spawn(async move {
+            if let Err(error) = store.put_segments(&conversation, &segments).await {
+                warn!(conversation = %conversation, error = %error, "conversation segments not persisted");
+            }
+            if let Err(error) = store.put_boundaries(&conversation, &boundaries).await {
+                warn!(conversation = %conversation, error = %error, "conversation boundaries not persisted");
+            }
+        });
     }
 
     /// Asks the decider within the router's timeout; `None` (logged) when it fails or is slow.
@@ -798,10 +842,9 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     {
         return ProviderPlan::Stay;
     }
-    let (turn, current_model, held) = {
+    let (turn, current_model) = {
         let state = locked(&router.state);
-        let held = held_by_class(&state, state.next_turn, &signature.arm_key());
-        (state.next_turn, state.current_model.clone(), held)
+        (state.next_turn, state.current_model.clone())
     };
     // No two PROVIDER moves in a row (decision R-S3: a move relays the history to a new
     // session, a model change does not): the turn right after a move is decided among the
@@ -816,6 +859,15 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     let direction_changed = boundaries
         .iter()
         .any(|boundary| boundary.dimension != Dimension::Harness);
+    // R-S3: a confirmed non-harness boundary re-opens the decision. `held_by_class` would
+    // hold a turn that follows a change of the SAME class (steady, no exploration); a turn
+    // the conversation actually changed direction on is instead decided FRESH, so the
+    // decider re-evaluates provider AND model for the new direction. `may_move` below already
+    // drops the `after_provider_move` restriction when `direction_changed` is set, so the
+    // provider question re-opens too. A harness boundary is a provider switch (already
+    // handled by `moved_in`): `direction_changed` excludes it, so it keeps the guard.
+    let held =
+        held_by_class(&locked(&router.state), turn, &signature.arm_key()) && !direction_changed;
     let segment_note = (!boundaries.is_empty()).then(|| {
         boundaries
             .iter()
@@ -920,7 +972,14 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
     // Every turn feeds the segmenter exactly once. A turn already observed by the provider
     // check (mode `full`) is a repeated turn here and is tolerated as a no-op; the sessions
     // the provider check never runs for (mode `mixed`, one provider) are observed here.
-    router.observe_turn(ctx.turn_index, &router.provider_id);
+    let boundaries = router.observe_turn(ctx.turn_index, &router.provider_id);
+    // A confirmed non-harness boundary re-opens the decision here too (matching
+    // `plan_provider_move`): a turn the conversation actually changed direction on is
+    // decided FRESH, not held steady. A harness boundary is a provider switch, not a change
+    // of direction, so it keeps the guard (`direction_changed` excludes it).
+    let direction_changed = boundaries
+        .iter()
+        .any(|boundary| boundary.dimension != Dimension::Harness);
     let predecided = locked(&router.predecided)
         .take()
         .filter(|pre| pre.turn_index == ctx.turn_index);
@@ -936,8 +995,11 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         None => {
             // R-S3: right after a change, a turn of the same class is decided without
             // exploration (the hysteresis margin alone may move it); another class is routed
-            // as any turn.
-            let held = held_by_class(&locked(&router.state), ctx.turn_index, &class);
+            // as any turn. A confirmed non-harness boundary lifts the steady guard, matching
+            // `plan_provider_move`: a turn the conversation really changed direction on is
+            // decided fresh.
+            let held =
+                held_by_class(&locked(&router.state), ctx.turn_index, &class) && !direction_changed;
             let (mut pool, project) = provider_pool(router).await;
             if let Some(allowed) = &choice.allowed_models {
                 pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
@@ -1878,6 +1940,7 @@ mod provider_move_tests {
             current_model: "m".into(),
             next_turn: 1,
             moved_in: false,
+            segment_store: None,
         }
     }
 
@@ -2552,6 +2615,7 @@ mod image_routing_tests {
             current_model: "flash".into(),
             next_turn: 1,
             moved_in: false,
+            segment_store: None,
         }
     }
 
@@ -3052,7 +3116,12 @@ mod image_routing_tests {
 #[cfg(test)]
 mod segment_tests {
     use super::*;
+    use crate::chat::provider::cognitive::decision::DecisionAlternative;
     use crate::chat::provider::cognitive::segment::BoundaryReason;
+    use crate::chat::provider::cognitive::segment_store::{InMemorySegmentStore, SegmentStore};
+    use chrono::Utc;
+    use nexus_claude::agent::CostBasis;
+    use std::sync::Mutex as StdMutex;
 
     /// A decider that is never asked: these tests only feed observations.
     struct NoDecide;
@@ -3092,6 +3161,7 @@ mod segment_tests {
             current_model: "m".into(),
             next_turn: 1,
             moved_in: false,
+            segment_store: None,
         }
     }
 
@@ -3195,5 +3265,289 @@ mod segment_tests {
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].dimension, Dimension::Topic);
         assert_eq!(boundaries[0].at_turn, 4);
+    }
+
+    // --- S3 decision wiring: fixtures that actually route (unlike `NoDecide`/`NoPool`) ---
+
+    fn routing_facts(provider: &str, model: &str) -> ModelFacts {
+        ModelFacts {
+            provider_id: provider.into(),
+            model: model.into(),
+            supports_tools: true,
+            supports_images: true,
+            context_window: Some(200_000),
+            window_unknown: None,
+            price: None,
+            cost_basis: CostBasis::Unknown,
+            healthy: Some(true),
+            allowed_for_project: true,
+            sandboxed: false,
+        }
+    }
+
+    /// Two providers, so a move is possible: `local/m` (the session's) and `local2/m`.
+    struct TwoProviders;
+
+    #[async_trait]
+    impl PoolSource for TwoProviders {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            self.project_pool(None)
+                .await
+                .into_iter()
+                .filter(|f| f.provider_id == provider_id)
+                .collect()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            vec![routing_facts("local", "m"), routing_facts("local2", "m")]
+        }
+    }
+
+    /// Picks `local2/m` (a move, when the guards allow it) and records every request.
+    #[derive(Default)]
+    struct Recording {
+        requests: StdMutex<Vec<DecideRequest>>,
+    }
+
+    impl Recording {
+        fn last(&self) -> DecideRequest {
+            self.requests.lock().unwrap().last().cloned().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl Decider for Recording {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            self.requests.lock().unwrap().push(request.clone());
+            let pick = Pick::new("local2", "m");
+            let mut alternatives = vec![DecisionAlternative {
+                pick: pick.clone(),
+                score: Some(0.9),
+                rejected: None,
+            }];
+            if let Some(current) = request.current.clone().filter(|c| *c != pick) {
+                alternatives.push(DecisionAlternative {
+                    pick: current,
+                    score: Some(0.1),
+                    rejected: None,
+                });
+            }
+            Ok(CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: Some(pick),
+                score: Some(0.9),
+                explored: false,
+                reason: "recording".into(),
+                alternatives,
+                applied: request.settings.mode == ProviderRoutingMode::Full
+                    && request.settings.stage == LearningStage::Auto,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            })
+        }
+    }
+
+    /// A router in `full` + `auto` on `local/m`, over the two-provider pool.
+    fn routing_router(decider: Arc<Recording>, moved_in: bool) -> TurnRouter {
+        TurnRouter::new(TurnRouterSpec {
+            decider,
+            pool: Arc::new(TwoProviders),
+            routing: RoutingSettings {
+                mode: ProviderRoutingMode::Full,
+                stage: LearningStage::Auto,
+                ..RoutingSettings::default()
+            },
+            provider_id: "local".into(),
+            session_id: Some(Uuid::new_v4()),
+            project_slug: Some("proj".into()),
+            trust: false,
+            explicit_model: false,
+            provider_imposed: false,
+            allowed_models: None,
+            routing_pool: None,
+            auto_models: None,
+            conversation_routes: false,
+            current_model: "m".into(),
+            next_turn: 1,
+            moved_in,
+            segment_store: None,
+        })
+    }
+
+    fn is_move_to(plan: &ProviderPlan, provider: &str) -> bool {
+        matches!(plan, ProviderPlan::Move { pick, .. } if pick.provider_id == provider)
+    }
+
+    /// S3 decision wiring: a confirmed non-harness boundary re-opens the decision. Turn 3
+    /// follows a change of the SAME class on turn 2 (`held_by_class` would steady it) AND
+    /// continues a topic drift right after a move: the boundary lifts the held guard and the
+    /// `after_provider_move` restriction, so the decider re-evaluates provider AND model.
+    #[tokio::test]
+    async fn a_confirmed_topic_boundary_reopens_the_decision_for_the_next_turn() {
+        let decider = Arc::new(Recording::default());
+        let router = routing_router(decider.clone(), true);
+        feed(&router, 0, "local", "the routing of the provider");
+        feed(&router, 1, "local", "the routing of the provider");
+        feed(&router, 2, "local", "neo4j docker tests"); // one deviating turn
+        let class = router.signature().arm_key();
+        {
+            let mut state = locked(&router.state);
+            state.next_turn = 3;
+            record_change(&mut state, 2, "m", class);
+        }
+        let plan = plan_provider_move(&router).await;
+        let request = decider.last();
+        assert!(
+            !request.steady,
+            "the boundary lifts the steady guard: {request:?}"
+        );
+        assert!(
+            request.settings.exploration_epsilon > 0.0,
+            "exploration is back on: {request:?}"
+        );
+        assert_eq!(
+            request.restrict_provider, None,
+            "the after-provider-move restriction is lifted: {request:?}"
+        );
+        assert!(
+            request.segment_note.is_some(),
+            "the boundary is recorded in the reason suffix: {request:?}"
+        );
+        assert!(
+            is_move_to(&plan, "local2"),
+            "the fresh decision may move: {plan:?}"
+        );
+    }
+
+    /// The same class with no boundary: the R-S3 `held_by_class` guard behaves exactly as
+    /// before (steady, no exploration).
+    #[tokio::test]
+    async fn a_same_class_turn_without_a_boundary_stays_held() {
+        let decider = Arc::new(Recording::default());
+        let router = routing_router(decider.clone(), false);
+        feed(&router, 0, "local", "the routing of the provider");
+        feed(&router, 1, "local", "the routing of the provider");
+        feed(&router, 2, "local", "the routing of the provider");
+        let class = router.signature().arm_key();
+        {
+            let mut state = locked(&router.state);
+            state.next_turn = 3;
+            record_change(&mut state, 2, "m", class);
+        }
+        let _ = plan_provider_move(&router).await;
+        let request = decider.last();
+        assert!(request.steady, "{request:?}");
+        assert_eq!(request.settings.exploration_epsilon, 0.0);
+        assert!(
+            request.narrowed.contains(&SAME_CLASS_NO_EXPLORE),
+            "{request:?}"
+        );
+        assert_eq!(request.segment_note, None);
+    }
+
+    /// A harness boundary is a provider switch, not a change of direction: it keeps the
+    /// "no two provider moves in a row" guard (`direction_changed` excludes the harness axis).
+    #[tokio::test]
+    async fn a_harness_boundary_keeps_the_move_guard() {
+        let decider = Arc::new(Recording::default());
+        let router = routing_router(decider.clone(), true);
+        // The session arrived from another harness: turn 0 was served there, the turn about
+        // to start (1) is on this one — a harness boundary fires, and nothing else.
+        feed(&router, 0, "claude-code", "the weather in antibes");
+        {
+            let mut state = locked(&router.state);
+            state.next_turn = 1;
+        }
+        let plan = plan_provider_move(&router).await;
+        let request = decider.last();
+        assert_eq!(
+            request.restrict_provider.as_deref(),
+            Some("local"),
+            "the move guard stays: {request:?}"
+        );
+        assert!(
+            request.narrowed.contains(&AFTER_PROVIDER_MOVE),
+            "{request:?}"
+        );
+        assert_eq!(
+            plan,
+            ProviderPlan::Stay,
+            "no second move in a row: {plan:?}"
+        );
+    }
+
+    /// A confirmed boundary snapshots the segmenter to the store, best-effort and
+    /// non-blocking (the write is spawned on a separate task). The store is keyed by the
+    /// session id, so the conversation's segments and boundaries land under it.
+    #[tokio::test]
+    async fn a_boundary_observation_persists_segments_and_boundaries_to_the_store() {
+        let session = Uuid::new_v4();
+        let conversation = session.to_string();
+        let store: Arc<dyn SegmentStore> = Arc::new(InMemorySegmentStore::new());
+        let mut router_spec = spec(session);
+        router_spec.segment_store = Some(store.clone());
+        let router = TurnRouter::new(router_spec);
+        feed(&router, 0, "deepseek", "the routing of the provider");
+        feed(&router, 1, "deepseek", "the routing of the provider");
+        assert!(feed(&router, 2, "deepseek", "neo4j docker tests").is_empty());
+        let boundaries = feed(&router, 3, "deepseek", "neo4j docker tests");
+        assert_eq!(boundaries.len(), 1);
+        // The write is spawned, not awaited: poll the store briefly.
+        let deadline = std::time::Instant::now();
+        loop {
+            let segments = store.segments(&conversation).await.unwrap();
+            if !segments.is_empty() {
+                assert_eq!(segments, locked(&router.segmenter).segments());
+                break;
+            }
+            assert!(
+                deadline.elapsed() < Duration::from_secs(2),
+                "the segments were not persisted"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            store.boundaries(&conversation).await.unwrap(),
+            locked(&router.segmenter).boundaries().to_vec()
+        );
+    }
+
+    /// S3 decision wiring, model path: `directive_for_turn` (the hook of a `mixed` or
+    /// one-provider session, the only observer of its turns) lifts `held_by_class` on a
+    /// confirmed non-harness boundary too, matching `plan_provider_move`. Harness stays
+    /// excluded (`direction_changed` counts the non-harness axes only).
+    #[tokio::test]
+    async fn a_confirmed_boundary_lifts_the_steady_guard_in_the_model_path() {
+        let decider = Arc::new(Recording::default());
+        let router = routing_router(decider.clone(), false);
+        router.set_model_live(true);
+        feed(&router, 0, "local", "the routing of the provider");
+        feed(&router, 1, "local", "the routing of the provider");
+        feed(&router, 2, "local", "neo4j docker tests"); // one deviating turn
+        let class = router.signature().arm_key();
+        {
+            let mut state = locked(&router.state);
+            record_change(&mut state, 2, "m", class);
+        }
+        // Turn 3 continues the drift: the second deviating turn confirms the boundary, and
+        // the hook must decide it fresh, not steady.
+        directive_for_turn(&router, &TurnContext::new(3, "m")).await;
+        let request = decider.last();
+        assert!(
+            !request.steady,
+            "the boundary lifts the steady guard: {request:?}"
+        );
+        assert!(request.settings.exploration_epsilon > 0.0, "{request:?}");
+        assert!(
+            !request.narrowed.contains(&SAME_CLASS_NO_EXPLORE),
+            "{request:?}"
+        );
     }
 }

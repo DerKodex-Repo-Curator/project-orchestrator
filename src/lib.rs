@@ -1678,7 +1678,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     );
     let cognitive_routing =
         chat::provider::cognitive::decider::CognitiveRouting::new(cognitive_store.clone())
-            .with_claude_code_catalog(model_catalog.clone());
+            .with_claude_code_catalog(model_catalog.clone())
+            // Episodic memory: the conversation segments and boundaries outlive the
+            // process. The store is lazy (no schema migration at startup); the field
+            // itself defaults to in-memory (`None`) for any other construction.
+            .with_segment_store(Arc::new(neo4j::segment::Neo4jSegmentStore::new(
+                orchestrator.neo4j_arc(),
+            )));
     api::routing_handlers::set_routing_store(Some(cognitive_store.clone()));
 
     // Create chat manager (optional — requires Claude CLI)

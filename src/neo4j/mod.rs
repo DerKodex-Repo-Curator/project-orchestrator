@@ -32,6 +32,7 @@ pub(crate) mod reasoning;
 mod registry;
 mod release;
 pub mod routing;
+pub mod segment;
 mod sharing;
 mod skill;
 mod step;
@@ -46,6 +47,7 @@ pub use agent_execution::{AgentExecutionNode, AgentExecutionStatus};
 pub use client::Neo4jClient;
 pub use document::{Document, DocumentChunk, DocumentChunkHit};
 pub use models::*;
+pub use segment::Neo4jSegmentStore;
 pub use traits::GraphStore;
 
 #[cfg(test)]
