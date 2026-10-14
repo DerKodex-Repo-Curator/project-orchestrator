@@ -14105,18 +14105,15 @@ impl ChatManager {
         instance: &str,
         reserved: Vec<super::provider::cognitive::decider::Reservation>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
-        use super::provider::cognitive::decider::{
-            is_out_of_credit, record_probe, ProbeOutcome, OUT_OF_CREDIT_COOLDOWN,
-        };
+        use super::provider::cognitive::decider::{record_probe, ProbeOutcome};
         let policy = routing.probe_policy;
         reserved
             .into_iter()
             .map(|reservation| {
-                let (native, log, instance, credit_until) = (
+                let (native, log, instance) = (
                     Arc::clone(native),
                     Arc::clone(&routing.probed),
                     instance.to_owned(),
-                    Arc::clone(&routing.credit_until),
                 );
                 tokio::spawn(async move {
                     let model = reservation.model;
@@ -14127,20 +14124,7 @@ impl ChatManager {
                     .await
                     {
                         Ok(Ok(_)) => ProbeOutcome::Concluded,
-                        Ok(Err(error)) => {
-                            if is_out_of_credit(&error) {
-                                // Account out of credit: exclude the instance from
-                                // auto-routing until it is re-checked (credit returns).
-                                credit_until
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .insert(
-                                        instance.clone(),
-                                        std::time::Instant::now() + OUT_OF_CREDIT_COOLDOWN,
-                                    );
-                            }
-                            ProbeOutcome::of_error(&error)
-                        }
+                        Ok(Err(error)) => ProbeOutcome::of_error(&error),
                         Err(_) => ProbeOutcome::Failed,
                     };
                     if outcome != ProbeOutcome::Concluded {
