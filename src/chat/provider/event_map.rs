@@ -347,8 +347,10 @@ impl EventMapper {
                 stop_reason: Some(stop_reason_name(*stop_reason).to_string()),
                 // ERR-1: surface the typed provider error that was otherwise flattened
                 // to a bare "error_during_execution", so the stored thread says WHY.
-                error_code: error.as_ref().map(|e| e.kind().to_string()),
-                error_message: error.as_ref().map(|e| e.to_string()),
+                error_code: error
+                    .as_ref()
+                    .map(|e| open_failure(e, None).code.to_string()),
+                error_message: error.as_ref().map(|e| open_failure(e, None).message),
             }],
             AgentEvent::Error { error } => vec![error_event(error)],
             AgentEvent::ProviderNotice { kind, .. } if kind == MASKING_FAILED_SUBTYPE => {
@@ -1076,8 +1078,12 @@ mod tests {
         };
         let v = serde_json::to_value(&mapper.map(&done)[0]).unwrap();
         assert_eq!(v["subtype"], "error_during_execution");
-        assert_eq!(v["error_code"], "timeout");
-        assert_eq!(v["error_message"], "timed out after 30000 ms");
+        let failure = open_failure(
+            &nexus_claude::agent::ProviderError::Timeout { after_ms: 30_000 },
+            None,
+        );
+        assert_eq!(v["error_code"], failure.code);
+        assert_eq!(v["error_message"], failure.message);
     }
 
     #[test]
