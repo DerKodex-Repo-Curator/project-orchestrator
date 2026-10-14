@@ -15444,7 +15444,17 @@ impl ChatManager {
         )
         .await
         {
-            Ok(result) => result.map_err(anyhow::Error::new)?,
+            Ok(result) => match result {
+                Ok(ok) => ok,
+                Err(error) => {
+                    if super::provider::cognitive::decider::is_out_of_credit(&error) {
+                        if let Some(routing) = self.cognitive_routing.as_ref() {
+                            routing.mark_out_of_credit(provider_id, std::time::Instant::now());
+                        }
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
+            },
             Err(_) => {
                 return Err(anyhow::Error::new(
                     nexus_claude::agent::ProviderError::Timeout {
@@ -16134,7 +16144,7 @@ impl ChatManager {
         {
             host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
         }
-        let (session, dropped) = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
+        let opened = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
             let provider = Arc::clone(&provider);
             let token = token.clone();
             async move {
@@ -16144,8 +16154,18 @@ impl ChatManager {
                 }
             }
         })
-        .await
-        .map_err(anyhow::Error::new)?;
+        .await;
+        let (session, dropped) = match opened {
+            Ok(ok) => ok,
+            Err(error) => {
+                if super::provider::cognitive::decider::is_out_of_credit(&error) {
+                    if let Some(routing) = self.cognitive_routing.as_ref() {
+                        routing.mark_out_of_credit(&provider_id, std::time::Instant::now());
+                    }
+                }
+                return Err(anyhow::Error::new(error));
+            }
+        };
         let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
         if without_mcp {
             // As at an opening: the token went out in the refused request.
