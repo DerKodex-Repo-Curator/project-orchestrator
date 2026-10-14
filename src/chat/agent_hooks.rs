@@ -69,7 +69,7 @@ use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
 use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
 use super::provider::cognitive::observe;
 use super::provider::cognitive::segment::{
-    Boundary, Dimension, SegmentError, SegmentPolicy, Segmenter,
+    Boundary, Dimension, SegmentError, SegmentPolicy, Segmenter, SegmentsSnapshot,
 };
 use super::provider::cognitive::segment_store::SegmentStore;
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
@@ -449,6 +449,11 @@ pub(crate) struct TurnRouterSpec {
     /// Where the conversation's segments and boundaries are persisted on a confirmed
     /// boundary (`None` = in-memory only). Threaded from `CognitiveRouting.segment_store`.
     pub segment_store: Option<Arc<dyn SegmentStore>>,
+    /// The conversation's persisted segmentation, read once when its router is built
+    /// (`None` = a fresh conversation, or nothing to resume). [`Segmenter::resume`]
+    /// rebuilds the segmenter from it, so a conversation reopened after a restart
+    /// continues where it stopped.
+    pub segments: Option<SegmentsSnapshot>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -510,7 +515,17 @@ impl TurnRouter {
                 last_change_class: None,
                 next_turn: spec.next_turn,
             }),
-            segmenter: Mutex::new(Segmenter::new(SegmentPolicy::default(), seed)),
+            // S4: resume the conversation's persisted segmentation instead of starting
+            // from an empty history. A snapshot the model refuses (an incoherent one)
+            // starts fresh, with a warning — never a failed turn.
+            segmenter: Mutex::new(match spec.segments {
+                Some(snapshot) => Segmenter::resume(SegmentPolicy::default(), seed, &snapshot)
+                    .unwrap_or_else(|error| {
+                        warn!(%error, "unreadable conversation segments: fresh segmentation");
+                        Segmenter::new(SegmentPolicy::default(), seed)
+                    }),
+                None => Segmenter::new(SegmentPolicy::default(), seed),
+            }),
             segment_store: spec.segment_store,
             timeout: DECIDE_TIMEOUT,
         }
@@ -1932,6 +1947,7 @@ mod provider_move_tests {
             next_turn: 1,
             moved_in: false,
             segment_store: None,
+            segments: None,
         }
     }
 
@@ -2607,6 +2623,7 @@ mod image_routing_tests {
             next_turn: 1,
             moved_in: false,
             segment_store: None,
+            segments: None,
         }
     }
 
@@ -3153,6 +3170,7 @@ mod segment_tests {
             next_turn: 1,
             moved_in: false,
             segment_store: None,
+            segments: None,
         }
     }
 
@@ -3369,6 +3387,7 @@ mod segment_tests {
             next_turn: 1,
             moved_in,
             segment_store: None,
+            segments: None,
         })
     }
 
