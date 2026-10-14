@@ -11,14 +11,19 @@ FROM node:26-slim AS frontend-builder
 
 WORKDIR /app/frontend
 
-# Accept frontend source path as build arg (default: ./frontend)
-ARG FRONTEND_SRC=./frontend
+# Accept frontend source path as build arg.
+# The default carries a glob ([d]) so the COPY below is a no-op when ./frontend
+# is absent. The frontend lives in a separate repo (this-rs/project-orchestrator-frontend)
+# and a bare clone of this repo has no ./frontend — `docker compose up -d` must
+# still build, so an absent frontend degrades to an API-only image.
+ARG FRONTEND_SRC=./fronten[d]
 # Version to inject into the frontend (from git tag). Falls back to package.json default.
 ARG APP_VERSION=""
 
-# Copy everything from the frontend source.
-# Use a wildcard so COPY doesn't fail if only dist/ is present.
-COPY ${FRONTEND_SRC}/ ./
+# Copy everything from the frontend source. The glob makes an absent source a
+# no-op (BuildKit) instead of a hard failure; the RUN below then creates an
+# empty dist/ so the backend still builds without the frontend.
+COPY ${FRONTEND_SRC} ./
 
 # Build only if package.json exists (full source scenario).
 # If only dist/ was copied (CI scenario), skip the build entirely.

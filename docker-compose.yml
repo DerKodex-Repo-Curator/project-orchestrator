@@ -65,13 +65,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        # Path to the frontend source within the build context.
-        # To include the frontend, either:
-        # 1. Symlink/copy the frontend dir into this repo as ./frontend
-        # 2. Pre-build the frontend and copy dist/ to ./dist
-        # 3. Set FRONTEND_SRC to a valid path in the build context
-        FRONTEND_SRC: ./frontend
+      # The frontend lives in a separate repo (this-rs/project-orchestrator-frontend)
+      # and is optional: a bare clone builds an API-only image (the Dockerfile's
+      # default FRONTEND_SRC no-ops when ./frontend is absent). To embed the UI,
+      # clone/copy the frontend repo into ./frontend, or pass `FRONTEND_SRC` as a
+      # build arg pointing at a path that exists in the build context.
     container_name: orchestrator-server
     ports:
       - "8080:8080"
