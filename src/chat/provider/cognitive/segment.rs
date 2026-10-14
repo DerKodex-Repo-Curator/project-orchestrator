@@ -24,8 +24,11 @@
 //! * **Replayable.** Integer arithmetic only (distances are permille), ordered maps,
 //!   and segment ids derived by a fixed hash of `(seed, dimension, start turn)`: the
 //!   same seed and the same observations give the same segments and boundaries, byte
-//!   for byte, on any machine. The caller derives the seed from the conversation or
-//!   decision id (constraint: every automatic decision is attributable and replayable).
+//!   for byte, on any machine. Labels are expected to be ASCII (or near-ASCII):
+//!   `to_lowercase` follows the toolchain's Unicode tables, so exotic case folding
+//!   is not guaranteed bit-identical across toolchains. The caller derives the seed
+//!   from the conversation or decision id (constraint: every automatic decision is
+//!   attributable and replayable).
 //! * **Atomic.** An observation that is refused (turn not strictly increasing) leaves
 //!   the state exactly as it was.
 
@@ -80,7 +83,21 @@ impl Dimension {
 
 /// What a turn looks like on one axis: a set of normalised labels.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>")]
 pub struct Fingerprint(BTreeSet<String>);
+
+impl TryFrom<Vec<String>> for Fingerprint {
+    // Normalisation never fails, but `#[serde(try_from)]` needs a `TryFrom`;
+    // the error type is nominal and never constructed.
+    type Error = String;
+
+    /// Normalises on deserialization, exactly like [`Fingerprint::new`]: a
+    /// stored fingerprint that is not trimmed/lower-cased/​capped is brought
+    /// back to the canonical form instead of bypassing it.
+    fn try_from(labels: Vec<String>) -> Result<Self, Self::Error> {
+        Ok(Self::new(labels))
+    }
+}
 
 impl Fingerprint {
     /// Builds a fingerprint. Labels are trimmed and lower-cased; empty ones are dropped.
@@ -89,13 +106,15 @@ impl Fingerprint {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Self(
+        let mut fingerprint = Self(
             labels
                 .into_iter()
                 .map(|label| label.as_ref().trim().to_lowercase())
                 .filter(|label| !label.is_empty())
                 .collect(),
-        )
+        );
+        fingerprint.truncate_to_cap();
+        fingerprint
     }
 
     /// Whether the turn said nothing on this axis.
@@ -127,13 +146,23 @@ impl Fingerprint {
         u16::try_from(novelty.div_ceil(other.0.len())).unwrap_or(PERMILLE_MAX)
     }
 
-    /// Adds `other`'s labels, up to [`MAX_FINGERPRINT_LABELS`].
+    /// Adds `other`'s labels, then keeps the lexicographically-first
+    /// [`MAX_FINGERPRINT_LABELS`]: the result depends only on the set of labels seen,
+    /// never on the order they arrived.
     fn merge(&mut self, other: &Self) {
         for label in &other.0 {
-            if self.0.len() >= MAX_FINGERPRINT_LABELS {
-                break;
-            }
             self.0.insert(label.clone());
+        }
+        self.truncate_to_cap();
+    }
+
+    /// Keeps the lexicographically-first [`MAX_FINGERPRINT_LABELS`] labels.
+    fn truncate_to_cap(&mut self) {
+        while self.0.len() > MAX_FINGERPRINT_LABELS {
+            let Some(last) = self.0.iter().next_back().cloned() else {
+                break;
+            };
+            self.0.remove(&last);
         }
     }
 }
@@ -142,6 +171,13 @@ impl Fingerprint {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Observation {
     /// Index of the turn in the conversation; strictly increasing across observations.
+    ///
+    /// The counter is per-conversation as the CALLER sees it, not a global process
+    /// counter. The backend numbers turns per session and a provider move opens a new
+    /// session (and a new `Segmenter`), so the caller feeds one segmenter per session
+    /// and the counter never resets inside it; a relay that would otherwise send a
+    /// non-increasing turn is refused by the segmenter (and tolerated as a no-op by
+    /// the wiring, which logs it and continues).
     pub turn: u32,
     /// What the turn looks like per axis. A missing or empty entry is "no evidence".
     pub prints: BTreeMap<Dimension, Fingerprint>,
@@ -149,11 +185,29 @@ pub struct Observation {
 
 /// How far, and for how long, a direction must move before it counts as changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawThreshold")]
 pub struct Threshold {
     /// Distance, in permille, from which an observation deviates (1..=1000).
     pub distance_permille: u16,
     /// Consecutive deviating observations that confirm a boundary (at least 1).
     pub confirmations: u8,
+}
+
+/// The wire form of a [`Threshold`], validated on deserialization: a document
+/// that says `distance_permille: 0` or `confirmations: 0` is refused instead of
+/// silently changing how the segmenter cuts.
+#[derive(Deserialize)]
+struct RawThreshold {
+    distance_permille: u16,
+    confirmations: u8,
+}
+
+impl TryFrom<RawThreshold> for Threshold {
+    type Error = String;
+
+    fn try_from(raw: RawThreshold) -> Result<Self, Self::Error> {
+        Self::new(raw.distance_permille, raw.confirmations).map_err(|error| error.to_string())
+    }
 }
 
 impl Threshold {
@@ -224,14 +278,36 @@ impl SegmentPolicy {
 }
 
 /// Why a boundary was placed.
+///
+/// An enum, not a bag of numbers: the JSON is stable to grow (a later slice can
+/// add a variant without re-reading old documents as a different shape), and a
+/// reader can tell a drift from a switch from a compaction at a glance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoundaryReason {
-    /// Distance of the first deviating observation from the segment it left, in permille.
-    pub distance_permille: u16,
-    /// The threshold that was crossed.
-    pub threshold_permille: u16,
-    /// Consecutive deviating observations that confirmed it.
-    pub confirmations: u8,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoundaryReason {
+    /// The direction drifted: `confirmations` consecutive observations sat at
+    /// least `distance_permille` from the segment (at or beyond `threshold_permille`).
+    Drift {
+        /// Distance of the first deviating observation from the segment it left, in permille.
+        distance_permille: u16,
+        /// The threshold that was crossed.
+        threshold_permille: u16,
+        /// Consecutive deviating observations that confirmed it.
+        confirmations: u8,
+    },
+    /// The harness switched (a provider/model change is explicit). Reserved: the
+    /// pure segmenter reports a harness change as a [`BoundaryReason::Drift`] at
+    /// distance 1000; a later slice that knows the actual `from`/`to` harness can
+    /// fill this in.
+    Switch {
+        /// The harness the conversation left.
+        from: String,
+        /// The harness it moved to.
+        to: String,
+    },
+    /// The conversation was compacted. Reserved: the pure segmenter does not see
+    /// compactions; the wiring slice can open a boundary on one.
+    Compaction,
 }
 
 /// Stable identifier of a segment: a fixed hash, not a random id.
@@ -442,7 +518,18 @@ impl Segmenter {
             return None;
         };
 
-        let distance = current.fingerprint.distance_permille(print);
+        let distance = if dimension == Dimension::Harness {
+            // A harness switch is explicit: equality, not a distance, so a change of
+            // provider (or model, or a transient two-harness turn) always deviates and
+            // a segment can never get stuck by absorbing two harnesses.
+            if current.fingerprint == *print {
+                0
+            } else {
+                PERMILLE_MAX
+            }
+        } else {
+            current.fingerprint.distance_permille(print)
+        };
         if distance < threshold.distance_permille {
             // Back inside the segment: any run of deviations was a detour, not a change.
             track.pending.clear();
@@ -451,6 +538,18 @@ impl Segmenter {
             return None;
         }
 
+        // A deviating turn must head in the SAME new direction as the run already
+        // pending: two unrelated off-topic turns are not one change, they restart it.
+        if let Some(first) = track.pending.first() {
+            let consistent = if dimension == Dimension::Harness {
+                first.print == *print
+            } else {
+                first.print.distance_permille(print) < threshold.distance_permille
+            };
+            if !consistent {
+                track.pending.clear();
+            }
+        }
         track.pending.push(Pending {
             turn,
             print: print.clone(),
@@ -465,7 +564,7 @@ impl Segmenter {
         let pending = std::mem::take(&mut track.pending);
         let first = pending.first()?;
         let last = pending.last()?;
-        let reason = BoundaryReason {
+        let reason = BoundaryReason::Drift {
             distance_permille: first.distance,
             threshold_permille: threshold.distance_permille,
             confirmations: threshold.confirmations,
@@ -513,10 +612,18 @@ impl Segmenter {
     /// The segment `turn` belongs to on `dimension`: the latest one that started at or
     /// before it. A turn that deviates but is not yet confirmed still belongs to the
     /// current segment; it is moved when (and if) the boundary is confirmed.
+    ///
+    /// Segments are scanned in place (closed are already in confirmation order, the
+    /// open one is the latest), so this is O(number of segments) with no clone-and-sort,
+    /// not O(n²) per turn like the old `segments().rfind(..)`.
     pub fn segment_at(&self, dimension: Dimension, turn: u32) -> Option<Segment> {
-        self.segments()
-            .into_iter()
-            .rfind(|s| s.dimension == dimension && s.start_turn <= turn)
+        let open = self.tracks.get(&dimension).and_then(|t| t.current.as_ref());
+        self.closed
+            .iter()
+            .chain(open)
+            .filter(|s| s.dimension == dimension && s.start_turn <= turn)
+            .max_by_key(|s| s.start_turn)
+            .cloned()
     }
 
     /// Every boundary confirmed so far, in the order they were confirmed.
@@ -605,7 +712,10 @@ mod tests {
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].dimension, Dimension::Harness);
         assert_eq!(boundaries[0].at_turn, 2);
-        assert_eq!(boundaries[0].reason.confirmations, 1);
+        let BoundaryReason::Drift { confirmations, .. } = &boundaries[0].reason else {
+            panic!("a harness switch is a drift");
+        };
+        assert_eq!(*confirmations, 1);
         let before = segmenter.segment_at(Dimension::Harness, 1).unwrap();
         assert!(before.closed);
         assert_eq!(before.last_turn, 1);
@@ -639,8 +749,16 @@ mod tests {
         let boundary = &segmenter.boundaries()[0];
         // Confirmed on turn 3, but the direction changed on turn 2.
         assert_eq!(boundary.at_turn, 2);
-        assert_eq!(boundary.reason.distance_permille, 1_000);
-        assert_eq!(boundary.reason.threshold_permille, 700);
+        let BoundaryReason::Drift {
+            distance_permille,
+            threshold_permille,
+            ..
+        } = &boundary.reason
+        else {
+            panic!("a topic drift is a drift");
+        };
+        assert_eq!(*distance_permille, 1_000);
+        assert_eq!(*threshold_permille, 700);
         let old = segmenter.segment_at(Dimension::Topic, 1).unwrap();
         assert_eq!((old.start_turn, old.last_turn, old.closed), (0, 1, true));
         let new = segmenter.segment_at(Dimension::Topic, 3).unwrap();
@@ -891,5 +1009,179 @@ mod tests {
             );
         }
         assert!(segmenter.boundaries().is_empty());
+    }
+
+    #[test]
+    fn a_multi_label_harness_change_still_opens_a_boundary() {
+        // Review #2: a harness fingerprint that carries more than the provider id
+        // (e.g. provider + model) must still fire on ANY change. Strict equality,
+        // not a distance, so {a, a-chat} -> {a, a-reasoner} is a switch.
+        let mut segmenter = Segmenter::new(SegmentPolicy::default(), 7);
+        segmenter
+            .observe(&obs(
+                0,
+                &[(Dimension::Harness, &["deepseek", "deepseek-chat"])],
+            ))
+            .unwrap();
+        let boundaries = segmenter
+            .observe(&obs(
+                1,
+                &[(Dimension::Harness, &["deepseek", "deepseek-reasoner"])],
+            ))
+            .unwrap();
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].at_turn, 1);
+    }
+
+    #[test]
+    fn two_unrelated_off_topic_turns_do_not_confirm_a_boundary() {
+        // Review #6: two deviating turns that do not head in the same direction are
+        // two detours, not one change: the second restarts the pending run.
+        let segmenter = run(&[
+            topic(0, &["relay", "budget"]),
+            topic(1, &["relay", "budget"]),
+            topic(2, &["relay", "budget"]),
+            topic(3, &["weather"]),
+            topic(4, &["football"]),
+        ]);
+        assert!(segmenter.boundaries().is_empty());
+    }
+
+    #[test]
+    fn a_fingerprint_keeps_the_sorted_first_64_regardless_of_arrival_order() {
+        // Review #4: labels beyond the cap are dropped and the survivors are the
+        // lexicographically-first 64, so the result does not depend on arrival order.
+        let a: Vec<String> = (0..100).map(|i| format!("l{i:03}")).collect();
+        let mut b = a.clone();
+        b.reverse();
+        let fa = Fingerprint::new(a.iter().map(String::as_str));
+        let fb = Fingerprint::new(b.iter().map(String::as_str));
+        assert_eq!(fa, fb);
+        assert_eq!(fa.labels().count(), MAX_FINGERPRINT_LABELS);
+    }
+
+    #[test]
+    fn deserializing_an_invalid_threshold_is_refused() {
+        // Review #5: the wire form goes through Threshold::new, so out-of-range
+        // documents are refused instead of silently changing how the segmenter cuts.
+        let zero_distance: Result<Threshold, _> =
+            serde_json::from_str(r#"{"distance_permille":0,"confirmations":2}"#);
+        assert!(zero_distance.is_err());
+        let no_confirmation: Result<Threshold, _> =
+            serde_json::from_str(r#"{"distance_permille":700,"confirmations":0}"#);
+        assert!(no_confirmation.is_err());
+        let ok: Threshold =
+            serde_json::from_str(r#"{"distance_permille":700,"confirmations":2}"#).unwrap();
+        assert_eq!(ok, Threshold::new(700, 2).unwrap());
+    }
+
+    #[test]
+    fn deserializing_a_fingerprint_normalizes_it() {
+        // Review #5: stored labels are re-normalized (trim, lowercase, drop-empty,
+        // cap), not trusted as-is.
+        let f: Fingerprint = serde_json::from_str(r#"["  Relay ","RELAY","","Routing"]"#).unwrap();
+        assert_eq!(f.labels().collect::<Vec<_>>(), ["relay", "routing"]);
+    }
+
+    #[test]
+    fn segments_are_contiguous_and_do_not_overlap_on_one_axis() {
+        // Review #7: on one axis, a segment ends exactly where the next begins.
+        let segmenter = run(&[
+            topic(0, &["relay"]),
+            topic(1, &["relay"]),
+            topic(2, &["weather"]),
+            topic(3, &["weather"]),
+            topic(4, &["relay"]),
+            topic(5, &["relay"]),
+        ]);
+        let topic_segments: Vec<_> = segmenter
+            .segments()
+            .into_iter()
+            .filter(|s| s.dimension == Dimension::Topic)
+            .collect();
+        assert_eq!(topic_segments.len(), 3);
+        for window in topic_segments.windows(2) {
+            assert_eq!(window[0].last_turn + 1, window[1].start_turn);
+            assert!(window[0].closed);
+        }
+        assert!(!topic_segments.last().unwrap().closed);
+    }
+
+    #[test]
+    fn an_a_to_b_to_a_oscillation_gives_two_boundaries() {
+        // Review #7: A -> B -> A' is two boundaries; the ids chain A -> B -> A'.
+        let segmenter = run(&[
+            topic(0, &["a"]),
+            topic(1, &["a"]),
+            topic(2, &["b"]),
+            topic(3, &["b"]),
+            topic(4, &["a"]),
+            topic(5, &["a"]),
+        ]);
+        let boundaries = segmenter.boundaries();
+        assert_eq!(boundaries.len(), 2);
+        assert_eq!(boundaries[0].at_turn, 2);
+        assert_eq!(boundaries[1].at_turn, 4);
+        assert_eq!(
+            boundaries[0].to, boundaries[1].from,
+            "B ends where A' begins"
+        );
+        assert_ne!(
+            boundaries[0].from, boundaries[1].to,
+            "A and A' are distinct segments"
+        );
+    }
+
+    #[test]
+    fn a_change_on_the_first_turn_opens_no_boundary() {
+        // Review #7: the first observation of an axis opens a segment, it never deviates.
+        let mut segmenter = Segmenter::new(SegmentPolicy::default(), 7);
+        let boundaries = segmenter.observe(&topic(0, &["weather"])).unwrap();
+        assert!(boundaries.is_empty());
+        assert_eq!(segmenter.current(Dimension::Topic).unwrap().start_turn, 0);
+    }
+
+    #[test]
+    fn multiple_axes_can_open_boundaries_on_the_same_turn() {
+        // Review #7: harness (1 confirmation) and topic (2) can confirm on the same turn.
+        let mut segmenter = Segmenter::new(SegmentPolicy::default(), 7);
+        segmenter
+            .observe(&obs(
+                0,
+                &[(Dimension::Harness, &["a"]), (Dimension::Topic, &["x"])],
+            ))
+            .unwrap();
+        segmenter
+            .observe(&obs(
+                1,
+                &[(Dimension::Harness, &["a"]), (Dimension::Topic, &["y"])],
+            ))
+            .unwrap();
+        let boundaries = segmenter
+            .observe(&obs(
+                2,
+                &[(Dimension::Harness, &["b"]), (Dimension::Topic, &["y"])],
+            ))
+            .unwrap();
+        assert_eq!(boundaries.len(), 2);
+        let dims: Vec<_> = boundaries.iter().map(|b| b.dimension).collect();
+        assert!(dims.contains(&Dimension::Harness) && dims.contains(&Dimension::Topic));
+    }
+
+    #[test]
+    fn segment_at_is_none_before_the_first_segment_and_in_a_gap() {
+        // Review #7: a turn before the first segment, or in a gap with no evidence,
+        // belongs to no segment.
+        let mut segmenter = Segmenter::new(SegmentPolicy::default(), 7);
+        assert_eq!(segmenter.segment_at(Dimension::Topic, 0), None);
+        segmenter
+            .observe(&obs(2, &[(Dimension::Topic, &["relay"])]))
+            .unwrap();
+        assert_eq!(
+            segmenter.segment_at(Dimension::Topic, 1),
+            None,
+            "a turn before the first segment is a gap"
+        );
+        assert!(segmenter.segment_at(Dimension::Topic, 2).is_some());
     }
 }

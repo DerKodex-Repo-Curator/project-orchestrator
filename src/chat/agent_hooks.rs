@@ -3052,6 +3052,7 @@ mod image_routing_tests {
 #[cfg(test)]
 mod segment_tests {
     use super::*;
+    use crate::chat::provider::cognitive::segment::BoundaryReason;
 
     /// A decider that is never asked: these tests only feed observations.
     struct NoDecide;
@@ -3115,7 +3116,10 @@ mod segment_tests {
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].dimension, Dimension::Harness);
         assert_eq!(boundaries[0].at_turn, 2);
-        assert_eq!(boundaries[0].reason.confirmations, 1);
+        let BoundaryReason::Drift { confirmations, .. } = &boundaries[0].reason else {
+            panic!("a harness switch is a drift");
+        };
+        assert_eq!(*confirmations, 1);
         // The segmenter keeps the confirmed boundary, not just the per-turn return.
         assert_eq!(locked(&router.segmenter).boundaries().len(), 1);
     }
@@ -3135,7 +3139,10 @@ mod segment_tests {
         assert_eq!(boundaries.len(), 1);
         assert_eq!(boundaries[0].dimension, Dimension::Topic);
         assert_eq!(boundaries[0].at_turn, 2);
-        assert_eq!(boundaries[0].reason.confirmations, 2);
+        let BoundaryReason::Drift { confirmations, .. } = &boundaries[0].reason else {
+            panic!("a topic drift is a drift");
+        };
+        assert_eq!(*confirmations, 2);
     }
 
     #[test]

@@ -17,6 +17,17 @@
 //! labels come straight from the signature and the topic slice. Keeping this
 //! extraction separate from the segment decision is what makes the vocabulary
 //! testable and the segmentation replayable.
+//!
+//! # Arbitration with the existing per-class latch
+//!
+//! `agent_hooks.rs` already keeps a per-class anti-oscillation latch
+//! (`held_by_class`, `last_change_class`) and `moved_in`/`AFTER_PROVIDER_MOVE`
+//! bound provider moves. These segments do NOT replace them: the segmenter adds a
+//! conversation-scale, multi-axis signal on top, and only RELAXES the move guard
+//! on a confirmed boundary. `Topic` comes from [`super::topic::topic_labels`] on
+//! the turn's message text; `Problem`/`Resolution` come from `TaskSignature`'s
+//! class key; `Understanding` from the attempt count. (Decision recorded 2026-10,
+//! S2: keep both hystereses; do not wire a second independent latch.)
 
 use std::collections::BTreeMap;
 
