@@ -13,9 +13,9 @@ use super::config::ChatConfig;
 use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
-    classify_api_error, truncate_snippet, BackgroundTaskInfo, BackgroundTaskKind, ChatEvent,
-    ChatEventPage, ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult,
-    PendingMessage, SessionActivity, SessionWorkLog,
+    classify_api_error, is_out_of_credit_message, truncate_snippet, BackgroundTaskInfo,
+    BackgroundTaskKind, ChatEvent, ChatEventPage, ChatRequest, CreateSessionResponse,
+    MessageSearchHit, MessageSearchResult, PendingMessage, SessionActivity, SessionWorkLog,
 };
 use crate::events::attention::{notify_attention, AttentionReason, AttentionSubject};
 use crate::meilisearch::SearchStore;
@@ -2816,6 +2816,8 @@ pub(crate) fn interrupted_turn_end(
             usage,
             model,
             stop_reason: Some("interrupted".to_string()),
+            error_code: None,
+            error_message: None,
         },
         _ => ChatEvent::Result {
             session_id: String::new(),
@@ -2829,6 +2831,8 @@ pub(crate) fn interrupted_turn_end(
             usage: None,
             model: None,
             stop_reason: Some("interrupted".to_string()),
+            error_code: None,
+            error_message: None,
         },
     };
     stored_interrupted_result(&ended).unwrap_or(ended)
@@ -2872,6 +2876,8 @@ pub(crate) fn stored_interrupted_result(event: &ChatEvent) -> Option<ChatEvent> 
             usage: usage.clone(),
             model: model.clone(),
             stop_reason: stop_reason.clone(),
+            error_code: None,
+            error_message: None,
         }),
         _ => None,
     }
@@ -4478,6 +4484,7 @@ impl ChatManager {
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
         let documents = self.document_store.clone();
+        let cognitive_routing = self.cognitive_routing.clone();
 
         tokio::spawn(async move {
             let mut subscriber = match nats.subscribe_rpc_send(&session_id).await {
@@ -4840,6 +4847,7 @@ impl ChatManager {
                             let enrichment_pipeline_clone = enrichment_pipeline.clone();
                             let search_clone = search.clone();
                             let documents_clone = documents.clone();
+                            let cognitive_routing_clone = cognitive_routing.clone();
 
                             let active_sessions_for_turn = active_sessions.clone();
                             let session_id_for_turn = session_id.clone();
@@ -4867,6 +4875,7 @@ impl ChatManager {
                                     enrichment_pipeline_clone,
                                     search_clone,
                                     documents_clone,
+                                    cognitive_routing_clone,
                                 )
                                 .await;
                             });
@@ -6278,6 +6287,8 @@ impl ChatManager {
                     usage: None,
                     model: None,
                     stop_reason: None,
+                    error_code: None,
+                    error_message: None,
                 }]
             }
             Message::StreamEvent { event, .. } => match event {
@@ -7396,6 +7407,7 @@ impl ChatManager {
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
         let documents = self.document_store.clone();
+        let cognitive_routing = self.cognitive_routing.clone();
 
         let session_id_for_turn = session_id_str.clone();
         let turn_task = tokio::spawn(async move {
@@ -7422,6 +7434,7 @@ impl ChatManager {
                 enrichment_pipeline,
                 search,
                 documents,
+                cognitive_routing,
             )
             .await;
         });
@@ -8014,6 +8027,41 @@ impl ChatManager {
         }
     }
 
+    /// Marks the session's provider instance out of credit in the cognitive
+    /// router when a legacy-engine turn ended on an out-of-credit refusal
+    /// reported as TEXT (HTTP 402). The legacy CLI reports a 402 as raw text,
+    /// so the router's typed `ProviderError` check never sees it; the manager
+    /// calls this on the error text instead. The provider id is read from the
+    /// session node (frozen at open; `claude-code` when the node predates the
+    /// field), so nothing is plumbed through the turn.
+    async fn mark_out_of_credit_if_needed(
+        routing: Option<&super::provider::cognitive::decider::CognitiveRouting>,
+        graph: &Arc<dyn GraphStore>,
+        session_uuid: Option<Uuid>,
+        error_text: &str,
+    ) {
+        let Some(routing) = routing else {
+            return;
+        };
+        if !is_out_of_credit_message(error_text) {
+            return;
+        }
+        let provider_id = match session_uuid {
+            Some(uuid) => match graph.get_chat_session(uuid).await {
+                Ok(Some(node)) => node
+                    .provider_id
+                    .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string()),
+                _ => super::provider::resolver::CLAUDE_CODE.to_string(),
+            },
+            None => super::provider::resolver::CLAUDE_CODE.to_string(),
+        };
+        warn!(
+            provider = %provider_id,
+            "legacy turn ended out of credit; excluding the provider instance for a cooldown"
+        );
+        routing.mark_out_of_credit(&provider_id, Instant::now());
+    }
+
     /// Internal: send a message to the client and stream the response to broadcast
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream_response(
@@ -8041,6 +8089,7 @@ impl ChatManager {
         enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
         search: Arc<dyn crate::meilisearch::SearchStore>,
         documents: crate::documents::store::DocumentStore,
+        cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
     ) {
         // The tap that mirrors this session's Claude Code sub-agents (P18c, `chat::mirror`):
         // it sees each event AFTER it was broadcast, and never holds the turn.
@@ -8339,30 +8388,26 @@ impl ChatManager {
                             // Not retryable or max retries exceeded — propagate error
                             error!("Error starting stream for session {}: {}", session_id, e);
 
-                            // If this is a ChannelSendError (CLI is dead), remove the
-                            // session from active_sessions so the next user message
-                            // routes to resume_session instead of hitting the same dead CLI.
-                            let is_channel_dead = err_str.contains("channel")
-                                || err_str.contains("Channel")
-                                || err_str.contains("Not connected");
-                            if is_channel_dead {
-                                warn!(
-                                    "CLI appears dead for session {} ({}), removing from active_sessions \
-                                     so next message triggers resume_session",
-                                    session_id, err_str
+                            // A turn that never started leaves the session half-dead:
+                            // the CLI could not accept the write, whether the error
+                            // names the channel or not. Forget it so the next user
+                            // message routes to resume_session (a fresh CLI) instead
+                            // of re-hitting the same broken stdin. Only the entry of
+                            // THIS client: a resume that replaced it meanwhile keeps
+                            // its session and its NATS listeners (review of #685,
+                            // finding 2).
+                            warn!(
+                                "CLI could not start the stream for session {} ({}), removing from \
+                                 active_sessions so next message triggers resume_session",
+                                session_id, err_str
+                            );
+                            if Self::forget_if_client(&active_sessions, &session_id, &client).await
+                            {
+                                notify_attention(
+                                    &event_emitter,
+                                    AttentionSubject::Session(session_id.to_string()),
+                                    AttentionReason::SessionInactive,
                                 );
-                                // Only the entry of THIS client: a resume that
-                                // replaced it meanwhile keeps its session and its
-                                // NATS listeners (review of #685, finding 2).
-                                if Self::forget_if_client(&active_sessions, &session_id, &client)
-                                    .await
-                                {
-                                    notify_attention(
-                                        &event_emitter,
-                                        AttentionSubject::Session(session_id.to_string()),
-                                        AttentionReason::SessionInactive,
-                                    );
-                                }
                             }
 
                             emit_chat(
@@ -8812,6 +8857,16 @@ impl ChatManager {
                                         last_retry_error = text.clone();
                                         break; // break inner stream loop
                                     }
+                                    // A non-retryable refusal: a 402 (out of credit)
+                                    // must cool the instance down via the router, not
+                                    // repeat it on the next message.
+                                    Self::mark_out_of_credit_if_needed(
+                                        cognitive_routing.as_ref(),
+                                        &graph,
+                                        session_uuid,
+                                        text.as_str(),
+                                    )
+                                    .await;
                                 }
 
                                 // Collect assistant text for memory
@@ -9063,6 +9118,15 @@ impl ChatManager {
                                 } else {
                                     // Not retryable — propagate error
                                     error!("Stream error for session {}: {}", session_id, e);
+                                    // A 402 (out of credit) reported as text must cool
+                                    // the instance down via the router.
+                                    Self::mark_out_of_credit_if_needed(
+                                        cognitive_routing.as_ref(),
+                                        &graph,
+                                        session_uuid,
+                                        &err_str,
+                                    )
+                                    .await;
                                     let cli_gone = err_str.contains("ended before a Result");
                                     if cli_gone {
                                         warn!(
@@ -9395,6 +9459,7 @@ impl ChatManager {
             enrichment_pipeline,
             search,
             documents,
+            cognitive_routing,
         )
         .await;
     }
@@ -9600,6 +9665,7 @@ impl ChatManager {
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
         let documents = self.document_store.clone();
+        let cognitive_routing = self.cognitive_routing.clone();
 
         let session_id_for_turn = session_id_str.clone();
         let turn_task = tokio::spawn(async move {
@@ -9626,6 +9692,7 @@ impl ChatManager {
                 enrichment_pipeline,
                 search,
                 documents,
+                cognitive_routing,
             )
             .await;
         });
@@ -11737,6 +11804,7 @@ impl ChatManager {
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
         let documents = self.document_store.clone();
+        let cognitive_routing = self.cognitive_routing.clone();
 
         let session_id_for_turn = session_id_str.clone();
         let turn_task = tokio::spawn(async move {
@@ -11763,6 +11831,7 @@ impl ChatManager {
                 enrichment_pipeline,
                 search,
                 documents,
+                cognitive_routing,
             )
             .await;
         });
@@ -14214,9 +14283,14 @@ impl ChatManager {
             .await
             .into_iter()
             .collect();
-        let healthy_of = |id: &str| match measured.get(id) {
-            Some(ok) => *ok,
-            None => routing.health.get(id, Instant::now()).unwrap_or(false),
+        let healthy_of = |id: &str| {
+            if routing.out_of_credit(id, Instant::now()) {
+                return false;
+            }
+            match measured.get(id) {
+                Some(ok) => *ok,
+                None => routing.health.get(id, Instant::now()).unwrap_or(false),
+            }
         };
         // The catalogs of the healthy instances, all at once and each bounded: a
         // sequential wait here added `ROUTING_CATALOG_TIMEOUT` per instance (review
@@ -15431,7 +15505,17 @@ impl ChatManager {
         )
         .await
         {
-            Ok(result) => result.map_err(anyhow::Error::new)?,
+            Ok(result) => match result {
+                Ok(ok) => ok,
+                Err(error) => {
+                    if super::provider::cognitive::decider::is_out_of_credit(&error) {
+                        if let Some(routing) = self.cognitive_routing.as_ref() {
+                            routing.mark_out_of_credit(provider_id, std::time::Instant::now());
+                        }
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
+            },
             Err(_) => {
                 return Err(anyhow::Error::new(
                     nexus_claude::agent::ProviderError::Timeout {
@@ -16121,7 +16205,7 @@ impl ChatManager {
         {
             host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
         }
-        let (session, dropped) = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
+        let opened = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
             let provider = Arc::clone(&provider);
             let token = token.clone();
             async move {
@@ -16131,8 +16215,18 @@ impl ChatManager {
                 }
             }
         })
-        .await
-        .map_err(anyhow::Error::new)?;
+        .await;
+        let (session, dropped) = match opened {
+            Ok(ok) => ok,
+            Err(error) => {
+                if super::provider::cognitive::decider::is_out_of_credit(&error) {
+                    if let Some(routing) = self.cognitive_routing.as_ref() {
+                        routing.mark_out_of_credit(&provider_id, std::time::Instant::now());
+                    }
+                }
+                return Err(anyhow::Error::new(error));
+            }
+        };
         let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
         if without_mcp {
             // As at an opening: the token went out in the refused request.
@@ -20113,6 +20207,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: stop.map(str::to_string),
+            error_code: None,
+            error_message: None,
         };
         assert!(stored_interrupted_result(&result(Some("error"))).is_none());
         assert!(stored_interrupted_result(&result(None)).is_none());
@@ -25859,6 +25955,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
             ChatEvent::UserMessage {
                 content: "Hello".into(),
@@ -26022,6 +26120,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         }
     }
 
@@ -29871,6 +29971,156 @@ mod tests {
         let mut dead = InteractiveClient::from_transport(Box::new(DiesMidTurn));
         dead.connect().await.unwrap();
         a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(dead).await;
+    }
+
+    /// A connected CLI whose `send_message` fails without naming the channel:
+    /// the "half-dead" path. `send_and_receive_stream` reports a transport
+    /// error, not "Not connected", so the dead-channel heuristic does not fire.
+    struct RefusesToSend;
+
+    #[async_trait::async_trait]
+    impl nexus_claude::transport::Transport for RefusesToSend {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        async fn connect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_message(
+            &mut self,
+            _: nexus_claude::transport::InputMessage,
+        ) -> nexus_claude::Result<()> {
+            Err(nexus_claude::SdkError::TransportError(
+                "simulated send refusal".into(),
+            ))
+        }
+        fn receive_messages(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        async fn send_control_request(
+            &mut self,
+            _: nexus_claude::ControlRequest,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn receive_control_response(
+            &mut self,
+        ) -> nexus_claude::Result<Option<nexus_claude::ControlResponse>> {
+            Ok(None)
+        }
+        async fn send_sdk_control_request(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_sdk_control_response(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn disconnect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A write that fails with a NON-channel error ("Transport error: ...")
+    /// still leaves the session half-dead: the CLI could not accept the turn.
+    /// The turn must forget it so the next message resumes it instead of
+    /// re-hitting the same broken stdin.
+    #[tokio::test]
+    async fn a_turn_whose_write_fails_without_naming_the_channel_forgets_the_session() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let sid = Uuid::new_v4().to_string();
+        let (mut old, _) = create_dummy_session(false, "", vec![]);
+        let mut refusing = InteractiveClient::from_transport(Box::new(RefusesToSend));
+        refusing.connect().await.unwrap();
+        old.client = Arc::new(Mutex::new(refusing));
+        let mut events = old.events_tx.subscribe();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.clone(), old);
+
+        manager.send_message(&sid, "hi").await.unwrap();
+
+        // The turn reports the refusal ...
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(ChatEvent::Error { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("no error event"),
+                }
+            }
+        })
+        .await
+        .expect("the turn reports its refusal");
+
+        // ... and the half-dead session is gone, so the next message resumes it.
+        let sessions = manager.active_sessions.read().await;
+        assert!(
+            sessions.get(&sid).is_none(),
+            "the half-dead session is forgotten"
+        );
+    }
+
+    /// A legacy turn that ends on a 402 (out of credit) text marks the session's
+    /// provider instance out of credit in the router, reading the instance id
+    /// from the session node; a non-credit error leaves the instance alone.
+    #[tokio::test]
+    async fn a_legacy_out_of_credit_refusal_marks_the_provider_instance_out_of_credit() {
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut session = test_chat_session(None);
+        session.provider_id = Some("deepseek".into());
+        graph.create_chat_session(&session).await.unwrap();
+
+        let routing = CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new()));
+
+        ChatManager::mark_out_of_credit_if_needed(
+            Some(&routing),
+            &graph,
+            Some(session.id),
+            "API Error: 402 {\"type\":\"error\",\"error\":{\"message\":\"Insufficient credits\"}}",
+        )
+        .await;
+        assert!(
+            routing.out_of_credit("deepseek", Instant::now()),
+            "the provider instance is out of credit after a 402"
+        );
+
+        // A non-credit error does not mark another instance.
+        let mut other = test_chat_session(None);
+        other.provider_id = Some("elsewhere".into());
+        graph.create_chat_session(&other).await.unwrap();
+        ChatManager::mark_out_of_credit_if_needed(
+            Some(&routing),
+            &graph,
+            Some(other.id),
+            "API Error: 500 {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}",
+        )
+        .await;
+        assert!(
+            !routing.out_of_credit("elsewhere", Instant::now()),
+            "a non-credit error does not mark the instance"
+        );
     }
 
     /// Review of #685, finding 1: an agent-engine cancel listener reads no request

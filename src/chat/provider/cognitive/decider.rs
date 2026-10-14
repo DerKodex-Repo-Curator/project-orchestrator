@@ -383,6 +383,22 @@ impl ProbeOutcome {
     }
 }
 
+/// Whether an error means the ACCOUNT is out of credit (HTTP 402). Unlike a model
+/// refusal, this is about the account: auto-routing must stop sending to that
+/// instance until credit returns, instead of retrying the same send and erroring
+/// the chat.
+pub fn is_out_of_credit(error: &nexus_claude::agent::ProviderError) -> bool {
+    use nexus_claude::agent::ProviderError;
+    matches!(
+        error,
+        ProviderError::InvalidRequest { detail } if detail.starts_with("HTTP 402")
+    )
+}
+
+/// How long an out-of-credit instance stays out of the routing pool before it is
+/// re-checked (the next pool build re-probes it; if credit returned it resumes).
+pub const OUT_OF_CREDIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Capability probes of the routing: (instance, model) to what is known.
 pub type ProbeLog = std::collections::HashMap<(String, String), ProbeMark>;
 
@@ -616,6 +632,10 @@ pub struct CognitiveRouting {
     /// What is known of each native model's capability probe: a probe is sent once
     /// per model (a failure is retried later, a conclusion never), never twice at once.
     pub probed: Arc<std::sync::Mutex<ProbeLog>>,
+    /// Per-instance "out of credit" cooldown: when a 402 is observed, the instance is
+    /// excluded from the routing pool until this instant. It re-checks (and resumes)
+    /// once the cooldown has elapsed and the next probe/send sees credit again.
+    pub credit_until: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     /// The bounds of those probes.
     pub probe_policy: ProbePolicy,
     /// Where decisions and arms live, when the standard wiring built this; it is
@@ -643,6 +663,7 @@ impl CognitiveRouting {
             hints,
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
+            credit_until: Default::default(),
             probe_policy: ProbePolicy::standard(),
             store: Some(store),
             segment_store: None,
@@ -657,6 +678,7 @@ impl CognitiveRouting {
             hints: Arc::new(RwLock::new(PriorHints::new())),
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
+            credit_until: Default::default(),
             probe_policy: ProbePolicy::standard(),
             store: None,
             segment_store: None,
@@ -678,6 +700,24 @@ impl CognitiveRouting {
     pub fn with_segment_store(mut self, store: Arc<dyn SegmentStore>) -> Self {
         self.segment_store = Some(store);
         self
+    }
+
+    /// Marks `instance` out of credit for [`OUT_OF_CREDIT_COOLDOWN`].
+    pub fn mark_out_of_credit(&self, instance: &str, now: std::time::Instant) {
+        self.credit_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(instance.to_owned(), now + OUT_OF_CREDIT_COOLDOWN);
+    }
+
+    /// Whether `instance` is currently out of credit and must be excluded from
+    /// the routing pool.
+    pub fn out_of_credit(&self, instance: &str, now: std::time::Instant) -> bool {
+        self.credit_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(instance)
+            .is_some_and(|until| now < *until)
     }
 
     /// Replaces the alias hints.
@@ -1354,6 +1394,36 @@ mod tests {
         ] {
             assert_eq!(ProbeOutcome::of_error(&transient), ProbeOutcome::Failed);
         }
+    }
+
+    #[test]
+    fn an_out_of_credit_error_is_classified_and_cooldown_excludes_then_resumes() {
+        use nexus_claude::agent::ProviderError;
+        let refused = |detail: &str| ProviderError::InvalidRequest {
+            detail: detail.to_string(),
+        };
+        // 402 is about the ACCOUNT, not the model.
+        assert!(is_out_of_credit(&refused("HTTP 402: insufficient credits")));
+        assert!(!is_out_of_credit(&refused("HTTP 400: not a chat model")));
+        assert!(!is_out_of_credit(&ProviderError::RateLimited {
+            retry_after_ms: None
+        }));
+
+        let routing = CognitiveRouting::new(std::sync::Arc::new(InMemoryRoutingStore::new()));
+        let t0 = std::time::Instant::now();
+        assert!(!routing.out_of_credit("deepseek", t0));
+        routing.mark_out_of_credit("deepseek", t0);
+        assert!(routing.out_of_credit("deepseek", t0));
+        assert!(routing.out_of_credit(
+            "deepseek",
+            t0 + OUT_OF_CREDIT_COOLDOWN - std::time::Duration::from_secs(1)
+        ));
+        assert!(!routing.out_of_credit(
+            "deepseek",
+            t0 + OUT_OF_CREDIT_COOLDOWN + std::time::Duration::from_secs(1)
+        ));
+        // Another instance is unaffected.
+        assert!(!routing.out_of_credit("claude-code", t0));
     }
 
     /// Review of #709 (N2): a model the catalogue lists without tools is never reserved,

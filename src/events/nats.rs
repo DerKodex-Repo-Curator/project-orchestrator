@@ -764,6 +764,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
             ChatEvent::StreamDelta {
                 text: "tok".into(),

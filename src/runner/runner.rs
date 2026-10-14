@@ -5741,6 +5741,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         })
         .unwrap();
 
@@ -5807,6 +5809,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         })
         .unwrap();
 
@@ -5850,6 +5854,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         })
         .unwrap();
 
@@ -8731,6 +8737,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         })
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
@@ -9726,6 +9734,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         })
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
@@ -9745,6 +9755,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         })
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
