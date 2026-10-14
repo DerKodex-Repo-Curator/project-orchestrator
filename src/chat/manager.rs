@@ -3551,6 +3551,14 @@ impl ChatManager {
             .cognitive_routing
             .as_ref()
             .and_then(|routing| routing.segment_store.clone());
+        // S4: the conversation's persisted segmentation, read once here. A conversation
+        // reopened after a restart continues where it stopped; a fresh one has nothing to
+        // resume. Bounded, and never fatal: `read_segments_snapshot` starts a fresh
+        // segmentation rather than delaying or failing the turn.
+        let segments = match segment_store.as_ref() {
+            Some(store) => Self::read_segments_snapshot(store, session_id).await,
+            None => None,
+        };
         // A model the request named, or the user set by hand, stays pinned across a
         // resume or a restart: the pin is stored, not only held by the router.
         // A conversation given a pool (two models ticked or more) names its pilot, but PO still
@@ -3620,6 +3628,7 @@ impl ChatManager {
                 next_turn: turn.next_turn,
                 moved_in: turn.moved_in,
                 segment_store,
+                segments,
             },
         ));
         router.set_last_message(turn.message);
@@ -8060,6 +8069,37 @@ impl ChatManager {
             "legacy turn ended out of credit; excluding the provider instance for a cooldown"
         );
         routing.mark_out_of_credit(&provider_id, Instant::now());
+    }
+
+    /// The conversation's persisted segmentation, or `None` when there is nothing to
+    /// resume. Never a failure, and never a delay beyond `READ_TIMEOUT`: an absent, empty,
+    /// slow or unreadable store starts a fresh segmentation — a missing episodic memory
+    /// costs a boundary, never a turn.
+    async fn read_segments_snapshot(
+        store: &Arc<dyn super::provider::cognitive::segment_store::SegmentStore>,
+        conversation: &str,
+    ) -> Option<super::provider::cognitive::segment::SegmentsSnapshot> {
+        /// How long the stored segmentation is waited for when a router is built.
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
+        let read = async {
+            let segments = store.segments(conversation).await.ok()?;
+            let boundaries = store.boundaries(conversation).await.ok()?;
+            Some(super::provider::cognitive::segment::SegmentsSnapshot {
+                segments,
+                boundaries,
+            })
+        };
+        match tokio::time::timeout(READ_TIMEOUT, read).await {
+            Ok(Some(snapshot)) if !snapshot.is_empty() => Some(snapshot),
+            Ok(_) => None,
+            Err(_) => {
+                warn!(
+                    conversation,
+                    "conversation segments unreadable in time: fresh segmentation"
+                );
+                None
+            }
+        }
     }
 
     /// Internal: send a message to the client and stream the response to broadcast
@@ -32567,6 +32607,7 @@ mod image_turn_services_tests {
             next_turn: 0,
             moved_in: false,
             segment_store: None,
+            segments: None,
         }));
         router.set_model_live(true);
         let routing = Arc::new(TurnRouting::default());

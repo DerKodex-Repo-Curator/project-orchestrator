@@ -63,6 +63,9 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "routing_decision_id",
     // Plan triggers
     "trigger_signal_key",
+    // Conversation segments (episodic memory, S4)
+    "conversation_segment_key",
+    "conversation_boundary_key",
 ];
 
 /// Client for Neo4j operations
@@ -622,6 +625,14 @@ impl Neo4jClient {
             // Plan triggers: one reserved signal per (trigger, key), kept 24 h.
             "CREATE CONSTRAINT trigger_signal_key IF NOT EXISTS FOR (s:TriggerSignal) REQUIRE (s.trigger_id, s.key) IS UNIQUE",
             "CREATE INDEX trigger_signal_reserved_at IF NOT EXISTS FOR (s:TriggerSignal) ON (s.reserved_at)",
+            // Conversation segments (episodic memory, S4): the store MERGEs on
+            // (conversation, id) — never the id alone, since two conversations with the
+            // same seed derive the same segment ids. The constraint is what makes that
+            // MERGE atomic under concurrent writes (two turns of one conversation), and
+            // it carries the index the reads by conversation use.
+            "CREATE CONSTRAINT conversation_segment_key IF NOT EXISTS FOR (s:ConversationSegment) REQUIRE (s.conversation, s.id) IS UNIQUE",
+            // One boundary per (conversation, axis, turn): the natural key its MERGE uses.
+            "CREATE CONSTRAINT conversation_boundary_key IF NOT EXISTS FOR (b:ConversationBoundary) REQUIRE (b.conversation, b.dimension, b.at_turn) IS UNIQUE",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)

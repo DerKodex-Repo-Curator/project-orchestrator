@@ -60,12 +60,11 @@ impl Neo4jClient {
     /// boundaries (the caller does `put_segments` then `put_boundaries`), so the
     /// `PRECEDES` links the boundaries create have their endpoints.
     pub async fn put_segments_impl(&self, conversation: &str, segments: &[Segment]) -> Result<()> {
-        // The caller "replaces": drop what this conversation had, then write the
-        // new set. The deterministic ids make a re-`put` land on the same nodes.
-        let clear =
-            query("MATCH (s:ConversationSegment {conversation: $conversation}) DETACH DELETE s")
-                .param("conversation", conversation.to_string());
-        self.graph.run(clear).await?;
+        // Incremental, never a rewrite: the caller hands the WHOLE set of the
+        // conversation (it only ever grows), so a node already written is updated in
+        // place and only the new ones are created. Nothing is dropped first, so a crash
+        // mid-write can no longer lose the conversation's memory, and a long
+        // conversation does not pay O(segments) per boundary.
         for segment in segments {
             let json = serde_json::to_string(segment)?;
             let q = query(SEGMENT_MERGE)
@@ -76,6 +75,19 @@ impl Neo4jClient {
                 .param("json", json);
             self.graph.run(q).await?;
         }
+        // `put` REPLACES: what the conversation no longer has is removed. The set only
+        // grows in practice, so this prunes nothing on the normal path.
+        let ids: Vec<String> = segments
+            .iter()
+            .map(|segment| segment.id.as_str().to_string())
+            .collect();
+        let prune = query(
+            "MATCH (s:ConversationSegment {conversation: $conversation}) \
+             WHERE NOT (s.id IN $ids) DETACH DELETE s",
+        )
+        .param("conversation", conversation.to_string())
+        .param("ids", ids);
+        self.graph.run(prune).await?;
         Ok(())
     }
 
@@ -90,10 +102,11 @@ impl Neo4jClient {
         let mut result = self.graph.execute(q).await?;
         let mut segments = Vec::new();
         while let Some(row) = result.next().await? {
-            match segment_from_json(&row.get::<String>("json")?) {
-                Ok(segment) => segments.push(segment),
-                Err(error) => tracing::warn!(%error, "conversation segment skipped"),
-            }
+            // An unreadable row is an ERROR, never a silently shorter history: a partial
+            // view would make the caller resume from a truncated segmentation and open a
+            // boundary that never happened. Failing makes it start a fresh segmentation
+            // instead, which costs a boundary and never a turn.
+            segments.push(segment_from_json(&row.get::<String>("json")?)?);
         }
         Ok(order_segments(segments))
     }
@@ -107,10 +120,6 @@ impl Neo4jClient {
         conversation: &str,
         boundaries: &[Boundary],
     ) -> Result<()> {
-        let clear =
-            query("MATCH (b:ConversationBoundary {conversation: $conversation}) DETACH DELETE b")
-                .param("conversation", conversation.to_string());
-        self.graph.run(clear).await?;
         for boundary in boundaries {
             let json = serde_json::to_string(boundary)?;
             let q = query(
@@ -137,6 +146,18 @@ impl Neo4jClient {
                 tracing::warn!(conversation, %error, "segment boundary link not made");
             }
         }
+        // Same as the segments: what the conversation no longer has is removed.
+        let keys: Vec<String> = boundaries
+            .iter()
+            .map(|boundary| format!("{}#{}", boundary.dimension.as_str(), boundary.at_turn))
+            .collect();
+        let prune = query(
+            "MATCH (b:ConversationBoundary {conversation: $conversation}) \
+             WHERE NOT ((b.dimension + '#' + toString(b.at_turn)) IN $keys) DETACH DELETE b",
+        )
+        .param("conversation", conversation.to_string())
+        .param("keys", keys);
+        self.graph.run(prune).await?;
         Ok(())
     }
 
@@ -152,10 +173,8 @@ impl Neo4jClient {
         let mut result = self.graph.execute(q).await?;
         let mut boundaries = Vec::new();
         while let Some(row) = result.next().await? {
-            match boundary_from_json(&row.get::<String>("json")?) {
-                Ok(boundary) => boundaries.push(boundary),
-                Err(error) => tracing::warn!(%error, "conversation boundary skipped"),
-            }
+            // Same rule as the segments: an unreadable row fails the read.
+            boundaries.push(boundary_from_json(&row.get::<String>("json")?)?);
         }
         Ok(order_boundaries(boundaries))
     }
@@ -353,6 +372,14 @@ mod tests {
             b.segments().len()
         );
         assert!(store.segments("other").await.unwrap().is_empty());
+    }
+
+    /// S4: the read path REFUSES an unreadable row rather than skipping it, so a partial
+    /// history can never be resumed as if it were complete.
+    #[test]
+    fn an_unreadable_segment_or_boundary_json_is_an_error() {
+        assert!(segment_from_json("not json").is_err());
+        assert!(boundary_from_json("{}").is_err());
     }
 
     #[test]

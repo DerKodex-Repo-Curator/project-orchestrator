@@ -403,6 +403,25 @@ pub struct Boundary {
     pub reason: BoundaryReason,
 }
 
+/// A conversation's segmentation as it was persisted ([`Segmenter::segments`] plus
+/// [`Segmenter::boundaries`]). The wiring snapshots it on a confirmed boundary; a
+/// conversation reopened later reads it back with [`Segmenter::resume`], so its
+/// segmentation survives a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentsSnapshot {
+    /// Every segment of the conversation, closed and open.
+    pub segments: Vec<Segment>,
+    /// Every boundary, in the order it was confirmed.
+    pub boundaries: Vec<Boundary>,
+}
+
+impl SegmentsSnapshot {
+    /// Nothing to resume.
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty() && self.boundaries.is_empty()
+    }
+}
+
 /// A refused input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SegmentError {
@@ -420,6 +439,14 @@ pub enum SegmentError {
     /// A threshold that no observation can confirm.
     #[error("a boundary needs at least one confirmation")]
     NoConfirmation,
+    /// A snapshot that is not a segmentation this model can produce.
+    #[error("the {dimension:?} axis carries {count} open segments: a conversation has one open segment per axis")]
+    IncoherentSnapshot {
+        /// The axis that carries more than one open segment.
+        dimension: Dimension,
+        /// How many it carries.
+        count: usize,
+    },
 }
 
 /// An observation that deviates and is waiting to be confirmed.
@@ -471,6 +498,62 @@ impl Segmenter {
         for observation in observations {
             segmenter.observe(observation)?;
         }
+        Ok(segmenter)
+    }
+
+    /// Resumes a segmentation from a persisted [`SegmentsSnapshot`], instead of replaying
+    /// the observations: the open segment of each axis comes back with the labels it had
+    /// absorbed, so the next deviating turn is measured against what the conversation
+    /// already knew — not against nothing, which would open a spurious boundary.
+    ///
+    /// The snapshot is written on a confirmed boundary, so the axis that confirmed has no
+    /// pending deviation; a run pending on ANOTHER axis is not part of the snapshot, and
+    /// resuming can confirm that axis one turn later than an uninterrupted run would
+    /// (`a_pending_run_of_another_axis_is_not_restored`).
+    ///
+    /// Refused when one axis carries more than one open segment: the model never produces
+    /// that, so such a snapshot is corrupt rather than a segmentation.
+    pub fn resume(
+        policy: SegmentPolicy,
+        seed: u64,
+        snapshot: &SegmentsSnapshot,
+    ) -> Result<Self, SegmentError> {
+        let mut open_per_axis: BTreeMap<Dimension, usize> = BTreeMap::new();
+        for segment in &snapshot.segments {
+            if !segment.closed {
+                *open_per_axis.entry(segment.dimension).or_default() += 1;
+            }
+        }
+        if let Some((&dimension, &count)) = open_per_axis.iter().find(|(_, count)| **count > 1) {
+            return Err(SegmentError::IncoherentSnapshot { dimension, count });
+        }
+
+        let mut segmenter = Self::new(policy, seed);
+        for segment in &snapshot.segments {
+            if segment.closed {
+                segmenter.closed.push(segment.clone());
+            } else {
+                segmenter
+                    .tracks
+                    .entry(segment.dimension)
+                    .or_default()
+                    .current = Some(segment.clone());
+            }
+        }
+        // Closed segments come back in the order `segments()` publishes (axis, then first
+        // turn): a reader sorts or scans by axis, so the confirmation order is not needed.
+        segmenter
+            .closed
+            .sort_by(|a, b| (a.dimension, a.start_turn).cmp(&(b.dimension, b.start_turn)));
+        segmenter.boundaries = snapshot.boundaries.clone();
+        segmenter.last_turn = {
+            let segments = segmenter.segments();
+            segments
+                .iter()
+                .map(|segment| segment.last_turn)
+                .chain(segmenter.boundaries.iter().map(|boundary| boundary.at_turn))
+                .max()
+        };
         Ok(segmenter)
     }
 
@@ -657,6 +740,161 @@ mod tests {
 
     fn run(observations: &[Observation]) -> Segmenter {
         Segmenter::replay(SegmentPolicy::default(), 7, observations).unwrap()
+    }
+
+    fn snapshot_of(segmenter: &Segmenter) -> SegmentsSnapshot {
+        SegmentsSnapshot {
+            segments: segmenter.segments(),
+            boundaries: segmenter.boundaries().to_vec(),
+        }
+    }
+
+    /// S4: a conversation cut mid-way and resumed segments its FOLLOWING turns exactly as
+    /// an uninterrupted run does — same segments, same boundaries. The tail is also run on
+    /// a fresh segmenter, which differs: the snapshot really is used.
+    #[test]
+    fn resuming_from_a_snapshot_segments_the_following_turns_identically() {
+        let history = vec![
+            topic(0, &["routing"]),
+            topic(1, &["routing"]),
+            topic(2, &["docker"]),
+            topic(3, &["docker"]), // confirms the topic boundary, placed at turn 2
+            topic(4, &["docker"]),
+            topic(5, &["neo4j"]),
+            topic(6, &["neo4j"]), // confirms the second boundary, placed at turn 5
+        ];
+        let whole = run(&history);
+        assert_eq!(whole.boundaries().len(), 2);
+
+        let cut = 4;
+        let first_leg = run(&history[..cut]);
+        let snapshot = snapshot_of(&first_leg);
+        let mut resumed = Segmenter::resume(SegmentPolicy::default(), 7, &snapshot).unwrap();
+        for observation in &history[cut..] {
+            resumed.observe(observation).unwrap();
+        }
+        assert_eq!(resumed.segments(), whole.segments());
+        assert_eq!(resumed.boundaries(), whole.boundaries());
+
+        // The same tail on a FRESH segmenter is not the same conversation: without the
+        // snapshot the segmentation restarts, so this test is red if `resume` ignores it.
+        let mut fresh = Segmenter::new(SegmentPolicy::default(), 7);
+        for observation in &history[cut..] {
+            fresh.observe(observation).unwrap();
+        }
+        assert_ne!(fresh.segments(), whole.segments());
+    }
+
+    /// An empty snapshot behaves as a fresh segmenter.
+    #[test]
+    fn resuming_an_empty_snapshot_is_a_fresh_segmenter() {
+        let snapshot = SegmentsSnapshot {
+            segments: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        assert!(snapshot.is_empty());
+        let mut resumed = Segmenter::resume(SegmentPolicy::default(), 7, &snapshot).unwrap();
+        assert!(resumed.segments().is_empty());
+        assert!(resumed.boundaries().is_empty());
+        resumed.observe(&topic(0, &["routing"])).unwrap();
+        assert_eq!(resumed.segments().len(), 1);
+    }
+
+    /// The open segment comes back with the labels it had absorbed: the next turns of the
+    /// same subject are not mistaken for a new direction.
+    #[test]
+    fn the_open_segment_comes_back_with_the_labels_it_had_absorbed() {
+        let first = run(&[topic(0, &["routing"]), topic(1, &["routing"])]);
+        let mut resumed =
+            Segmenter::resume(SegmentPolicy::default(), 7, &snapshot_of(&first)).unwrap();
+        assert_eq!(
+            resumed.current(Dimension::Topic).map(|s| s.observations),
+            Some(2),
+            "the absorbed turns are restored"
+        );
+        assert!(resumed.observe(&topic(2, &["routing"])).unwrap().is_empty());
+        assert!(resumed.observe(&topic(3, &["routing"])).unwrap().is_empty());
+        assert_eq!(resumed.boundaries().len(), 0);
+    }
+
+    /// A snapshot is what the model produced, so an axis with two open segments is refused
+    /// rather than silently half-restored.
+    #[test]
+    fn two_open_segments_on_one_axis_are_refused() {
+        let first = run(&[topic(0, &["routing"])]);
+        let mut segments = first.segments();
+        let mut duplicate = segments[0].clone();
+        duplicate.start_turn = 99;
+        segments.push(duplicate);
+        let snapshot = SegmentsSnapshot {
+            segments,
+            boundaries: Vec::new(),
+        };
+        assert!(matches!(
+            Segmenter::resume(SegmentPolicy::default(), 7, &snapshot),
+            Err(SegmentError::IncoherentSnapshot {
+                dimension: Dimension::Topic,
+                count: 2
+            })
+        ));
+    }
+
+    /// S4, documented limit. The snapshot is taken ON a boundary, so the confirming axis
+    /// carries no pending deviation — but another axis may, and a pending run is not
+    /// persisted. Resuming then needs one more deviating turn to confirm that axis. This
+    /// test PINS the difference: it is a known property, not a surprise.
+    #[test]
+    fn a_pending_run_of_another_axis_is_not_restored() {
+        let head = vec![
+            obs(
+                0,
+                &[
+                    (Dimension::Harness, &["a"]),
+                    (Dimension::Topic, &["routing"]),
+                ],
+            ),
+            obs(
+                1,
+                &[
+                    (Dimension::Harness, &["a"]),
+                    (Dimension::Topic, &["routing"]),
+                ],
+            ),
+            // Harness switches: confirmed at once (one boundary, snapshot taken here).
+            // Topic drifts on the SAME turn: one deviating turn, still pending.
+            obs(
+                2,
+                &[
+                    (Dimension::Harness, &["b"]),
+                    (Dimension::Topic, &["docker"]),
+                ],
+            ),
+        ];
+        let next = obs(
+            3,
+            &[
+                (Dimension::Harness, &["b"]),
+                (Dimension::Topic, &["docker"]),
+            ],
+        );
+
+        let mut uninterrupted = run(&head);
+        assert_eq!(uninterrupted.boundaries().len(), 1);
+        assert_eq!(uninterrupted.boundaries()[0].dimension, Dimension::Harness);
+        uninterrupted.observe(&next).unwrap();
+        assert_eq!(
+            uninterrupted.boundaries().len(),
+            2,
+            "uninterrupted: the topic run confirms on its second turn"
+        );
+
+        let mut resumed =
+            Segmenter::resume(SegmentPolicy::default(), 7, &snapshot_of(&run(&head))).unwrap();
+        assert!(
+            resumed.observe(&next).unwrap().is_empty(),
+            "resumed: the discarded pending run restarts, so the boundary comes one turn later"
+        );
+        assert_eq!(resumed.boundaries().len(), 1);
     }
 
     #[test]

@@ -6030,6 +6030,7 @@ mod parity {
                 conversation_routes: false,
                 moved_in: false,
                 segment_store: None,
+                segments: None,
             },
         ));
         r.manager.turn_routing.insert(&r.sid, Arc::clone(&router));
