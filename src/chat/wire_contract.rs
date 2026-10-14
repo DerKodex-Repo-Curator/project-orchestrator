@@ -403,6 +403,8 @@ fn server_examples() -> Vec<ServerExample> {
                 ),
                 model: Some(s("example-model-large")),
                 stop_reason: Some(s("completed")),
+                error_code: None,
+                error_message: None,
             },
             ChatEvent::Result {
                 session_id: s(SESSION_ID),
@@ -416,6 +418,8 @@ fn server_examples() -> Vec<ServerExample> {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
         ),
         ServerExample::new(

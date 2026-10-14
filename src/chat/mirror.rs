@@ -1087,6 +1087,8 @@ impl Worker {
                 }
                 .to_string(),
             ),
+            error_code: None,
+            error_message: None,
         };
         self.append(call, result).await;
         if let Some(mirror) = self.mirrors.remove(call) {
@@ -1753,6 +1755,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         });
         tap.observe(&said("it broke", Some(CALL)));
         tap.flushed().await;
