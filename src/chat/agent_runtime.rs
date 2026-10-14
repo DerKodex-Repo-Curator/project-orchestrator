@@ -97,6 +97,17 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     }
 }
 
+/// Whether an event says the provider process is gone: the turn cannot go on, and
+/// no later message can be delivered to this session (it must be resumed instead).
+fn process_exited(event: &AgentEvent) -> bool {
+    let error = match event {
+        AgentEvent::Error { error } => Some(error),
+        AgentEvent::Done { error, .. } => error.as_ref(),
+        _ => None,
+    };
+    matches!(error, Some(ProviderError::ProcessExited { .. }))
+}
+
 /// The terminal event of a turn stopped before the provider answered (a Stop during
 /// the pause before a retry).
 fn interrupted_done() -> AgentEvent {
@@ -667,6 +678,10 @@ pub struct AgentSessionHandle {
     last_activity: std::sync::Mutex<Instant>,
     /// When its tool calls really ran (`tool_clock`): a `tool_timing` follows each result.
     tool_clock: Arc<super::tool_clock::ToolClock>,
+    /// The runtime's live-session registry, so this handle can remove itself once
+    /// its provider process is gone: a dead handle must not keep answering (and
+    /// re-failing) a session the manager will otherwise resume.
+    registry: std::sync::Weak<RwLock<HashMap<String, Arc<AgentSessionHandle>>>>,
 }
 
 impl AgentSessionHandle {
@@ -887,6 +902,24 @@ impl AgentSessionHandle {
                 error = %e,
                 "Failed to persist the resume token (retried at the next turn)"
             ),
+        }
+    }
+
+    /// Removes this handle from the runtime's registry once its provider process
+    /// has exited. A dead handle must not keep answering (and re-failing) a
+    /// session the manager will resume instead: once it is gone, the next message
+    /// takes the resume path. Only this handle is removed — a newer handle that
+    /// replaced it stays.
+    async fn detach_after_process_exit(&self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut sessions = registry.write().await;
+        if sessions
+            .get(&self.session_id)
+            .is_some_and(|live| std::ptr::eq(live.as_ref(), self))
+        {
+            sessions.remove(&self.session_id);
         }
     }
 
@@ -1298,6 +1331,10 @@ impl AgentSessionHandle {
         let mut turn_cost: Option<f64> = None;
         let retry_config = self.retry_config();
         let max_attempts = retry_config.max_attempts;
+        // A provider that died mid-turn leaves its handle dead: once the turn is
+        // over the handle is removed from the runtime, so the next message resumes
+        // the session instead of re-failing on a closed process.
+        let mut exited = false;
         loop {
             // Did the turn already show the user anything? A turn that did is
             // never replayed: it would repeat text or tool calls.
@@ -1307,6 +1344,7 @@ impl AgentSessionHandle {
                 // Terminal-ness is read on the original: a withheld terminal event
                 // still ends the turn.
                 let terminal = event.is_terminal();
+                exited |= process_exited(&event);
                 // The provider may have just named its session: stored before the
                 // terminal event goes out, so a client that saw the turn end can
                 // count on a resume.
@@ -1385,6 +1423,7 @@ impl AgentSessionHandle {
             match self.session.send_turn(input.clone()).await {
                 Ok(next) => stream = next,
                 Err(e) => {
+                    exited |= matches!(&e, ProviderError::ProcessExited { .. });
                     let ev = AgentEvent::Error { error: e };
                     let chat_events = self.mapper.lock().await.map(&ev);
                     for chat_event in chat_events {
@@ -1396,6 +1435,9 @@ impl AgentSessionHandle {
         }
         // The record carries the turn's cost before the session is seen idle.
         self.add_turn_cost(turn_cost).await;
+        if exited {
+            self.detach_after_process_exit().await;
+        }
         (outcome, pending_tools)
     }
 
@@ -1435,24 +1477,27 @@ impl AgentSessionHandle {
     /// The host's end of turn ([`TurnServices::after_turn`]), bounded: its events
     /// are emitted, its hints queued.
     async fn after_turn(&self, outcome: &TurnOutcome) {
+        self.after_turn_bounded(outcome, AFTER_TURN_BACKSTOP).await;
+    }
+
+    /// [`Self::after_turn`] under an explicit budget (tests shorten it). When the
+    /// host's end of turn does not finish in time it is skipped — recoverable, the
+    /// turn already completed — so it is announced as a non-terminal system note,
+    /// never as an `Error` that would read as a failed turn.
+    async fn after_turn_bounded(&self, outcome: &TurnOutcome, backstop: Duration) {
         let Some(services) = &self.services else {
             return;
         };
         let Some(after) = super::post_stream::bounded(
             &self.session_id,
             "after_turn",
-            AFTER_TURN_BACKSTOP,
+            backstop,
             services.after_turn(&self.session_id, outcome),
         )
         .await
         else {
-            self.emit(ChatEvent::Error {
-                message: "Error: the end-of-turn processing took too long: skipped".into(),
-                parent_tool_use_id: None,
-                code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
-                reason: Some("after_turn".to_string()),
-                index: None,
-                request_id: None,
+            self.emit(ChatEvent::SystemHint {
+                content: "The end-of-turn processing took too long and was skipped.".into(),
             })
             .await;
             return;
@@ -2018,7 +2063,9 @@ pub(crate) fn cancel_refused_event(capability: &str) -> ChatEvent {
 
 /// The live sessions of the agent path.
 pub struct AgentRuntime {
-    sessions: RwLock<HashMap<String, Arc<AgentSessionHandle>>>,
+    /// The live sessions, shared with each handle (as a `Weak`) so a handle can
+    /// remove itself once its provider process is gone.
+    sessions: Arc<RwLock<HashMap<String, Arc<AgentSessionHandle>>>>,
     graph: Arc<dyn GraphStore>,
     /// The third-party MCP tools the operator declared read-only
     /// (`ChatConfig::read_only_mcp_tools`): what each session's grants may cover
@@ -2030,7 +2077,7 @@ impl AgentRuntime {
     /// A runtime persisting its events in `graph`.
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             graph,
             read_only_mcp_tools: Vec::new(),
         }
@@ -2198,6 +2245,7 @@ impl AgentRuntime {
             opening_counted: AtomicBool::new(false),
             retry: std::sync::RwLock::new(RetryConfig::default()),
             last_activity: std::sync::Mutex::new(Instant::now()),
+            registry: Arc::downgrade(&self.sessions),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -4273,6 +4321,51 @@ mod after_turn_tests {
         let (provider, _host) = image_turn(None).await;
         assert!(provider.state.models.lock().unwrap().is_empty());
     }
+
+    /// A host whose end of turn never finishes: the runtime's backstop skips it.
+    struct StuckHost;
+
+    #[async_trait::async_trait]
+    impl TurnServices for StuckHost {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
+            sent.to_string()
+        }
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
+        }
+        async fn after_turn(&self, _session_id: &str, _outcome: &TurnOutcome) -> AfterTurn {
+            std::future::pending::<AfterTurn>().await
+        }
+    }
+
+    /// An `after_turn` that never returns is skipped and announced as a recoverable
+    /// system note, never as an `Error` that would read as a failed turn (B5).
+    #[tokio::test]
+    async fn an_abandoned_after_turn_is_a_recoverable_signal_not_an_error() {
+        let host = Arc::new(StuckHost);
+        let (_provider, handle) = rig(Some(host as Arc<dyn TurnServices>)).await;
+        let mut rx = handle.events_tx.subscribe();
+        handle
+            .after_turn_bounded(&TurnOutcome::default(), Duration::from_millis(20))
+            .await;
+        let mut note = false;
+        let mut error = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ChatEvent::SystemHint { .. } => note = true,
+                ChatEvent::Error { .. } => error = true,
+                _ => {}
+            }
+        }
+        assert!(note, "the skipped wrap-up is said as a system note");
+        assert!(!error, "no error event for a recoverable skip");
+    }
 }
 
 #[cfg(test)]
@@ -4346,6 +4439,65 @@ mod retry_stop_tests {
             );
         }
         assert!(ended, "a result with stop_reason interrupted");
+    }
+}
+
+/// What a provider process that exits does to its live handle (B4): the handle is
+/// dropped from the runtime so the next message resumes the session instead of
+/// re-failing on a dead process.
+#[cfg(test)]
+mod process_exit_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    /// A `ProcessExited` terminal event ends the turn, is said as a session error,
+    /// and removes the handle from the runtime: the next message takes the resume
+    /// path rather than re-failing on the dead process.
+    #[tokio::test]
+    async fn a_process_exit_removes_the_dead_handle_so_the_next_message_resumes() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("go").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(AgentEvent::Error {
+            error: ProviderError::ProcessExited { code: Some(1) },
+        });
+        // The turn ends once the terminal error is out; the handle detaches itself.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            runtime.get("not-a-uuid").await.is_none(),
+            "the dead handle must leave the registry"
+        );
+        // The client was told it was the session (not a plain in-stream error).
+        let mut session_error = false;
+        while let Ok(event) = rx.try_recv() {
+            session_error |= matches!(event, ChatEvent::SessionError { .. });
+        }
+        assert!(
+            session_error,
+            "the process exit was said as a session error"
+        );
     }
 }
 
@@ -4976,6 +5128,8 @@ mod stored_interrupted_result_tests {
                 usage: None,
                 model: None,
                 stop_reason: Some("interrupted".into()),
+                error_code: None,
+                error_message: None,
             })
             .await;
         let live = rx.recv().await.unwrap();

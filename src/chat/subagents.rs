@@ -1058,6 +1058,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         })
         .unwrap();
         assert_eq!(waiting.await.unwrap(), Ok("DONE".to_string()));
@@ -1198,6 +1200,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         };
         let said = |t: &str| ChatEvent::AssistantText {
             content: t.into(),
@@ -1234,6 +1238,8 @@ mod tests {
             usage: None,
             model: None,
             stop_reason: None,
+            error_code: None,
+            error_message: None,
         }
     }
 
@@ -1323,6 +1329,8 @@ mod tests {
                 usage: None,
                 model: None,
                 stop_reason: None,
+                error_code: None,
+                error_message: None,
             },
         );
         assert_eq!(answer_of(&seen), Some(Ok("last".into())));
