@@ -403,8 +403,8 @@ fn server_examples() -> Vec<ServerExample> {
                 ),
                 model: Some(s("example-model-large")),
                 stop_reason: Some(s("completed")),
-                error_code: None,
-                error_message: None,
+                error_code: Some(s("endpoint_unreachable")),
+                error_message: Some(s("The provider endpoint could not be reached.")),
             },
             ChatEvent::Result {
                 session_id: s(SESSION_ID),
@@ -1264,6 +1264,19 @@ fn derived_fields_mark_optional_and_nullable() {
     assert_eq!(
         result["num_turns"],
         json!({ "type": "number", "required": false })
+    );
+
+    // `Option` with `skip_serializing_if` → absent from `minimal`, present in
+    // `full` (ERR-1: a typed provider error is surfaced as a stable code plus a
+    // short human message). Keeping them `None` in `full` would drop them from
+    // the contract — these two assertions guard against that regression.
+    assert_eq!(
+        result["error_code"],
+        json!({ "type": "string", "required": false })
+    );
+    assert_eq!(
+        result["error_message"],
+        json!({ "type": "string", "required": false })
     );
 
     // Empty `Vec` skipped → not required.
