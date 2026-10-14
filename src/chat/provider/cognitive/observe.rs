@@ -170,7 +170,6 @@ mod tests {
     fn an_empty_topic_omits_the_topic_axis() {
         let observation = observation(0, "a", &signature(1), &[]);
         assert!(!observation.prints.contains_key(&Dimension::Topic));
-        assert!(observation.prints.get(&Dimension::Topic).is_none());
     }
 
     #[test]
