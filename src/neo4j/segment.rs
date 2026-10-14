@@ -354,4 +354,18 @@ mod tests {
         );
         assert!(store.segments("other").await.unwrap().is_empty());
     }
+
+    #[test]
+    fn segment_from_json_round_trips_a_serialized_segment() {
+        let segment = replay().segments().remove(0);
+        let json = serde_json::to_string(&segment).unwrap();
+        assert_eq!(segment_from_json(&json).unwrap(), segment);
+    }
+
+    #[test]
+    fn boundary_from_json_round_trips_a_serialized_boundary() {
+        let boundary = replay().boundaries()[0].clone();
+        let json = serde_json::to_string(&boundary).unwrap();
+        assert_eq!(boundary_from_json(&json).unwrap(), boundary);
+    }
 }

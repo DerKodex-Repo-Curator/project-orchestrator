@@ -28,6 +28,9 @@
 //! WARNING: point `NEO4J_URI` at a disposable instance. The default
 //! `bolt://localhost:7687` is a real Neo4j on many dev machines.
 
+use project_orchestrator::chat::provider::cognitive::segment::{
+    Boundary, Dimension, Fingerprint, Observation, Segment, SegmentPolicy, Segmenter,
+};
 use project_orchestrator::neo4j::models::*;
 use project_orchestrator::neo4j::{GraphStore, Neo4jClient};
 use uuid::Uuid;
@@ -1128,4 +1131,96 @@ async fn test_mcp_token_lifecycle_revocation_and_purge() {
     store.purge_mcp_tokens(other).await.unwrap();
     assert!(store.list_mcp_tokens(user).await.unwrap().is_empty());
     assert!(store.list_mcp_tokens(other).await.unwrap().is_empty());
+}
+
+// ===========================================================================
+// src/neo4j/segment.rs — the conversation segment query layer
+// ===========================================================================
+
+/// A two-turn harness switch: the first turn opens a segment on the harness
+/// axis, the second (a different harness) confirms a boundary at once, so the
+/// segmenter yields two segments and one boundary.
+fn a_harness_switch() -> (Vec<Segment>, Vec<Boundary>) {
+    let history = [
+        Observation {
+            turn: 0,
+            prints: [(Dimension::Harness, Fingerprint::new(["deepseek"]))]
+                .into_iter()
+                .collect(),
+        },
+        Observation {
+            turn: 1,
+            prints: [(Dimension::Harness, Fingerprint::new(["claude-code"]))]
+                .into_iter()
+                .collect(),
+        },
+    ];
+    let segmenter = Segmenter::replay(SegmentPolicy::default(), 7, &history).unwrap();
+    (segmenter.segments(), segmenter.boundaries().to_vec())
+}
+
+#[tokio::test]
+async fn test_segment_store_round_trips_and_replaces() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let conversation = Uuid::new_v4().to_string();
+    let (segments, boundaries) = a_harness_switch();
+    assert!(!segments.is_empty(), "the fixture must open a segment");
+    assert!(!boundaries.is_empty(), "the fixture must cut a boundary");
+
+    // --- an unknown conversation reads as empty, never as an error ---
+    assert!(store.get_segments(&conversation).await.unwrap().is_empty());
+    assert!(store
+        .get_boundaries(&conversation)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // --- happy path: segments and boundaries round-trip ---
+    store.put_segments(&conversation, &segments).await.unwrap();
+    assert_eq!(store.get_segments(&conversation).await.unwrap(), segments);
+    store
+        .put_boundaries(&conversation, &boundaries)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_boundaries(&conversation).await.unwrap(),
+        boundaries
+    );
+
+    // --- another conversation stays empty ---
+    let other = Uuid::new_v4().to_string();
+    assert!(store.get_segments(&other).await.unwrap().is_empty());
+    assert!(store.get_boundaries(&other).await.unwrap().is_empty());
+
+    // --- a second put replaces, never accumulates ---
+    store
+        .put_segments(&conversation, &segments[..1])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_segments(&conversation).await.unwrap(),
+        segments[..1].to_vec(),
+        "putting a subset must replace the stored set, not append to it"
+    );
+    store.put_boundaries(&conversation, &[]).await.unwrap();
+    assert!(
+        store
+            .get_boundaries(&conversation)
+            .await
+            .unwrap()
+            .is_empty(),
+        "putting no boundaries clears the stored ones"
+    );
+
+    // --- cleanup: clear what this test wrote ---
+    store.put_segments(&conversation, &[]).await.unwrap();
+    store.put_boundaries(&conversation, &[]).await.unwrap();
+    assert!(store.get_segments(&conversation).await.unwrap().is_empty());
+    assert!(store
+        .get_boundaries(&conversation)
+        .await
+        .unwrap()
+        .is_empty());
 }
