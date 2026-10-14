@@ -3372,6 +3372,36 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<bool>;
 
     // ========================================================================
+    // Conversation segments (episodic memory)
+    // ========================================================================
+
+    /// Stores (replacing) the conversation segments of a conversation.
+    async fn put_segments(
+        &self,
+        conversation: &str,
+        segments: &[crate::chat::provider::cognitive::segment::Segment],
+    ) -> Result<()>;
+
+    /// The stored conversation segments of a conversation, empty when none.
+    async fn get_segments(
+        &self,
+        conversation: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Segment>>;
+
+    /// Stores (replacing) the boundaries of a conversation.
+    async fn put_boundaries(
+        &self,
+        conversation: &str,
+        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
+    ) -> Result<()>;
+
+    /// The stored boundaries of a conversation, empty when none.
+    async fn get_boundaries(
+        &self,
+        conversation: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Boundary>>;
+
+    // ========================================================================
     // Health check
     // ========================================================================
 

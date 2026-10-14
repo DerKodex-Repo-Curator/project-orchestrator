@@ -3544,6 +3544,13 @@ impl ChatManager {
         turn: OpeningTurn<'_>,
     ) -> Option<Arc<super::agent_hooks::TurnRouter>> {
         let (decider, pool) = self.turn_routing.configured()?;
+        // The conversation's segments and boundaries are persisted on a confirmed boundary,
+        // when the process wired a graph-backed segment store (`CognitiveRouting.segment_store`).
+        // `None` keeps them in the session's segmenter only.
+        let segment_store = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.segment_store.clone());
         // A model the request named, or the user set by hand, stays pinned across a
         // resume or a restart: the pin is stored, not only held by the router.
         // A conversation given a pool (two models ticked or more) names its pilot, but PO still
@@ -3612,6 +3619,7 @@ impl ChatManager {
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
                 moved_in: turn.moved_in,
+                segment_store,
             },
         ));
         router.set_last_message(turn.message);
@@ -32558,6 +32566,7 @@ mod image_turn_services_tests {
             current_model: "flash".into(),
             next_turn: 0,
             moved_in: false,
+            segment_store: None,
         }));
         router.set_model_live(true);
         let routing = Arc::new(TurnRouting::default());

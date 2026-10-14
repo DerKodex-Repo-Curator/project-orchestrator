@@ -133,6 +133,8 @@ pub struct MockGraphStore {
     pub agent_executions: RwLock<HashMap<Uuid, crate::neo4j::agent_execution::AgentExecutionNode>>,
     /// Routing arms and decisions (cognitive routing).
     pub routing: crate::chat::provider::cognitive::store::InMemoryRoutingStore,
+    /// Conversation segments and boundaries (episodic memory).
+    pub segments: crate::chat::provider::cognitive::segment_store::InMemorySegmentStore,
     /// Failure injection: AgentExecution ids whose `update_agent_execution` errors.
     pub fail_agent_execution_updates: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     /// Failure injection: PlanRun ids whose `update_plan_run` errors.
@@ -376,6 +378,7 @@ impl MockGraphStore {
             frozen_active_plan_runs: std::sync::Mutex::new(None),
             agent_executions: RwLock::new(HashMap::new()),
             routing: Default::default(),
+            segments: Default::default(),
             fail_agent_execution_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_plan_run_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_get_plan: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -12454,6 +12457,42 @@ impl GraphStore for MockGraphStore {
     ) -> anyhow::Result<bool> {
         use crate::chat::provider::cognitive::store::RoutingArmStore;
         self.routing.set_outcome(id, outcome).await
+    }
+
+    // ── Conversation segments (in-memory mock) ──────────────────────────────
+
+    async fn put_segments(
+        &self,
+        conversation: &str,
+        segments: &[crate::chat::provider::cognitive::segment::Segment],
+    ) -> anyhow::Result<()> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.put_segments(conversation, segments).await
+    }
+
+    async fn get_segments(
+        &self,
+        conversation: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Segment>> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.segments(conversation).await
+    }
+
+    async fn put_boundaries(
+        &self,
+        conversation: &str,
+        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
+    ) -> anyhow::Result<()> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.put_boundaries(conversation, boundaries).await
+    }
+
+    async fn get_boundaries(
+        &self,
+        conversation: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Boundary>> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.boundaries(conversation).await
     }
 
     // ── AgentExecution (in-memory mock) ─────────────────────────────────────

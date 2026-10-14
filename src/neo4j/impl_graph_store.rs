@@ -4225,6 +4225,38 @@ impl GraphStore for Neo4jClient {
         self.set_routing_decision_outcome_impl(id, outcome).await
     }
 
+    // ── Conversation segments ───────────────────────────────────────────────
+
+    async fn put_segments(
+        &self,
+        conversation: &str,
+        segments: &[crate::chat::provider::cognitive::segment::Segment],
+    ) -> anyhow::Result<()> {
+        self.put_segments_impl(conversation, segments).await
+    }
+
+    async fn get_segments(
+        &self,
+        conversation: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Segment>> {
+        self.get_segments_impl(conversation).await
+    }
+
+    async fn put_boundaries(
+        &self,
+        conversation: &str,
+        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
+    ) -> anyhow::Result<()> {
+        self.put_boundaries_impl(conversation, boundaries).await
+    }
+
+    async fn get_boundaries(
+        &self,
+        conversation: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Boundary>> {
+        self.get_boundaries_impl(conversation).await
+    }
+
     // ── AgentExecution ──────────────────────────────────────────────────────
 
     async fn create_agent_execution(

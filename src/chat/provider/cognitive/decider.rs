@@ -16,6 +16,7 @@ use super::candidates::{self, ModelFacts, Slot};
 use super::decision::{CognitiveDecision, DecideRequest, Decider, DecisionAlternative, Pick};
 use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings};
 use super::scorer::{self, PriorHints, Scored};
+use super::segment_store::SegmentStore;
 use super::signature::TaskSignature;
 use super::store::{ArmStats, RoutingArmStore};
 use crate::chat::provider::resolver::Role;
@@ -640,6 +641,10 @@ pub struct CognitiveRouting {
     /// Where decisions and arms live, when the standard wiring built this; it is
     /// how a session's decision is linked and closed. `None` for a test decider.
     pub store: Option<Arc<dyn RoutingArmStore>>,
+    /// Where the conversation segments and boundaries live (the episodic memory),
+    /// when a graph-backed store is installed. `None` keeps them in the session
+    /// only (the in-memory default).
+    pub segment_store: Option<Arc<dyn SegmentStore>>,
     /// The live Anthropic model catalog: where the Claude Code candidates and
     /// their windows come from (`max_input_tokens`). `None` (tests, or no
     /// catalog wired): Claude Code adds only what its provider reports.
@@ -661,6 +666,7 @@ impl CognitiveRouting {
             credit_until: Default::default(),
             probe_policy: ProbePolicy::standard(),
             store: Some(store),
+            segment_store: None,
             claude_code_catalog: None,
         }
     }
@@ -675,6 +681,7 @@ impl CognitiveRouting {
             credit_until: Default::default(),
             probe_policy: ProbePolicy::standard(),
             store: None,
+            segment_store: None,
             claude_code_catalog: None,
         }
     }
@@ -685,6 +692,13 @@ impl CognitiveRouting {
         catalog: Arc<crate::chat::model_catalog::ModelCatalogCache>,
     ) -> Self {
         self.claude_code_catalog = Some(catalog);
+        self
+    }
+
+    /// Attaches a graph-backed segment store, so a conversation's segments and
+    /// boundaries outlive the process. Without it the default is in-memory only.
+    pub fn with_segment_store(mut self, store: Arc<dyn SegmentStore>) -> Self {
+        self.segment_store = Some(store);
         self
     }
 

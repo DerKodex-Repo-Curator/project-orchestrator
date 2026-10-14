@@ -10,8 +10,17 @@
 //! * **Problem** — the task class key, plus `"retry"` on any attempt after the
 //!   first.
 //! * **Resolution** — the task class key (how the problem is being solved).
-//! * **Understanding** — `"understood"` on the first attempt, `"uncertain"`
-//!   after.
+//!
+//! **Understanding is intentionally not fed.** The first cut pinned it to
+//! `"understood"` on the first attempt and `"uncertain"` after: a binary latch
+//! that adds nothing over the attempt count (already visible as `Problem`'s
+//! `"retry"` label) and, in the chat path, was constant (`from_chat_request`
+//! always sets `attempt = 1`, so it could never fire). There is no reliable,
+//! offline signal of "how well the situation is understood" yet, so rather than
+//! emit a degenerate axis that never changes, this slice leaves
+//! `Dimension::Understanding` out of the live observation. The variant stays in
+//! `segment.rs` (and the default policy keeps a threshold for it) for the day a
+//! real signal exists.
 //!
 //! Nothing here reads a message body, calls a model or touches the network: the
 //! labels come straight from the signature and the topic slice. Keeping this
@@ -26,8 +35,8 @@
 //! conversation-scale, multi-axis signal on top, and only RELAXES the move guard
 //! on a confirmed boundary. `Topic` comes from [`super::topic::topic_labels`] on
 //! the turn's message text; `Problem`/`Resolution` come from `TaskSignature`'s
-//! class key; `Understanding` from the attempt count. (Decision recorded 2026-10,
-//! S2: keep both hystereses; do not wire a second independent latch.)
+//! class key. (Decision recorded 2026-10, S2: keep both hystereses; do not wire a
+//! second independent latch.)
 
 use std::collections::BTreeMap;
 
@@ -70,15 +79,6 @@ pub fn observation(
         prints.insert(Dimension::Resolution, resolution);
     }
 
-    let understanding = Fingerprint::new([if signature.attempt == 1 {
-        "understood"
-    } else {
-        "uncertain"
-    }]);
-    if !understanding.is_empty() {
-        prints.insert(Dimension::Understanding, understanding);
-    }
-
     Observation { turn, prints }
 }
 
@@ -109,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn every_axis_is_populated_for_a_chat_turn() {
+    fn the_live_axes_are_populated_for_a_chat_turn() {
         let observation = observation(
             7,
             "deepseek",
@@ -117,7 +117,7 @@ mod tests {
             &["Relay".to_owned(), "provider".to_owned()],
         );
         assert_eq!(observation.turn, 7);
-        assert_eq!(observation.prints.len(), 5);
+        assert_eq!(observation.prints.len(), 4);
         assert_eq!(
             labels(observation.prints.get(&Dimension::Harness).unwrap()),
             ["deepseek"]
@@ -133,10 +133,6 @@ mod tests {
         assert_eq!(
             labels(observation.prints.get(&Dimension::Resolution).unwrap()),
             ["chat.debug"]
-        );
-        assert_eq!(
-            labels(observation.prints.get(&Dimension::Understanding).unwrap()),
-            ["understood"]
         );
     }
 
@@ -156,25 +152,17 @@ mod tests {
     }
 
     #[test]
-    fn understanding_flips_to_uncertain_after_attempt_one() {
-        assert_eq!(
-            labels(
-                observation(0, "a", &signature(1), &[])
-                    .prints
-                    .get(&Dimension::Understanding)
-                    .unwrap()
-            ),
-            ["understood"]
-        );
-        assert_eq!(
-            labels(
-                observation(0, "a", &signature(2), &[])
-                    .prints
-                    .get(&Dimension::Understanding)
-                    .unwrap()
-            ),
-            ["uncertain"]
-        );
+    fn understanding_is_not_fed_into_the_live_observation() {
+        // The axis is deliberately absent: the only signal we have (the attempt
+        // count) is a binary latch already carried by Problem's "retry" label and
+        // constant in the chat path. Feeding a degenerate axis would only add noise.
+        for attempt in [1, 2, 3] {
+            let observation = observation(0, "a", &signature(attempt), &[]);
+            assert!(
+                !observation.prints.contains_key(&Dimension::Understanding),
+                "Understanding must stay out of the live vocabulary (attempt={attempt})"
+            );
+        }
     }
 
     #[test]
