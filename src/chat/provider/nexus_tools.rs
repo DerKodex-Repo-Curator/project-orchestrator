@@ -36,7 +36,7 @@
 //!   authorised it for the project (`browser` document). Its stealth mode is never passed: this
 //!   module takes no argument for the browser.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 
-use super::endpoint_guard::origin_of;
+use super::endpoint_guard::{origin_of, validate_endpoint, EndpointPolicy};
 use super::settings::project_scope;
 use crate::neo4j::GraphStore;
 use crate::vault::grants::Denied;
@@ -363,6 +363,23 @@ pub async fn check_call(
     search_origins: &[String],
     call: &ToolCallInfo,
 ) -> Result<(), ToolAccessError> {
+    check_call_with(consents, project, search_origins, &BTreeSet::new(), call).await
+}
+
+/// The origin nexus-tools really connects to: it upgrades `http://` to `https://` first.
+fn reached(origin: &str) -> String {
+    origin.replacen("http://", "https://", 1)
+}
+
+/// [`check_call`] where `let_through` holds origins the caller already decided to allow for this
+/// call (Rock'n roll, [`ToolAccessHooks::with_trust`]), written as nexus-tools reaches them.
+pub async fn check_call_with(
+    consents: &dyn ToolConsents,
+    project: Option<&str>,
+    search_origins: &[String],
+    let_through: &BTreeSet<String>,
+    call: &ToolCallInfo,
+) -> Result<(), ToolAccessError> {
     let canonical = call.canonical.as_deref();
     let browser_tool = browser_tool_of(&call.name);
     if canonical == Some("WebFetch") {
@@ -374,23 +391,18 @@ pub async fn check_call(
         if needed[0].starts_with("http://") {
             needed.push(needed[0].replacen("http://", "https://", 1));
         }
-        return require_origins(consents, project, &needed).await;
+        return require_origins(consents, project, let_through, &needed).await;
     }
     if canonical == Some("WebSearch") {
-        let project = project.ok_or(ToolAccessError::SearchNotConsented)?;
-        for origin in search_origins {
-            if consents.origin_consented(project, origin).await? {
-                return Ok(());
-            }
+        // EVERY engine of the session must be allowed, not one of them: nexus-tools tries its
+        // engines in order and falls back to the next (`search/mod.rs`), so the engine that
+        // answers is not the one a check can name. An engine left unconsented would be reached
+        // through the fallback of one that is. The refusal names the first one to allow (the
+        // built-in engine's, before any consent), as a fetch to a new origin does.
+        if search_origins.is_empty() {
+            return Err(ToolAccessError::SearchNotConsented);
         }
-        // Name the origin to allow (the built-in engine's, before any consent): the refusal is
-        // then the same as a fetch to a new origin, and says what to allow.
-        return Err(match search_origins.first() {
-            Some(origin) => ToolAccessError::OriginNotConsented {
-                origin: origin.clone(),
-            },
-            None => ToolAccessError::SearchNotConsented,
-        });
+        return require_origins(consents, project, let_through, search_origins).await;
     }
     if let Some(tool) = browser_tool {
         let project = project.ok_or(ToolAccessError::BrowserNotAuthorized)?;
@@ -400,7 +412,7 @@ pub async fn check_call(
         if BROWSER_NAVIGATION.contains(&tool) {
             let url = call.input.get("url").and_then(Value::as_str);
             let origin = origin_of(url.unwrap_or_default()).ok_or(ToolAccessError::InvalidUrl)?;
-            return require_origins(consents, Some(project), &[origin]).await;
+            return require_origins(consents, Some(project), let_through, &[origin]).await;
         }
     }
     Ok(())
@@ -409,9 +421,13 @@ pub async fn check_call(
 async fn require_origins(
     consents: &dyn ToolConsents,
     project: Option<&str>,
+    let_through: &BTreeSet<String>,
     origins: &[String],
 ) -> Result<(), ToolAccessError> {
     for origin in origins {
+        if let_through.contains(&reached(origin)) {
+            continue;
+        }
         let allowed = match project {
             Some(project) => consents.origin_consented(project, origin).await?,
             // No project, no consent (A28): the same default as a model endpoint.
@@ -426,14 +442,75 @@ async fn require_origins(
     Ok(())
 }
 
+/// Whether the session is in `trust` (Rock'n roll) RIGHT NOW. Read at each call: a person can
+/// take the session out of trust, or back in, while it runs.
+pub type TrustProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+/// Tells the person something the session did on its own. Resolves to whether the text was
+/// handed to the session's event stream: a notice that was lost is sent again next time, and the
+/// call waits for it, so the notice comes before the tool's own events.
+pub type TrustNotice =
+    Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+
+/// Whether Rock'n roll opens the network of a session: the session's access is normal AND a
+/// PERSON put it in trust (and it has not left it). Never the mode alone: the runner, a protocol
+/// executor and a delegated task run in `bypassPermissions` with nobody in front of them, and a
+/// read-only session has no `Bash` (its denial wins over trust), so an open network would be a
+/// channel for what it reads. The same two conditions as the lift of the file scope
+/// ([`lifts_file_scope`]).
+pub fn trust_opens_network(access: super::policy::SessionAccess, chosen_by_person: bool) -> bool {
+    access == super::policy::SessionAccess::Normal && chosen_by_person
+}
+
+/// The posture an origin must pass for Rock'n roll to reach it without a consent of the project:
+/// the strict one of the endpoint guard (https only; nothing private, link-local, metadata or
+/// reserved), with no relaxation. nexus-tools' own fetch refuses the same classes.
+fn trust_origin_policy() -> EndpointPolicy {
+    EndpointPolicy {
+        allow_insecure_loopback: false,
+        ..EndpointPolicy::default()
+    }
+}
+
+/// Whether `origin` names the machine itself: `localhost` (or a name under it) or a loopback
+/// literal, IPv4-mapped IPv6 included. The endpoint guard accepts these on purpose, for a local
+/// inference server a person configured; a fetch an agent chose is another matter.
+fn names_the_machine_itself(origin: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return true;
+    };
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
 /// The `before_tool` gate of a native session: the revocation of its token, then the consent of
 /// its project, then (if both pass) the session's other hooks.
+///
+/// In Rock'n roll no consent is asked for: a PUBLIC origin is allowed on the spot and the person
+/// is told ([`Self::with_trust`]); who counts as being in Rock'n roll is [`trust_opens_network`].
+/// Nothing is written to the project's consent document, which stays an act of a person, and
+/// the permission is the session's, for as long as it stays in trust.
 pub struct ToolAccessHooks {
     inner: Option<Arc<dyn SessionHooks>>,
     consents: Arc<dyn ToolConsents>,
     session_id: String,
     project: Option<String>,
     search_origins: Vec<String>,
+    /// Whether the session is in trust now; `None`: never (the default).
+    trust: Option<TrustProbe>,
+    /// Where the person is told what trust allowed.
+    notice: Option<TrustNotice>,
+    /// The origins already announced: said once per origin, not at every call.
+    announced: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// The directories the session was launched with (cwd, then extra ones): what its file
     /// tools are held to when a session launched `--unscoped` left trust.
     scope_dirs: Option<(PathBuf, Vec<PathBuf>)>,
@@ -454,7 +531,85 @@ impl ToolAccessHooks {
             session_id: session_id.into(),
             project,
             search_origins,
+            trust: None,
+            notice: None,
+            announced: Default::default(),
             scope_dirs: None,
+        }
+    }
+
+    /// Lets a session in trust reach public origins without the project's consent, telling the
+    /// person through `notice`. `in_trust` is read at each call.
+    #[must_use]
+    pub fn with_trust(mut self, in_trust: TrustProbe, notice: TrustNotice) -> Self {
+        self.trust = Some(in_trust);
+        self.notice = Some(notice);
+        self
+    }
+
+    /// What trust makes of a refusal: the origin to let through when the session is in Rock'n roll
+    /// and the refusal is an origin without consent; `None` keeps the refusal. The origin is the
+    /// one nexus-tools REACHES (`http://` is upgraded to `https://`), which is also the one the
+    /// person is told about.
+    ///
+    /// Trust spares the person a question; it does not open the machine's own network. A public
+    /// origin only: the endpoint guard's strict posture (https, nothing private, link-local,
+    /// metadata or reserved) and no loopback literal or `localhost`, the same classes
+    /// nexus-tools' own fetch refuses (`web/ssrf.rs`). A broader reach would announce an access
+    /// the tool then refuses.
+    async fn allowed_by_trust(&self, refusal: &ToolAccessError) -> Option<String> {
+        let in_trust = self.trust.as_ref()?;
+        if !in_trust() {
+            return None;
+        }
+        let ToolAccessError::OriginNotConsented { origin } = refusal else {
+            return None;
+        };
+        let reached = reached(origin);
+        if names_the_machine_itself(&reached) {
+            return None;
+        }
+        if let Err(why) = validate_endpoint(&reached, &trust_origin_policy()).await {
+            tracing::warn!(
+                session_id = %self.session_id,
+                refusal = ?why,
+                "Rock'n roll does not cover this origin: refused"
+            );
+            return None;
+        }
+        Some(reached)
+    }
+
+    /// Tells the person `origin` was let through, once per origin, and traces it on the server.
+    /// The origin counts as told only once the notice was delivered: a notice that was lost is
+    /// sent again at the next call.
+    async fn announce(&self, origin: &str) {
+        tracing::warn!(
+            session_id = %self.session_id,
+            origin,
+            "network origin opened by Rock'n roll (no project consent)"
+        );
+        let Some(notice) = &self.notice else {
+            return;
+        };
+        let first = self
+            .announced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(origin.to_owned());
+        if !first {
+            return;
+        }
+        let delivered = notice(format!(
+            "Rock'n roll: network access to {origin} was allowed automatically for this \
+             session. It is not saved as a consent of the project."
+        ))
+        .await;
+        if !delivered {
+            self.announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(origin);
         }
     }
 
@@ -536,22 +691,38 @@ impl SessionHooks for ToolAccessHooks {
                 return HookVerdict::Deny { reason };
             }
         }
-        if let Err(refusal) = check_call(
-            self.consents.as_ref(),
-            self.project.as_deref(),
-            &self.search_origins,
-            call,
-        )
-        .await
-        {
-            tracing::warn!(
-                session_id = %self.session_id,
-                code = refusal.code(),
-                "network tool refused"
-            );
-            return HookVerdict::Deny {
-                reason: refusal.reason(),
-            };
+        // Rock'n roll opens the origins that lack a consent one by one (a fetch to `http://X`
+        // needs `https://X` too, a search needs every engine of the session): each is checked
+        // again with the ones already let through, and each is announced. The loop ends: it adds
+        // a new origin at every turn or returns.
+        let mut let_through = BTreeSet::new();
+        loop {
+            match check_call_with(
+                self.consents.as_ref(),
+                self.project.as_deref(),
+                &self.search_origins,
+                &let_through,
+                call,
+            )
+            .await
+            {
+                Ok(()) => break,
+                Err(refusal) => match self.allowed_by_trust(&refusal).await {
+                    Some(origin) if let_through.insert(origin.clone()) => {
+                        self.announce(&origin).await;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            session_id = %self.session_id,
+                            code = refusal.code(),
+                            "network tool refused"
+                        );
+                        return HookVerdict::Deny {
+                            reason: refusal.reason(),
+                        };
+                    }
+                },
+            }
         }
         match &self.inner {
             Some(inner) => inner.before_tool(call).await,
@@ -986,6 +1157,10 @@ pub async fn attach(
             };
             match consents.origin_consented(project, &origin).await {
                 Ok(true) => {}
+                // In trust the engine stays: the origin is judged at each call, where trust
+                // lets a public one through (and a session taken out of trust is held to the
+                // project's consent again, the same as the built-in engine below).
+                Ok(false) if input.policy.mode == nexus_claude::agent::PolicyMode::Trust => {}
                 Ok(false) => {
                     attachment.skipped_engines.push((
                         provider.id.clone(),
@@ -1465,8 +1640,17 @@ mod tests {
         check_call(&consents, Some("proj"), &origins, &search)
             .await
             .unwrap();
+        // No project, no consent (A28), exactly as for a fetch: the refusal names the origin to
+        // allow instead of the generic code, and Rock'n roll can open it like any other.
         assert_eq!(
             check_call(&consents, None, &origins, &search).await,
+            Err(ToolAccessError::OriginNotConsented {
+                origin: BRAVE_ORIGIN.to_owned()
+            })
+        );
+        // An engine-less session still has nothing to allow.
+        assert_eq!(
+            check_call(&consents, None, &[], &search).await,
             Err(ToolAccessError::SearchNotConsented)
         );
     }
@@ -1521,6 +1705,328 @@ mod tests {
             HookVerdict::AddContext("inner".into())
         );
         crate::auth::agent_tokens::revoke_session("hook-s1");
+    }
+
+    // ---- (0b) trust (Rock'n roll): public origins without a consent, and the person is told ----
+
+    /// Public IP literals: the guard needs no DNS to judge them, so these tests stay offline.
+    const PUBLIC: &str = "https://93.184.216.34";
+
+    type Said = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn trust_hooks(
+        session: &str,
+        in_trust: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (ToolAccessHooks, Said) {
+        crate::auth::agent_tokens::register_tools(session);
+        let said: Said = Arc::default();
+        let sink = said.clone();
+        let hooks = ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(Arc::new(MockGraphStore::new()))),
+            session,
+            Some("proj".into()),
+            Vec::new(),
+        )
+        .with_trust(
+            Arc::new(move || in_trust.load(std::sync::atomic::Ordering::SeqCst)),
+            Arc::new(move |text: String| {
+                sink.lock().unwrap().push(text);
+                Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
+            }),
+        );
+        (hooks, said)
+    }
+
+    fn flag(on: bool) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(on))
+    }
+
+    #[tokio::test]
+    async fn a_session_in_trust_reaches_a_public_origin_without_consent_and_says_so_once() {
+        let (hooks, said) = trust_hooks("trust-s1", flag(true));
+        assert_eq!(
+            hooks.before_tool(&fetch(&format!("{PUBLIC}/a"))).await,
+            HookVerdict::Continue
+        );
+        assert_eq!(
+            hooks.before_tool(&fetch(&format!("{PUBLIC}/b"))).await,
+            HookVerdict::Continue
+        );
+        {
+            let said = said.lock().unwrap();
+            assert_eq!(said.len(), 1, "said once per origin, not at every call");
+            assert!(said[0].contains(PUBLIC), "{}", said[0]);
+            assert!(said[0].contains("not saved"), "it is not a stored consent");
+        }
+        assert_eq!(
+            hooks.before_tool(&fetch("https://1.1.1.1/")).await,
+            HookVerdict::Continue
+        );
+        assert_eq!(
+            said.lock().unwrap().len(),
+            2,
+            "another origin is said again"
+        );
+        crate::auth::agent_tokens::revoke_session("trust-s1");
+    }
+
+    #[tokio::test]
+    async fn rock_n_roll_does_not_open_the_machines_own_network() {
+        // nexus-tools' own fetch refuses these classes (`web/ssrf.rs`); a gate that announced
+        // "allowed automatically" for them would announce an access the tool then refuses.
+        let (hooks, said) = trust_hooks("trust-s2", flag(true));
+        for url in [
+            "https://127.0.0.1/",
+            "https://[::1]/",
+            "https://localhost/",
+            "https://api.localhost/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://10.0.0.5/",
+            "https://192.168.1.1/admin",
+            "https://0.0.0.0/",
+            "http://127.0.0.1:8080/api/projects",
+        ] {
+            let verdict = hooks.before_tool(&fetch(url)).await;
+            let HookVerdict::Deny { reason } = verdict else {
+                panic!("{url} must stay refused in Rock'n roll, got {verdict:?}");
+            };
+            assert!(
+                reason.starts_with("tool_origin_not_allowed:"),
+                "{url}: {reason}"
+            );
+        }
+        assert!(
+            said.lock().unwrap().is_empty(),
+            "nothing allowed, nothing said"
+        );
+        crate::auth::agent_tokens::revoke_session("trust-s2");
+    }
+
+    #[tokio::test]
+    async fn a_session_out_of_trust_is_refused_as_before() {
+        let (hooks, said) = trust_hooks("trust-s3", flag(false));
+        let verdict = hooks.before_tool(&fetch(&format!("{PUBLIC}/"))).await;
+        let HookVerdict::Deny { reason } = verdict else {
+            panic!("a denial was expected, got {verdict:?}");
+        };
+        assert!(reason.starts_with("tool_origin_not_allowed:"));
+        assert!(said.lock().unwrap().is_empty());
+        crate::auth::agent_tokens::revoke_session("trust-s3");
+    }
+
+    #[tokio::test]
+    async fn leaving_trust_takes_the_permission_back_even_for_an_origin_already_announced() {
+        let mode = flag(true);
+        let (hooks, said) = trust_hooks("trust-s4", mode.clone());
+        let url = format!("{PUBLIC}/");
+        assert_eq!(hooks.before_tool(&fetch(&url)).await, HookVerdict::Continue);
+        mode.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(
+                hooks.before_tool(&fetch(&url)).await,
+                HookVerdict::Deny { .. }
+            ),
+            "announcing an origin is not a grant"
+        );
+        mode.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(hooks.before_tool(&fetch(&url)).await, HookVerdict::Continue);
+        assert_eq!(
+            said.lock().unwrap().len(),
+            1,
+            "back in trust: not announced twice"
+        );
+        crate::auth::agent_tokens::revoke_session("trust-s4");
+    }
+
+    #[tokio::test]
+    async fn an_http_origin_is_judged_and_announced_as_the_https_origin_nexus_tools_reaches() {
+        let (hooks, said) = trust_hooks("trust-s5", flag(true));
+        assert_eq!(
+            hooks.before_tool(&fetch("http://93.184.216.34/")).await,
+            HookVerdict::Continue
+        );
+        {
+            let said = said.lock().unwrap();
+            assert_eq!(said.len(), 1, "one notice, not one per scheme: {said:?}");
+            assert!(said[0].contains("https://93.184.216.34"), "{}", said[0]);
+            assert!(
+                !said[0].contains("http://"),
+                "the origin reached: {}",
+                said[0]
+            );
+        }
+        assert!(matches!(
+            hooks.before_tool(&fetch("http://10.0.0.5/")).await,
+            HookVerdict::Deny { .. }
+        ));
+        // A request that names no origin at all stays refused.
+        assert!(matches!(
+            hooks.before_tool(&fetch("not a url")).await,
+            HookVerdict::Deny { .. }
+        ));
+        crate::auth::agent_tokens::revoke_session("trust-s5");
+    }
+
+    /// A search with `engines` attached, the project consenting to `consented` of them.
+    async fn search_hooks(
+        session: &str,
+        engines: &[&str],
+        consented: &[&str],
+        in_trust: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (ToolAccessHooks, Said) {
+        let graph = Arc::new(MockGraphStore::new());
+        for origin in consented {
+            store_consent(&graph, "proj", origin).await;
+        }
+        crate::auth::agent_tokens::register_tools(session);
+        let said: Said = Arc::default();
+        let sink = said.clone();
+        let hooks = ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(graph)),
+            session,
+            Some("proj".into()),
+            engines.iter().map(|e| (*e).to_owned()).collect(),
+        )
+        .with_trust(
+            Arc::new(move || in_trust.load(std::sync::atomic::Ordering::SeqCst)),
+            Arc::new(move |text: String| {
+                sink.lock().unwrap().push(text);
+                Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
+            }),
+        );
+        (hooks, said)
+    }
+
+    fn web_search() -> ToolCallInfo {
+        call(
+            "mcp__nexus__WebSearch",
+            Some("WebSearch"),
+            json!({"query": "antibes"}),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_search_needs_every_engine_of_the_session_allowed_not_one_of_them() {
+        const A: &str = "https://93.184.216.34";
+        const B: &str = "https://1.1.1.1";
+        // nexus-tools falls back from one engine to the next: the project consents to A only, so
+        // B would be reached through A's fallback. Outside Rock'n roll that is refused, naming B.
+        let mode = flag(false);
+        let (hooks, said) = search_hooks("trust-s7", &[A, B], &[A], mode.clone()).await;
+        let HookVerdict::Deny { reason } = hooks.before_tool(&web_search()).await else {
+            panic!("a denial was expected");
+        };
+        assert!(reason.starts_with("tool_origin_not_allowed:"), "{reason}");
+        assert!(reason.contains(B) && !reason.contains(A), "{reason}");
+        // In Rock'n roll the engine without a consent is opened and announced, and ONLY it.
+        mode.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            hooks.before_tool(&web_search()).await,
+            HookVerdict::Continue
+        );
+        {
+            let said = said.lock().unwrap();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(said[0].contains(B), "{}", said[0]);
+        }
+        // Out again: the allowance was the mode's, B is refused once more.
+        mode.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            hooks.before_tool(&web_search()).await,
+            HookVerdict::Deny { .. }
+        ));
+        crate::auth::agent_tokens::revoke_session("trust-s7");
+    }
+
+    #[tokio::test]
+    async fn every_engine_without_a_consent_is_announced_in_rock_n_roll() {
+        let (hooks, said) = search_hooks(
+            "trust-s8",
+            &["https://93.184.216.34", "https://1.1.1.1"],
+            &[],
+            flag(true),
+        )
+        .await;
+        assert_eq!(
+            hooks.before_tool(&web_search()).await,
+            HookVerdict::Continue
+        );
+        let said = said.lock().unwrap();
+        assert_eq!(said.len(), 2, "one notice per engine: {said:?}");
+        drop(said);
+        crate::auth::agent_tokens::revoke_session("trust-s8");
+    }
+
+    #[tokio::test]
+    async fn a_notice_that_was_lost_is_sent_again_at_the_next_call() {
+        crate::auth::agent_tokens::register_tools("trust-s9");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let hooks = ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(Arc::new(MockGraphStore::new()))),
+            "trust-s9",
+            Some("proj".into()),
+            Vec::new(),
+        )
+        .with_trust(
+            Arc::new(|| true),
+            Arc::new(move |_text: String| {
+                // The first delivery fails (the session's stream was not there), the next works.
+                let first = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                Box::pin(async move { !first }) as futures::future::BoxFuture<'static, bool>
+            }),
+        );
+        let url = format!("{PUBLIC}/");
+        assert_eq!(hooks.before_tool(&fetch(&url)).await, HookVerdict::Continue);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hooks.before_tool(&fetch(&url)).await, HookVerdict::Continue);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the lost notice is sent again"
+        );
+        assert_eq!(hooks.before_tool(&fetch(&url)).await, HookVerdict::Continue);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "and once delivered it is not repeated"
+        );
+        crate::auth::agent_tokens::revoke_session("trust-s9");
+    }
+
+    #[test]
+    fn rock_n_roll_opens_the_network_only_for_a_normal_session_a_person_put_in_trust() {
+        use crate::chat::provider::policy::SessionAccess;
+        // A person chose trust on a normal session: open.
+        assert!(trust_opens_network(SessionAccess::Normal, true));
+        // The runner, a protocol executor, a delegated task and a session nobody owns run in
+        // `bypassPermissions` with nobody to have chosen it: closed.
+        assert!(!trust_opens_network(SessionAccess::Normal, false));
+        // A read-only session has no Bash (its denial wins over trust): an open network would be
+        // its channel out, even when a person chose trust.
+        assert!(!trust_opens_network(SessionAccess::ReadOnly, true));
+        assert!(!trust_opens_network(SessionAccess::ReadOnly, false));
+    }
+
+    #[tokio::test]
+    async fn a_session_without_the_trust_wiring_keeps_the_old_refusal() {
+        crate::auth::agent_tokens::register_tools("trust-s6");
+        let hooks = ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(Arc::new(MockGraphStore::new()))),
+            "trust-s6",
+            Some("proj".into()),
+            Vec::new(),
+        );
+        assert!(matches!(
+            hooks.before_tool(&fetch(&format!("{PUBLIC}/"))).await,
+            HookVerdict::Deny { .. }
+        ));
+        crate::auth::agent_tokens::revoke_session("trust-s6");
     }
 
     // ---- (1) the token: signed, bound, revocable, never on argv -------------------------
@@ -2246,6 +2752,29 @@ mod tests {
         );
         assert!(!attachment.tools.contains(&"WebSearch".to_owned()));
         crate::auth::agent_tokens::revoke_session("srch-s4");
+    }
+
+    #[tokio::test]
+    async fn a_session_in_trust_keeps_an_engine_whose_origin_the_project_never_consented_to() {
+        let graph = Arc::new(MockGraphStore::new());
+        store_provider(&graph, &brave("brave-main")).await;
+        let vault = vault_with_key(Some("tool:brave-main")).await;
+        let trust = ToolPolicy::new(PolicyMode::Trust);
+        let attachment = attach(
+            &config(),
+            &GraphConsents(graph),
+            Some(&vault),
+            input("srch-s4t", &trust, Some("proj")),
+        )
+        .await;
+        assert!(
+            attachment.skipped_engines.is_empty(),
+            "{:?}",
+            attachment.skipped_engines
+        );
+        assert!(attachment.tools.contains(&"WebSearch".to_owned()));
+        assert_eq!(attachment.search_origins, [BRAVE_ORIGIN]);
+        crate::auth::agent_tokens::revoke_session("srch-s4t");
     }
 
     // ---- (4b) the built-in `obscura` engine (decision 1e9d7501) -------------------------------

@@ -135,6 +135,33 @@ pub fn is_scope_lifted(session_id: &str) -> bool {
         .is_some_and(|live| *live)
 }
 
+/// Sessions where a PERSON chose trust and it still holds: the owner switched to it (REST create
+/// or WebSocket switch on their own session), and the session has not left it since. Read by the
+/// network gate: Rock'n roll opens the network only for a session a person put in trust, never
+/// for one that is merely in `bypassPermissions` (the runner, a protocol executor, a delegated
+/// task, a session nobody owns), and the same flag as the file-scope lift
+/// ([`set_scope_lift_live`]) feeds it, set and cleared at the same two places.
+static PERSON_TRUST: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Records whether a person's choice of trust holds for the session.
+pub fn set_person_trust(session_id: &str, holds: bool) {
+    let mut set = PERSON_TRUST.write().unwrap_or_else(|e| e.into_inner());
+    if holds {
+        set.insert(session_id.to_string());
+    } else {
+        set.remove(session_id);
+    }
+}
+
+/// Whether a person's choice of trust holds for the session right now.
+pub fn person_trust(session_id: &str) -> bool {
+    PERSON_TRUST
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(session_id)
+}
+
 /// Whether the session's `nexus-tools` runs `--unscoped` while its lift no longer holds: the
 /// backend must then refuse every file tool call outside the session's directories.
 pub fn must_confine_unscoped(session_id: &str) -> bool {
@@ -149,6 +176,7 @@ pub fn must_confine_unscoped(session_id: &str) -> bool {
 /// profile token. Returns how many were revoked.
 pub fn revoke_session(session_id: &str) -> usize {
     set_out_of_trust(session_id, false);
+    set_person_trust(session_id, false);
     UNSCOPED
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -228,6 +256,22 @@ mod tests {
         assert!(!is_live("jti-old"));
         assert!(is_live("jti-new"));
         revoke_session("sess-respawn");
+    }
+
+    #[test]
+    fn a_persons_choice_of_trust_is_per_session_and_dies_with_the_session() {
+        assert!(
+            !person_trust("sess-pt"),
+            "nobody chose trust: closed by default"
+        );
+        set_person_trust("sess-pt", true);
+        assert!(person_trust("sess-pt"));
+        assert!(!person_trust("sess-other"), "another session is untouched");
+        set_person_trust("sess-pt", false);
+        assert!(!person_trust("sess-pt"), "leaving trust takes it back");
+        set_person_trust("sess-pt", true);
+        revoke_session("sess-pt");
+        assert!(!person_trust("sess-pt"), "a closed session keeps nothing");
     }
 
     #[test]
