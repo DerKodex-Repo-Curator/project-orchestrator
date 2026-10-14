@@ -859,15 +859,12 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     let direction_changed = boundaries
         .iter()
         .any(|boundary| boundary.dimension != Dimension::Harness);
-    // R-S3: a confirmed non-harness boundary re-opens the decision. `held_by_class` would
-    // hold a turn that follows a change of the SAME class (steady, no exploration); a turn
-    // the conversation actually changed direction on is instead decided FRESH, so the
-    // decider re-evaluates provider AND model for the new direction. `may_move` below already
-    // drops the `after_provider_move` restriction when `direction_changed` is set, so the
-    // provider question re-opens too. A harness boundary is a provider switch (already
-    // handled by `moved_in`): `direction_changed` excludes it, so it keeps the guard.
-    let held =
-        held_by_class(&locked(&router.state), turn, &signature.arm_key()) && !direction_changed;
+    // R-S3: `held_by_class` is keyed on the CLASS (`arm_key`), which a Problem/Resolution
+    // boundary already reflects (both carry `class.key()`): a class change lifts the steady
+    // guard naturally. `direction_changed` only relaxes `may_move` below (the provider
+    // question re-opens right after a move) — it must NOT lift `held_by_class`, because a
+    // TOPIC-only change keeps the same class and thus the same steady model choice.
+    let held = held_by_class(&locked(&router.state), turn, &signature.arm_key());
     let segment_note = (!boundaries.is_empty()).then(|| {
         boundaries
             .iter()
@@ -972,14 +969,10 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
     // Every turn feeds the segmenter exactly once. A turn already observed by the provider
     // check (mode `full`) is a repeated turn here and is tolerated as a no-op; the sessions
     // the provider check never runs for (mode `mixed`, one provider) are observed here.
-    let boundaries = router.observe_turn(ctx.turn_index, &router.provider_id);
-    // A confirmed non-harness boundary re-opens the decision here too (matching
-    // `plan_provider_move`): a turn the conversation actually changed direction on is
-    // decided FRESH, not held steady. A harness boundary is a provider switch, not a change
-    // of direction, so it keeps the guard (`direction_changed` excludes it).
-    let direction_changed = boundaries
-        .iter()
-        .any(|boundary| boundary.dimension != Dimension::Harness);
+    // Observe here for mode `mixed` (the provider check never runs); it feeds the segmenter
+    // once and persists segments on a confirmed boundary. The boundary list itself is not
+    // needed for the model decision: `held_by_class` is keyed on the class (arm_key).
+    let _ = router.observe_turn(ctx.turn_index, &router.provider_id);
     let predecided = locked(&router.predecided)
         .take()
         .filter(|pre| pre.turn_index == ctx.turn_index);
@@ -995,11 +988,9 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         None => {
             // R-S3: right after a change, a turn of the same class is decided without
             // exploration (the hysteresis margin alone may move it); another class is routed
-            // as any turn. A confirmed non-harness boundary lifts the steady guard, matching
-            // `plan_provider_move`: a turn the conversation really changed direction on is
-            // decided fresh.
-            let held =
-                held_by_class(&locked(&router.state), ctx.turn_index, &class) && !direction_changed;
+            // as any turn. A class change (Problem/Resolution boundary) already lifts
+            // `held_by_class` through the class itself.
+            let held = held_by_class(&locked(&router.state), ctx.turn_index, &class);
             let (mut pool, project) = provider_pool(router).await;
             if let Some(allowed) = &choice.allowed_models {
                 pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
@@ -3381,16 +3372,12 @@ mod segment_tests {
         })
     }
 
-    fn is_move_to(plan: &ProviderPlan, provider: &str) -> bool {
-        matches!(plan, ProviderPlan::Move { pick, .. } if pick.provider_id == provider)
-    }
-
-    /// S3 decision wiring: a confirmed non-harness boundary re-opens the decision. Turn 3
-    /// follows a change of the SAME class on turn 2 (`held_by_class` would steady it) AND
-    /// continues a topic drift right after a move: the boundary lifts the held guard and the
-    /// `after_provider_move` restriction, so the decider re-evaluates provider AND model.
+    /// S3 signal: a TOPIC drift within the SAME class does NOT lift the R-S3 `held_by_class`
+    /// steady guard (the class is unchanged, so the model choice stays steady), but it still
+    /// relaxes the `after_provider_move` restriction (`direction_changed`) and is recorded in
+    /// the reason. Only a CLASS change (Problem/Resolution boundary) lifts the steady guard.
     #[tokio::test]
-    async fn a_confirmed_topic_boundary_reopens_the_decision_for_the_next_turn() {
+    async fn a_topic_drift_keeps_the_class_steady_but_still_relaxes_the_move_guard() {
         let decider = Arc::new(Recording::default());
         let router = routing_router(decider.clone(), true);
         feed(&router, 0, "local", "the routing of the provider");
@@ -3402,27 +3389,27 @@ mod segment_tests {
             state.next_turn = 3;
             record_change(&mut state, 2, "m", class);
         }
-        let plan = plan_provider_move(&router).await;
+        let _ = plan_provider_move(&router).await;
         let request = decider.last();
         assert!(
-            !request.steady,
-            "the boundary lifts the steady guard: {request:?}"
+            request.steady,
+            "a same-class topic drift keeps the steady guard: {request:?}"
+        );
+        assert_eq!(
+            request.settings.exploration_epsilon, 0.0,
+            "no exploration on a same-class topic drift: {request:?}"
         );
         assert!(
-            request.settings.exploration_epsilon > 0.0,
-            "exploration is back on: {request:?}"
+            request.narrowed.contains(&SAME_CLASS_NO_EXPLORE),
+            "{request:?}"
         );
         assert_eq!(
             request.restrict_provider, None,
-            "the after-provider-move restriction is lifted: {request:?}"
+            "the topic drift still relaxes the after-provider-move guard: {request:?}"
         );
         assert!(
             request.segment_note.is_some(),
             "the boundary is recorded in the reason suffix: {request:?}"
-        );
-        assert!(
-            is_move_to(&plan, "local2"),
-            "the fresh decision may move: {plan:?}"
         );
     }
 
@@ -3519,12 +3506,12 @@ mod segment_tests {
         );
     }
 
-    /// S3 decision wiring, model path: `directive_for_turn` (the hook of a `mixed` or
-    /// one-provider session, the only observer of its turns) lifts `held_by_class` on a
-    /// confirmed non-harness boundary too, matching `plan_provider_move`. Harness stays
-    /// excluded (`direction_changed` counts the non-harness axes only).
+    /// S3 signal, model path: `directive_for_turn` (the hook of a `mixed` or one-provider
+    /// session, the only observer of its turns) keeps the R-S3 `held_by_class` steady guard on
+    /// a TOPIC drift within the SAME class (the class is unchanged), matching
+    /// `plan_provider_move`. A class change lifts it through the class itself.
     #[tokio::test]
-    async fn a_confirmed_boundary_lifts_the_steady_guard_in_the_model_path() {
+    async fn a_topic_drift_keeps_the_steady_guard_in_the_model_path() {
         let decider = Arc::new(Recording::default());
         let router = routing_router(decider.clone(), false);
         router.set_model_live(true);
@@ -3536,17 +3523,17 @@ mod segment_tests {
             let mut state = locked(&router.state);
             record_change(&mut state, 2, "m", class);
         }
-        // Turn 3 continues the drift: the second deviating turn confirms the boundary, and
-        // the hook must decide it fresh, not steady.
+        // Turn 3 continues the drift: the second deviating turn confirms a topic boundary, and
+        // the hook must keep the class steady (no exploration), not re-open the decision.
         directive_for_turn(&router, &TurnContext::new(3, "m")).await;
         let request = decider.last();
         assert!(
-            !request.steady,
-            "the boundary lifts the steady guard: {request:?}"
+            request.steady,
+            "a same-class topic drift keeps the steady guard: {request:?}"
         );
-        assert!(request.settings.exploration_epsilon > 0.0, "{request:?}");
+        assert_eq!(request.settings.exploration_epsilon, 0.0, "{request:?}");
         assert!(
-            !request.narrowed.contains(&SAME_CLASS_NO_EXPLORE),
+            request.narrowed.contains(&SAME_CLASS_NO_EXPLORE),
             "{request:?}"
         );
     }
