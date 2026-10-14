@@ -135,6 +135,9 @@ pub fn decide_with(
     for code in &request.narrowed {
         decision.reason = format!("{}; narrowed: {code}", decision.reason);
     }
+    if let Some(note) = &request.segment_note {
+        decision.reason = format!("{}; segment: {note}", decision.reason);
+    }
     decision
 }
 
@@ -1115,6 +1118,27 @@ mod tests {
         assert!(
             d.reason
                 .ends_with("; narrowed: same_class_no_explore; narrowed: after_provider_move"),
+            "{}",
+            d.reason
+        );
+    }
+
+    /// A confirmed conversation-segment boundary is named in the reason, so the
+    /// stored decision says why the direction changed (`; segment: boundary(...)@...`).
+    #[test]
+    fn a_segment_note_is_appended_to_the_reason() {
+        let sig = pilot();
+        let mut req = request(sig, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.segment_note = Some("boundary(topic)@12".into());
+        let d = decide_with(
+            Uuid::from_u128(7),
+            Utc::now(),
+            &req,
+            &[],
+            &PriorHints::new(),
+        );
+        assert!(
+            d.reason.ends_with("; segment: boundary(topic)@12"),
             "{}",
             d.reason
         );

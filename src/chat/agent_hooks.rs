@@ -67,7 +67,12 @@ use super::provider::cognitive::auto_models;
 use super::provider::cognitive::candidates::{self, ModelFacts, Slot};
 use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
 use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
+use super::provider::cognitive::observe;
+use super::provider::cognitive::segment::{
+    Boundary, Dimension, SegmentError, SegmentPolicy, Segmenter,
+};
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
+use super::provider::cognitive::topic;
 use super::provider::cognitive::{
     conversation_stage, ConversationRoutingMode, LearningStage, ProviderRoutingMode,
     RoutingSettings,
@@ -378,6 +383,13 @@ pub(crate) struct TurnRouter {
     /// what [`TurnRouter::forget_image_change`] puts back when the host could not apply it.
     image_change: Mutex<Option<(u32, String)>>,
     state: Mutex<TurnState>,
+    /// The conversation's segmenter: one [`Observation`] per turn, built from the offline
+    /// signature and the topic labels of the stored message (see [`TurnRouter::observe_turn`]).
+    /// Its boundaries are the finer-grained "the conversation changed direction" signal that
+    /// augments the coarse [`TurnRouter::moved_in`] flag: a boundary on any axis but the
+    /// harness relaxes the R-S3 "no two provider moves in a row" guard, while a harness
+    /// boundary is an explicit provider change (which keeps that guard).
+    segmenter: Mutex<Segmenter>,
     timeout: Duration,
 }
 
@@ -447,6 +459,18 @@ impl TurnRouter {
         let settings_stage = spec.routing.stage;
         let mut routing = spec.routing;
         routing.stage = conversation_stage(settings_stage, spec.conversation_routes);
+        // The segment ids are derived deterministically from the session id, so two routers
+        // of the same session segment byte-for-byte the same; without a session (a legacy
+        // engine run without a conversation id), the seed collapses to 0.
+        // Fold all 128 bits of the session id into 64, so two distinct sessions do not
+        // collapse to the same seed (and thus the same segment ids) by a low-bits collision.
+        let seed = spec
+            .session_id
+            .map(|id| {
+                let v = id.as_u128();
+                (v as u64) ^ (v >> 64) as u64
+            })
+            .unwrap_or(0);
         Self {
             decider: spec.decider,
             pool: spec.pool,
@@ -477,6 +501,7 @@ impl TurnRouter {
                 last_change_class: None,
                 next_turn: spec.next_turn,
             }),
+            segmenter: Mutex::new(Segmenter::new(SegmentPolicy::default(), seed)),
             timeout: DECIDE_TIMEOUT,
         }
     }
@@ -608,6 +633,29 @@ impl TurnRouter {
             self.project_slug.as_deref(),
             ContextHints::default(),
         )
+    }
+
+    /// Feeds the turn into the session's segmenter and returns the boundaries it confirmed
+    /// (the segmenter keeps the whole history; this is what the routing of the turn reads).
+    /// The observation is built from the offline signature and the topic labels of the stored
+    /// message: the harness axis carries `provider_id`, the session's own in production. A
+    /// turn that does not strictly increase (the same turn seen by both the provider check and
+    /// the hook) is tolerated: logged and dropped, it changes nothing and never breaks routing.
+    fn observe_turn(&self, turn_index: u32, provider_id: &str) -> Vec<Boundary> {
+        let message = locked(&self.last_message).clone().unwrap_or_default();
+        let topic = topic::topic_labels(&message);
+        let observation = observe::observation(turn_index, provider_id, &self.signature(), &topic);
+        match locked(&self.segmenter).observe(&observation) {
+            Ok(boundaries) => boundaries,
+            Err(SegmentError::OutOfOrder { turn, last }) => {
+                debug!(provider = %self.provider_id, turn, last, "the turn was already observed: the segmenter is not re-fed");
+                Vec::new()
+            }
+            Err(error) => {
+                warn!(provider = %self.provider_id, error = %error, "segment observation refused");
+                Vec::new()
+            }
+        }
     }
 
     /// Asks the decider within the router's timeout; `None` (logged) when it fails or is slow.
@@ -759,6 +807,28 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     // session, a model change does not): the turn right after a move is decided among the
     // models of the provider it moved to, so its model may still change.
     let just_moved = router.moved_in.swap(false, Ordering::SeqCst);
+    // The segmenter sees this turn once (a turn already observed by the hook is a no-op):
+    // a boundary on any axis but the harness means the conversation changed direction, and
+    // that relaxes the "no two moves in a row" guard below — a turn that really changed
+    // direction may re-evaluate the provider even right after a move. A harness boundary is
+    // an explicit provider change, so it keeps the guard (`direction_changed` excludes it).
+    let boundaries = router.observe_turn(turn, &router.provider_id);
+    let direction_changed = boundaries
+        .iter()
+        .any(|boundary| boundary.dimension != Dimension::Harness);
+    let segment_note = (!boundaries.is_empty()).then(|| {
+        boundaries
+            .iter()
+            .map(|boundary| {
+                format!(
+                    "boundary({})@{}",
+                    boundary.dimension.as_str(),
+                    boundary.at_turn
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
     // F-R4: a turn the pair in force cannot read must leave it, whatever the anti-flapping.
     let blind = cannot_read_turn(router, &pool, &router.provider_id, &current_model);
     if blind && !router.set_model_live.load(Ordering::SeqCst) {
@@ -768,7 +838,7 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
             f.provider_id != router.provider_id || same_model(&f.model, &current_model)
         });
     }
-    let may_move = blind || !just_moved;
+    let may_move = blind || !just_moved || direction_changed;
     let apply = routing.auto;
     let current = Pick::new(&router.provider_id, &current_model);
     let mut request = DecideRequest::new(signature, settings_for(&choice.routing, apply), pool);
@@ -782,6 +852,7 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     request.current = Some(current.clone());
     request.session_id = router.session_id;
     request.turn_index = Some(turn);
+    request.segment_note = segment_note;
     let Some(decision) = router.ask(request).await else {
         return ProviderPlan::Stay;
     };
@@ -846,6 +917,10 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         state.current_model = ctx.current_model.clone();
         state.next_turn = ctx.turn_index.saturating_add(1);
     }
+    // Every turn feeds the segmenter exactly once. A turn already observed by the provider
+    // check (mode `full`) is a repeated turn here and is tolerated as a no-op; the sessions
+    // the provider check never runs for (mode `mixed`, one provider) are observed here.
+    router.observe_turn(ctx.turn_index, &router.provider_id);
     let predecided = locked(&router.predecided)
         .take()
         .filter(|pre| pre.turn_index == ctx.turn_index);
@@ -2968,5 +3043,157 @@ mod image_routing_tests {
             !router.signature().needs_images,
             "a compaction during the turn reads no image"
         );
+    }
+}
+
+/// S4 integration: the session's segmenter is fed one [`Observation`] per turn and its
+/// boundaries (harness = explicit provider change; any other axis = a change of direction)
+/// are the finer-grained signal that augments [`TurnRouter::moved_in`].
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+    use crate::chat::provider::cognitive::segment::BoundaryReason;
+
+    /// A decider that is never asked: these tests only feed observations.
+    struct NoDecide;
+
+    #[async_trait]
+    impl Decider for NoDecide {
+        async fn decide(&self, _request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            unreachable!("the segment tests never ask the decider");
+        }
+    }
+
+    /// A pool that knows nothing: the segment tests never route.
+    struct NoPool;
+
+    #[async_trait]
+    impl PoolSource for NoPool {
+        async fn pool(&self, _provider_id: &str) -> Vec<ModelFacts> {
+            Vec::new()
+        }
+    }
+
+    fn spec(session_id: Uuid) -> TurnRouterSpec {
+        TurnRouterSpec {
+            decider: Arc::new(NoDecide),
+            pool: Arc::new(NoPool),
+            routing: RoutingSettings::default(),
+            provider_id: "deepseek".into(),
+            session_id: Some(session_id),
+            project_slug: None,
+            trust: false,
+            explicit_model: false,
+            provider_imposed: false,
+            allowed_models: None,
+            routing_pool: None,
+            auto_models: None,
+            conversation_routes: false,
+            current_model: "m".into(),
+            next_turn: 1,
+            moved_in: false,
+        }
+    }
+
+    fn router(session_id: Uuid) -> TurnRouter {
+        TurnRouter::new(spec(session_id))
+    }
+
+    /// Feeds a turn under `provider`, with `text` as the stored message.
+    fn feed(router: &TurnRouter, turn: u32, provider: &str, text: &str) -> Vec<Boundary> {
+        router.set_last_message(text);
+        router.observe_turn(turn, provider)
+    }
+
+    #[test]
+    fn a_harness_change_opens_a_boundary_at_once() {
+        let router = router(Uuid::new_v4());
+        // The harness axis confirms a switch at once (a switch is explicit), unlike the
+        // other axes that need two deviating turns.
+        assert!(feed(&router, 0, "deepseek", "anything").is_empty());
+        assert!(feed(&router, 1, "deepseek", "anything").is_empty());
+        let boundaries = feed(&router, 2, "claude-code", "anything");
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].dimension, Dimension::Harness);
+        assert_eq!(boundaries[0].at_turn, 2);
+        let BoundaryReason::Drift { confirmations, .. } = &boundaries[0].reason else {
+            panic!("a harness switch is a drift");
+        };
+        assert_eq!(*confirmations, 1);
+        // The segmenter keeps the confirmed boundary, not just the per-turn return.
+        assert_eq!(locked(&router.segmenter).boundaries().len(), 1);
+    }
+
+    #[test]
+    fn a_topic_change_opens_a_boundary_after_two_deviating_turns() {
+        let router = router(Uuid::new_v4());
+        let routing = "the routing of the provider";
+        let other = "neo4j docker tests";
+        // Same subject on two turns: the segment absorbs them, no boundary.
+        assert!(feed(&router, 0, "deepseek", routing).is_empty());
+        assert!(feed(&router, 1, "deepseek", routing).is_empty());
+        // One deviating turn is not a change; it opens a pending run only.
+        assert!(feed(&router, 2, "deepseek", other).is_empty());
+        // The second deviating turn confirms the boundary, placed at the FIRST deviating turn.
+        let boundaries = feed(&router, 3, "deepseek", other);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].dimension, Dimension::Topic);
+        assert_eq!(boundaries[0].at_turn, 2);
+        let BoundaryReason::Drift { confirmations, .. } = &boundaries[0].reason else {
+            panic!("a topic drift is a drift");
+        };
+        assert_eq!(*confirmations, 2);
+    }
+
+    #[test]
+    fn the_seed_makes_segment_ids_deterministic_across_routers_with_the_same_session() {
+        let session = Uuid::new_v4();
+        let a = router(session);
+        let b = router(session);
+        let history = [
+            (0, "deepseek", "the routing of the provider"),
+            (1, "deepseek", "the routing of the provider"),
+            (2, "deepseek", "neo4j docker tests"),
+            (3, "deepseek", "neo4j docker tests"),
+        ];
+        for (turn, provider, text) in history {
+            feed(&a, turn, provider, text);
+            feed(&b, turn, provider, text);
+        }
+        // The same session id gives the same seed, hence the same ids, byte for byte.
+        assert_eq!(
+            locked(&a.segmenter).segments(),
+            locked(&b.segmenter).segments()
+        );
+        assert_eq!(
+            locked(&a.segmenter).boundaries().to_vec(),
+            locked(&b.segmenter).boundaries().to_vec()
+        );
+        // Another session (another seed) segments the same turns but with different ids.
+        let other = router(Uuid::new_v4());
+        for (turn, provider, text) in history {
+            feed(&other, turn, provider, text);
+        }
+        let segs_a = locked(&a.segmenter).segments();
+        let segs_other = locked(&other.segmenter).segments();
+        assert_eq!(segs_a.len(), segs_other.len());
+        assert_ne!(segs_a[0].id, segs_other[0].id);
+    }
+
+    #[test]
+    fn a_non_increasing_turn_is_tolerated_without_breaking_routing() {
+        let router = router(Uuid::new_v4());
+        // The first observed turn is 3; turns 2 (before) and 3 (again) are refused by the
+        // segmenter, which `observe_turn` tolerates as an empty return instead of an error:
+        // routing never breaks on a repeated or out-of-order turn.
+        assert!(feed(&router, 3, "deepseek", "the routing of the provider").is_empty());
+        assert!(feed(&router, 2, "deepseek", "the routing of the provider").is_empty());
+        assert!(feed(&router, 3, "deepseek", "the routing of the provider").is_empty());
+        // The next strictly increasing turn still segments normally.
+        assert!(feed(&router, 4, "deepseek", "neo4j docker tests").is_empty());
+        let boundaries = feed(&router, 5, "deepseek", "neo4j docker tests");
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].dimension, Dimension::Topic);
+        assert_eq!(boundaries[0].at_turn, 4);
     }
 }

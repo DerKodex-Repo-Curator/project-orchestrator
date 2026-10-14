@@ -327,7 +327,11 @@ pub struct RoutingDecisionView {
     pub score: Option<f64>,
     /// Whether the draw explored.
     pub explored: bool,
-    /// Readable reason.
+    /// Readable reason, passed through verbatim. The wiring appends its own
+    /// suffixes as it narrows a decision (e.g. `; narrowed: same_class_no_explore`,
+    /// `; not_moved: <code>`, or `; segment: boundary(topic)@12` from the segment
+    /// slice); this view never parses, trims or rewrites them, so the log shows
+    /// exactly what was stored.
     pub reason: String,
     /// Options considered.
     pub alternatives: Vec<AlternativeView>,
@@ -663,5 +667,26 @@ mod tests {
         });
         let json = serde_json::to_value(RoutingDecisionView::from(&open)).unwrap();
         assert!(json["outcome"].is_null(), "a flag is not an outcome yet");
+    }
+
+    #[test]
+    fn the_reason_is_passed_through_verbatim_including_a_segment_suffix() {
+        // The wiring appends its own suffixes (narrowing guards, refused moves, and
+        // the segment slice's `; segment: boundary(<axis>)@<turn>`). The log and the
+        // report must echo them exactly as stored, never parsed or "cleaned up".
+        let mut d = decision(TaskClass::Simple, "a", None);
+        d.reason =
+            "routed to model a; narrowed: same_class_no_explore; segment: boundary(topic)@12"
+                .into();
+        let view = RoutingDecisionView::from(&d);
+        assert_eq!(
+            view.reason, d.reason,
+            "the stored reason is never rewritten"
+        );
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(
+            json["reason"],
+            "routed to model a; narrowed: same_class_no_explore; segment: boundary(topic)@12"
+        );
     }
 }

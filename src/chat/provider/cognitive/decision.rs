@@ -159,6 +159,11 @@ pub struct DecideRequest {
     /// `after_provider_move`): each is appended to the stored reason as
     /// `; narrowed: <code>`, like `not_moved:` / `not_changed:`.
     pub narrowed: Vec<&'static str>,
+    /// A confirmed conversation-segment boundary on this turn, pre-formatted by
+    /// the caller (e.g. `boundary(topic)@12`), appended to the reason as
+    /// `; segment: <note>` so a stored decision names why a direction changed.
+    /// `None` when no boundary confirmed on this turn.
+    pub segment_note: Option<String>,
 }
 
 impl DecideRequest {
@@ -179,6 +184,7 @@ impl DecideRequest {
             not_selectable: None,
             steady: false,
             narrowed: Vec::new(),
+            segment_note: None,
         }
     }
 }
