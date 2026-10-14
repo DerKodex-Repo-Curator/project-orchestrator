@@ -1761,7 +1761,7 @@ impl ApiErrorKind {
 }
 
 /// Known Anthropic API error types that are safe to retry.
-const RETRYABLE_ERROR_TYPES: &[&str] = &["api_error", "overloaded_error"];
+const RETRYABLE_ERROR_TYPES: &[&str] = &["api_error", "overloaded_error", "rate_limit_error"];
 
 /// Classify an API error message as retryable or non-retryable.
 ///
@@ -1772,9 +1772,9 @@ const RETRYABLE_ERROR_TYPES: &[&str] = &["api_error", "overloaded_error"];
 /// - Raw JSON: `{"type":"error","error":{"type":"api_error",...}}`
 /// - Plain text containing error type keywords
 ///
-/// **Retryable** (5xx): `api_error`, `overloaded_error`
+/// **Retryable** (5xx + rate limit): `api_error`, `overloaded_error`, `rate_limit_error`
 /// **Non-retryable** (4xx): `invalid_request_error`, `authentication_error`,
-/// `rate_limit_error`, `not_found_error`, `permission_error`
+/// `not_found_error`, `permission_error`
 pub fn classify_api_error(error_message: &str) -> ApiErrorKind {
     // Try to extract JSON from the error message and parse the error type
     if let Some(json_start) = error_message.find('{') {
@@ -1801,11 +1801,16 @@ pub fn classify_api_error(error_message: &str) -> ApiErrorKind {
         }
     }
 
-    // Check for HTTP 5xx status codes in the message
-    for code in &["500 ", "502 ", "503 ", "529 "] {
+    // Check for HTTP 5xx status codes in the message (504 is a gateway timeout).
+    for code in &["500 ", "502 ", "503 ", "504 ", "529 "] {
         if error_message.contains(code) {
             return ApiErrorKind::Retryable("http_5xx".to_string());
         }
+    }
+
+    // A timeout without a status ("Request timed out") is transient too.
+    if error_message.contains("timed out") {
+        return ApiErrorKind::Retryable("timeout".to_string());
     }
 
     ApiErrorKind::NonRetryable("unknown".to_string())
@@ -3256,11 +3261,18 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_api_error_non_retryable_rate_limit() {
+    fn test_classify_api_error_retryable_rate_limit() {
+        // A 429 is transient: retry (the retry loop backs off), not a final answer.
         let msg = r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#;
         let kind = classify_api_error(msg);
-        assert_eq!(kind, ApiErrorKind::NonRetryable("rate_limit_error".into()));
-        assert!(!kind.is_retryable());
+        assert_eq!(kind, ApiErrorKind::Retryable("rate_limit_error".into()));
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn test_classify_api_error_retryable_504_and_timeout() {
+        assert!(classify_api_error("API Error: 504 Gateway Timeout").is_retryable());
+        assert!(classify_api_error("Request timed out").is_retryable());
     }
 
     #[test]
