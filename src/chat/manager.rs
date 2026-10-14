@@ -22681,6 +22681,64 @@ mod tests {
         }
     }
 
+    /// P20-suite-2: a session recovered with its owner stored re-derives the person and
+    /// mints the PO token again, so the PO tools keep their auth after a restart.
+    #[tokio::test]
+    async fn a_recovered_session_with_its_owner_gets_a_po_token() {
+        let (manager, graph, fake, sid) = restarted_with(
+            &[("user_message", "{}"), ("assistant_text", "{}")],
+            chrono::Duration::zero(),
+            |config| config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into()),
+        )
+        .await;
+        // The owner stored at open, and the user record behind it.
+        let owner = Uuid::new_v4();
+        let mut node = graph.get_chat_session(sid).await.unwrap().unwrap();
+        node.owner = Some(owner.to_string());
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(node.capabilities.as_deref().unwrap()).unwrap();
+        snapshot["per_session_mcp"] = serde_json::json!(true);
+        node.capabilities = Some(snapshot.to_string());
+        graph.create_chat_session(&node).await.unwrap();
+        graph
+            .upsert_user(&crate::neo4j::models::UserNode {
+                id: owner,
+                email: "person@example.com".into(),
+                name: "A Person".into(),
+                picture_url: None,
+                auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+                external_id: Some("google-123".into()),
+                password_hash: None,
+                created_at: chrono::Utc::now(),
+                last_login_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!(report.resumed, 1);
+        let spec = fake
+            .state
+            .opened_specs
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        match spec.mcp_servers.get(PO_MCP_SERVER) {
+            Some(nexus_claude::agent::McpServerSpec::Stdio { env, .. }) => {
+                assert!(
+                    env.contains_key("PO_AUTH_TOKEN"),
+                    "an owner stored at open mints the resume token"
+                );
+            }
+            other => panic!("the resumed spec carries the PO server: {other:?}"),
+        }
+    }
+
     /// Finding 8b of #697: a session reopened without its owner's identity, on a server
     /// that signs its tokens, has the PO server but no token for it: it SAYS it lacks the
     /// PO tools instead of losing them silently.
