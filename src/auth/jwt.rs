@@ -65,6 +65,22 @@ impl Claims {
         }
     }
 
+    /// The claims of a signed-in person, re-derived from a stored identity (a resumed
+    /// session's owner). `iat`/`exp` are zero: these claims are never encoded as-is —
+    /// [`generate_session_token`] stamps fresh ones when it mints the session token.
+    pub fn person(sub: &str, email: &str, name: &str) -> Self {
+        Self {
+            sub: sub.to_string(),
+            email: email.to_string(),
+            name: name.to_string(),
+            iat: 0,
+            exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
+        }
+    }
+
     /// Create service-account claims for internally spawned agents.
     ///
     /// Used by the plan runner, task delegation, and protocol executor so that

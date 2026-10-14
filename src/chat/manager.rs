@@ -11379,6 +11379,19 @@ impl ChatManager {
         );
         self.ready_for_resume(&mut session_node).await?;
 
+        // A resume that carries no identity (the restart recovery, or a resume that
+        // arrives without claims) re-derives it from the owner stored at open — without
+        // it, `po_mcp_env` mints no `agent_session` token and the PO tools lose their auth
+        // (P20-suite-2). A session with no owner stays without one, rather than forging it.
+        let rederived_claims;
+        let user_claims: Option<&crate::auth::jwt::Claims> = match user_claims {
+            Some(claims) => Some(claims),
+            None => {
+                rederived_claims = self.resume_identity(&session_node).await;
+                rederived_claims.as_ref()
+            }
+        };
+
         // The engine is frozen at opening (M2): a session written as opened on the agent
         // engine resumes there, whether or not its capability snapshot was stored.
         if session_node.opened_on_agent() {
@@ -16070,6 +16083,23 @@ impl ChatManager {
     ///
     /// `seen`: the live handle the caller started from, read before it awaited anything
     /// (`None`: the session was not live; a dead handle: a resume after a failed send).
+    /// The identity a resumed session reopens under when its caller brought none (the
+    /// restart recovery, or a resume that arrives without claims): the person who opened
+    /// it, read from `ChatSessionNode.owner` (their `sub`) and resolved through the user
+    /// record for the `email`/`name` the session token copies. `None` when the session has
+    /// no owner, or the user is gone — the session then stays without an identity (its PO
+    /// tools run unauthorised) rather than forge one.
+    async fn resume_identity(&self, node: &ChatSessionNode) -> Option<crate::auth::jwt::Claims> {
+        let owner = node.owner.as_deref()?;
+        let id = Uuid::parse_str(owner).ok()?;
+        let user = self.graph.get_user_by_id(id).await.ok().flatten()?;
+        Some(crate::auth::jwt::Claims::person(
+            owner,
+            &user.email,
+            &user.name,
+        ))
+    }
+
     async fn resume_agent_session(
         &self,
         node: &ChatSessionNode,
@@ -16117,6 +16147,18 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
     ) -> Result<()> {
         let sid = node.id.to_string();
+        // (P20-suite-2) The restart recovery reopens the session with no caller: re-derive
+        // the person from the owner stored at open, so the session token can be minted
+        // again and the PO tools keep their auth. No owner, or a gone user: stays without
+        // one (the tools run unauthorised rather than forging an identity).
+        let rederived_claims;
+        let user_claims: Option<&crate::auth::jwt::Claims> = match user_claims {
+            Some(claims) => Some(claims),
+            None => {
+                rederived_claims = self.resume_identity(node).await;
+                rederived_claims.as_ref()
+            }
+        };
         let provider_id = node
             .provider_id
             .clone()
@@ -30161,6 +30203,48 @@ mod tests {
             !routing.out_of_credit("elsewhere", Instant::now()),
             "a non-credit error does not mark the instance"
         );
+    }
+
+    /// P20-suite-2: a resume that carries no claims re-derives the person from the owner
+    /// stored at open — so `po_mcp_env` can mint the session token again after a restart.
+    /// A session with no owner, or whose user record is gone, stays without one.
+    #[tokio::test]
+    async fn a_resumed_session_rederives_its_identity_from_the_stored_owner() {
+        use crate::neo4j::models::{AuthProvider, UserNode};
+        let state = mock_app_state();
+        let graph = Arc::clone(&state.neo4j);
+        let user = UserNode {
+            id: Uuid::new_v4(),
+            email: "person@example.com".into(),
+            name: "A Person".into(),
+            picture_url: None,
+            auth_provider: AuthProvider::Oidc,
+            external_id: Some("google-123".into()),
+            password_hash: None,
+            created_at: chrono::Utc::now(),
+            last_login_at: chrono::Utc::now(),
+        };
+        graph.upsert_user(&user).await.unwrap();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // The owner stored at open is re-derived into the person's claims.
+        let mut owned = test_chat_session(None);
+        owned.owner = Some(user.id.to_string());
+        let claims = manager.resume_identity(&owned).await.unwrap();
+        assert_eq!(claims.sub, user.id.to_string());
+        assert_eq!(claims.email, "person@example.com");
+        assert_eq!(claims.name, "A Person");
+
+        // No owner → no identity: the session stays degraded, never forged.
+        assert!(manager
+            .resume_identity(&test_chat_session(None))
+            .await
+            .is_none());
+
+        // An owner whose user record is gone → no identity either.
+        let mut ghost = test_chat_session(None);
+        ghost.owner = Some(Uuid::new_v4().to_string());
+        assert!(manager.resume_identity(&ghost).await.is_none());
     }
 
     /// Review of #685, finding 1: an agent-engine cancel listener reads no request
