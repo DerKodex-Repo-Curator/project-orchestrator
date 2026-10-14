@@ -86,6 +86,7 @@ diagrams:
       - "backend:src/chat/routing_modes_e2e_tests.rs"
       - "backend:src/api/routing_handlers.rs"
       - "backend:src/neo4j/routing.rs"
+      - "backend:src/neo4j/segment.rs"
       - "backend:src/runner/routing.rs"
   - name: po-chat-transport
     owner: theotime
