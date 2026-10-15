@@ -3318,6 +3318,9 @@ impl PlanRunner {
                 .to_string(),
             ),
             task_context: Some(task_context_str),
+            subagent_type: None,
+
+            route_auto: false,
             scaffolding_override: None,
             runner_context: Some(runner_context),
             routing_decision_id,

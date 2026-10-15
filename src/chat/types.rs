@@ -464,6 +464,17 @@ pub struct ChatRequest {
     /// Not deserialized from HTTP requests (internal use only).
     #[serde(skip)]
     pub task_context: Option<String>,
+    /// The kind of agent the model asked for in an `Agent` call (`subagent_type`),
+    /// carried from `chat::subagents::run_subagent` to the open-time routing so the
+    /// sub-task's signature can name the class the model stated. Internal only.
+    #[serde(skip)]
+    pub subagent_type: Option<String>,
+    /// PO routes this sub-agent's opening over the full pool (the parent conversation was
+    /// in Auto and PO decides the sub-agent, AUTO-SUB). Set by `run_subagent` alone; it
+    /// keeps the child's routing in PO's hands even though a spawned session normally
+    /// cannot hand its own routing over. Internal only.
+    #[serde(skip)]
+    pub route_auto: bool,
     /// Inherited scaffolding level from parent session.
     /// When set, overrides the auto-computed scaffolding level in `build_system_prompt`.
     /// This ensures sub-agents inherit the same prompt complexity as their parent.

@@ -628,6 +628,9 @@ mod tests {
             user_claims: None,
             spawned_by: None,
             task_context: None,
+            subagent_type: None,
+
+            route_auto: false,
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,

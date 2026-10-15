@@ -306,6 +306,37 @@ impl TaskSignature {
         }
     }
 
+    /// A sub-agent of a native parent (the `Agent` tool): an executor whose class comes
+    /// from the agent the model named (`subagent_type`) or, failing that, the task
+    /// description; the prompt's length grows the complexity and the context need. A
+    /// sub-agent always calls tools and never carries images of its own.
+    pub fn from_subagent(
+        subagent_type: Option<&str>,
+        description: Option<&str>,
+        prompt: &str,
+        project_slug: Option<&str>,
+        hints: ContextHints,
+    ) -> Self {
+        let class = subagent_type
+            .and_then(TaskClass::parse)
+            .or_else(|| description.and_then(TaskClass::parse))
+            .unwrap_or(TaskClass::Simple);
+        let length_bonus = (prompt.chars().count() / 800).min(2) as u8;
+        let message_tokens = prompt.chars().count() as u64 / CHARS_PER_TOKEN;
+        Self {
+            role: Role::Executor,
+            class,
+            complexity: clamp_complexity(class.base_complexity() + length_bonus),
+            context_need_tokens: context_need(None, 0, message_tokens, &hints),
+            needs_tools: true,
+            needs_images: false,
+            budget_remaining_usd: hints.budget_remaining_usd,
+            attempt: 1,
+            project_slug: project_slug.map(str::to_owned),
+            persona: None,
+        }
+    }
+
     /// A utility one-shot (feature-graph proposal, compaction summary): no
     /// tools, an executor, the context it is handed.
     pub fn utility(class: TaskClass, context_tokens: u64, project_slug: Option<&str>) -> Self {

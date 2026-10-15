@@ -392,14 +392,53 @@ impl ChatManager {
             envelope::resolve_envelope(self.graph.as_ref(), self.as_ref(), parent_session_id, None)
                 .await
                 .map_err(|e| refused(e.code().to_owned()))?;
+        // AUTO-SUB: a parent conversation in Auto (mode `full`, or a pool of two models or
+        // more) routes every `Agent` call over every candidate its person and project allow —
+        // Claude Code included — instead of the child inheriting the parent's provider and
+        // model. A pinned parent (a provider named by the request, or a single ticked model)
+        // keeps the inheritance: its choice is never substituted. The decision is taken and
+        // applied by the open-time routing (`cognitive_decision`), which the child reaches by
+        // clearing `provider`/`model` and asking for `full` routing.
+        let routing_mode: Option<super::provider::cognitive::ConversationRoutingMode> = parent
+            .routing_mode
+            .as_deref()
+            .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok());
+        let routing_pool: Option<Vec<super::types::RoutingPoolEntry>> = parent
+            .routing_pool
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok());
+        let parent_routes = super::provider::cognitive::conversation_routes(
+            routing_mode,
+            routing_pool.as_ref().map_or(0, Vec::len),
+        );
+        let pinned = parent.routed_by.as_deref() == Some("request")
+            || routing_pool.as_ref().is_some_and(|p| p.len() == 1);
+        let route_child = parent_routes && !pinned && self.cognitive_routing.is_some();
+        tracing::debug!(
+            route_child = route_child,
+            parent_routes = parent_routes,
+            pinned = pinned,
+            cognitive = self.cognitive_routing.is_some(),
+            "sub-agent opening: auto routing"
+        );
         let mut child = ChatRequest {
             message: crate::refs::compose::inert(&request.prompt),
             cwd: parent.cwd.clone(),
-            model: Some(parent.model.clone()),
-            provider: parent.provider_id.clone(),
+            model: if route_child {
+                None
+            } else {
+                Some(parent.model.clone())
+            },
+            provider: if route_child {
+                None
+            } else {
+                parent.provider_id.clone()
+            },
             add_dirs: parent.add_dirs.clone(),
             user_claims,
             task_context: request.description.clone(),
+            subagent_type: request.subagent_type.clone(),
+            route_auto: route_child,
             // Never wider than the parent (a read-only parent has no `Agent`; defence in depth).
             access: Some(parent.access),
             ..Default::default()

@@ -1327,6 +1327,18 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
     })
 }
 
+/// Whether the request opens a child of a conversation — a native parent's `Agent`
+/// call (its `tool_use_id` is set) or a sub-conversation it spawned. Such a child is a
+/// sub-task, so its routing signature is built from the sub-task (description, prompt,
+/// `subagent_type`), never from a task node or a stated class alone.
+fn is_subagent_spawn(request: &ChatRequest) -> bool {
+    request
+        .spawned_by
+        .as_deref()
+        .and_then(parse_spawned_by)
+        .is_some_and(|ctx| ctx.spawn_type == "conversation")
+}
+
 /// Project id handed to every enrichment stage, resolved once from the
 /// session's slug. Stages that read only `project_id` (reflex) were skipped
 /// for every chat message when it was left `None`.
@@ -10995,6 +11007,9 @@ impl ChatManager {
                 .clone()
                 .filter(|s| parse_spawned_by(s).is_some_and(|ctx| ctx.parent_session_id.is_some())),
             task_context: None,
+            subagent_type: None,
+
+            route_auto: false,
             scaffolding_override: None,
             // A switch never widens: the new session keeps the access of the old one.
             access: Some(node.access),
@@ -14700,13 +14715,25 @@ impl ChatManager {
                 project_slug,
                 ContextHints::default(),
             ),
-            super::provider::resolver::Role::Executor => TaskSignature::from_delegation(
-                request.task_class.as_deref(),
-                None,
-                1,
-                project_slug,
-                ContextHints::default(),
-            ),
+            super::provider::resolver::Role::Executor => {
+                if is_subagent_spawn(request) {
+                    TaskSignature::from_subagent(
+                        request.subagent_type.as_deref(),
+                        request.task_context.as_deref(),
+                        &crate::refs::turn::visible_text(&request.message),
+                        project_slug,
+                        ContextHints::default(),
+                    )
+                } else {
+                    TaskSignature::from_delegation(
+                        request.task_class.as_deref(),
+                        None,
+                        1,
+                        project_slug,
+                        ContextHints::default(),
+                    )
+                }
+            }
         };
         routing.set_hints(PriorHints::from_aliases(aliases));
         // A provider, model, alias or run the caller named is never substituted. The
@@ -14740,6 +14767,21 @@ impl ChatManager {
         if ticked.is_some() {
             settings.mode = super::provider::cognitive::ProviderRoutingMode::Full;
         }
+        // AUTO-SUB: a sub-agent PO routes (its parent was in Auto) is decided over the full
+        // pool at the `auto` stage, whatever the settings — a spawned session normally
+        // cannot hand its routing over, but this is PO's own choice, not the child's.
+        if request.route_auto {
+            settings.mode = super::provider::cognitive::ProviderRoutingMode::Full;
+            settings.stage = super::provider::cognitive::LearningStage::Auto;
+        }
+        debug!(
+            route_auto = request.route_auto,
+            subagent = is_subagent_spawn(request),
+            named = named,
+            mode = ?settings.mode,
+            stage = ?settings.stage,
+            "cognitive decision settings"
+        );
         // What the probes may cost: nothing for a named choice (the session opening
         // probes its own model) or in `primary` + `shadow`; only the ticked models when
         // there are some; every model otherwise.
@@ -14768,7 +14810,8 @@ impl ChatManager {
         // the fallback to every model, stated in the reason, when nothing listed can serve).
         let person_code = if !named
             && ticked.is_none()
-            && matches!(role, super::provider::resolver::Role::Pilot)
+            && (matches!(role, super::provider::resolver::Role::Pilot)
+                || is_subagent_spawn(request))
             && settings.mode == super::provider::cognitive::ProviderRoutingMode::Full
         {
             match self
@@ -14864,6 +14907,13 @@ impl ChatManager {
             }
         }
         let decision = routing.decider.decide(&decide).await?;
+        debug!(
+            chosen = ?decision.chosen,
+            applied = decision.applied,
+            role = ?decide.signature.role,
+            pool = ?decide.pool.iter().map(|f| f.provider_id.as_str()).collect::<Vec<_>>(),
+            "cognitive decision"
+        );
         // A conversation that routes (Auto, models ticked) is decided turn by turn from
         // pools that follow the stored settings, which may forbid probing: the candidates
         // of its provider not known yet are probed now, in the background, within the
@@ -21119,6 +21169,8 @@ mod tests {
                 .to_string(),
             ),
             task_context: None,
+            subagent_type: None,
+            route_auto: false,
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,

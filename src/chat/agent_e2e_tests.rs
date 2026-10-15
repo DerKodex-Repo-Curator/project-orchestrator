@@ -246,6 +246,9 @@ pub(super) fn request(provider: Option<&str>, project: Option<&str>, mode: &str)
         user_claims: Some(crate::auth::jwt::Claims::service_account("e2e")),
         spawned_by: None,
         task_context: None,
+        subagent_type: None,
+
+        route_auto: false,
         scaffolding_override: None,
         runner_context: None,
         routing_decision_id: None,
@@ -1344,6 +1347,23 @@ mod cognitive_routing {
         request(None, Some("proj"), "default")
     }
 
+    /// An `Agent` call of a native parent in Auto: a child of a conversation, routing in
+    /// `full` mode, with the sub-task's description and the agent kind the model named.
+    fn subagent_request() -> ChatRequest {
+        let mut r = request(None, Some("proj"), "default");
+        r.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::new_v4(),
+                tool_use_id: Some("toolu_subagent".into()),
+            }
+            .to_json_string(),
+        );
+        r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        r.task_context = Some("refactor the parser".into());
+        r.subagent_type = Some("complex".into());
+        r
+    }
+
     async fn choose(s: &Setup, r: &ChatRequest) -> ProviderChoice {
         s.manager
             .resolve_provider_choice(r, Some("proj"))
@@ -1914,8 +1934,14 @@ mod cognitive_routing {
     }
 
     /// A decider that applies `other/o1` for every request: a pair the resolver refuses
-    /// (the project gave no consent to `other`).
-    struct AppliesOther;
+    /// (the project gave no consent to `other`). A test that wants to read the signature the
+    /// manager put in front of the router passes `seen`; the others leave it `None`.
+    #[derive(Default)]
+    struct AppliesOther {
+        seen: Option<
+            Arc<std::sync::Mutex<Vec<crate::chat::provider::cognitive::signature::TaskSignature>>>,
+        >,
+    }
 
     #[async_trait::async_trait]
     impl crate::chat::provider::cognitive::decision::Decider for AppliesOther {
@@ -1924,6 +1950,11 @@ mod cognitive_routing {
             request: &crate::chat::provider::cognitive::decision::DecideRequest,
         ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
             use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+            if let Some(seen) = &self.seen {
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(request.signature.clone());
+            }
             Ok(CognitiveDecision {
                 id: Uuid::new_v4(),
                 at: Utc::now(),
@@ -1946,6 +1977,55 @@ mod cognitive_routing {
         }
     }
 
+    /// AUTO-SUB: a sub-agent of a native parent in Auto routes over every candidate the
+    /// project allowed — the router's pair, not the parent's provider — attributed to Auto,
+    /// and the signature the manager puts in front of the router names the sub-task (the
+    /// class the model stated, an executor).
+    #[tokio::test]
+    async fn a_subagent_of_an_auto_parent_routes_over_the_full_pool() {
+        let Setup {
+            _fake,
+            graph,
+            manager,
+        } = setup_with("full", "auto", false, false).await;
+        // A second instance the project consented to, alongside `local`.
+        let mut record = instance(&_fake, "none");
+        record.id = "other".into();
+        record.label = "Other".into();
+        store_instance(&graph, &record).await;
+        consent(&graph, "proj", "other", &_fake.origin()).await;
+        // A router that applies `other/o1`, keeping every signature it is handed.
+        let seen: Arc<
+            std::sync::Mutex<Vec<crate::chat::provider::cognitive::signature::TaskSignature>>,
+        > = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routing = CognitiveRouting::with_decider(Arc::new(AppliesOther {
+            seen: Some(seen.clone()),
+        }));
+        let s = Setup {
+            _fake,
+            graph,
+            manager: manager.with_cognitive_routing(routing),
+        };
+        let c = choose(&s, &subagent_request()).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("other", Some("o1"), RoutedBy::Auto),
+            "the child opens on the router's pair, attributed to Auto"
+        );
+        // The signature the manager built names the sub-task — the class the model stated
+        // (`subagent_type`), an executor — not a plain `simple` delegation.
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.len(), 1, "the router was handed one signature");
+        assert_eq!(
+            seen[0].class,
+            crate::chat::provider::cognitive::signature::TaskClass::Complex
+        );
+        assert!(matches!(
+            seen[0].role,
+            crate::chat::provider::resolver::Role::Executor
+        ));
+    }
+
     /// A manager whose router applies `other/o1` (consent not given), its decisions stored
     /// in the graph, and a pool request naming `pilot` as the menu's pilot.
     async fn refused_pick(pilot: &str) -> (Setup, ChatRequest) {
@@ -1960,7 +2040,7 @@ mod cognitive_routing {
             record.label = id.into();
             store_instance(&graph, &record).await;
         }
-        let mut routing = CognitiveRouting::with_decider(Arc::new(AppliesOther));
+        let mut routing = CognitiveRouting::with_decider(Arc::new(AppliesOther::default()));
         routing.store = Some(Arc::new(Neo4jRoutingStore::new(graph.clone())));
         let manager = manager.with_cognitive_routing(routing);
         let mut r = pilot_request();
@@ -13470,6 +13550,166 @@ mod native_subagents {
                 .any(|e| e.event_type == "session_closed"),
             "the backstop closed the child"
         );
+    }
+
+    /// AUTO-SUB, end to end: a native parent in Auto routes its `Agent` call over the pool
+    /// (a fake decider picks a second native provider), and the child opens on that pair —
+    /// its own provider and model, not the parent's. Red before: the child always inherited
+    /// the parent's provider and model.
+    #[tokio::test]
+    async fn an_auto_parent_routes_its_subagent_to_the_deciders_pick() {
+        // The parent (a pilot) stays on the native built-in; the child (an executor) is
+        // routed to a second native provider.
+        struct RoleAwareDecider;
+        #[async_trait::async_trait]
+        impl crate::chat::provider::cognitive::decision::Decider for RoleAwareDecider {
+            async fn decide(
+                &self,
+                request: &crate::chat::provider::cognitive::decision::DecideRequest,
+            ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision>
+            {
+                use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+                let pick = match request.signature.role {
+                    crate::chat::provider::resolver::Role::Pilot => Pick::new("claude-code", "m"),
+                    crate::chat::provider::resolver::Role::Executor => Pick::new("deepseek", "d1"),
+                };
+                Ok(CognitiveDecision {
+                    id: Uuid::new_v4(),
+                    at: Utc::now(),
+                    signature: request.signature.clone(),
+                    chosen: Some(pick),
+                    score: Some(0.9),
+                    explored: false,
+                    reason: "role-aware: fake".into(),
+                    alternatives: Vec::new(),
+                    applied: true,
+                    mode: request.settings.mode,
+                    stage: request.settings.stage,
+                    session_id: request.session_id,
+                    task_id: None,
+                    run_id: None,
+                    turn_index: request.turn_index,
+                    outcome: None,
+                    used: None,
+                })
+            }
+        }
+
+        // Two in-memory native providers: the parent's and the routed child's.
+        struct TwoProviders {
+            claude_code: Arc<ScriptedProvider>,
+            deepseek: Arc<ScriptedProvider>,
+        }
+        impl crate::chat::agent_runtime::ProviderSource for TwoProviders {
+            fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+                match provider_id {
+                    "claude-code" => Some(self.claude_code.clone()),
+                    "deepseek" => Some(self.deepseek.clone()),
+                    _ => None,
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let rules = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        // The second native provider is stored and consented, so the resolver accepts it.
+        store_instance(
+            &graph,
+            &InstanceRecord {
+                id: "deepseek".into(),
+                kind: "openai_compatible".into(),
+                preset: None,
+                label: "DeepSeek".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                origin: "http://127.0.0.1:9".into(),
+                default_model: Some("d1".into()),
+                cost_source: "free".into(),
+                credential_ref: "none".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        consent(&graph, &project.slug, "deepseek", "http://127.0.0.1:9").await;
+
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 20,
+            lasting_rules_dir: Some(rules.path().join("rules")),
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
+            // The child opens on a third-party instance: the security gate (A32) needs a
+            // signing key, as any other test that leaves Claude Code does.
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            ..Default::default()
+        };
+        let child_turn = answer("CHILD-ANSWER");
+        let make = |id: &str| {
+            Arc::new(ScriptedProvider::new(
+                id,
+                Script::builder()
+                    .capabilities(caps())
+                    .turn(child_turn.clone())
+                    .build(),
+            ))
+        };
+        let provider_source = Arc::new(TwoProviders {
+            claude_code: make("claude-code"),
+            deepseek: make("deepseek"),
+        });
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, config)
+                .with_provider_source(provider_source)
+                .with_cognitive_routing(
+                    crate::chat::provider::cognitive::decider::CognitiveRouting::with_decider(
+                        Arc::new(RoleAwareDecider),
+                    ),
+                ),
+        );
+        manager.enable_subagents();
+        // The parent: a native session in Auto (`full`), not pinned.
+        let mut req = request(None, Some(&project.slug), "default");
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        req.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        // The parent stays on its own pair (the decider's `Pilot` pick); what the child
+        // opens is read below, so an inherited provider would be visible here.
+        let pnode = graph
+            .get_chat_session(Uuid::parse_str(&parent).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (pnode.provider_id.as_deref(), pnode.model.as_str()),
+            (Some("claude-code"), "m"),
+            "the parent stays on the native built-in"
+        );
+        let out = manager
+            .clone()
+            .run_subagent(&parent, None, &SubagentRequest::new("toolu_auto", "do it"))
+            .await;
+        assert_eq!(out, Ok("CHILD-ANSWER".to_string()));
+        let children = graph
+            .get_session_children(Uuid::parse_str(&parent).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].provider_id.as_deref(),
+            Some("deepseek"),
+            "the child opens on the router's pair, not the parent's"
+        );
+        assert_eq!(children[0].model, "d1");
     }
 }
 

@@ -341,6 +341,9 @@ async fn execute_via_agent(
             "Protocol '{}' — executing state '{}'",
             protocol.name, state.name
         )),
+        subagent_type: None,
+
+        route_auto: false,
         scaffolding_override: None,
         runner_context: None,
         routing_decision_id: None,
