@@ -71,3 +71,20 @@ porte, AVANT le `result`, une trame `error` dont `code` dit laquelle :
 
 Le `message` est bâti des seuls nombres, jamais d'un texte du provider. Un `result` `budget_exceeded` sans
 `subtype` du provider prend `error_max_budget` (plus `error_max_budget_usd` : le budget peut être en jetons).
+
+## Compaction ratée (`error.code: compaction_failed`, nexus #105)
+
+Une compaction automatique qui échoue ne finit plus le tour : le harnais natif repart avec l'historique
+intact (nexus #105, `providers/native/loop.rs`) et le fil porte une trame `error` dont `code` vaut
+`compaction_failed`. Le `message` dit les deux choses : ce qui n'a pas pu être fait, puis ce qui s'est
+passé à la place.
+
+> The conversation's context could not be summarised automatically (protocol error: the compaction summary
+> came back empty). The turn went on without compacting: the history is intact, so nothing of the
+> conversation is lost.
+
+La cause entre parenthèses est la phrase du provider (la notice nexus porte aussi `trigger: "auto"` et un
+`code` typé, `protocol` ici — un code seul ne dirait rien du résumé vide). Déjà expurgée par nexus, elle
+l'est une seconde fois ici (`endpoint_guard::redact_error_body`, formes de credentials) et bornée à
+400 octets, une coupe étant signalée par `…`. Le même `provider_notice` vu HORS tour reste une ligne de
+diagnostic (`background_output`, source `system:compaction_failed`).
