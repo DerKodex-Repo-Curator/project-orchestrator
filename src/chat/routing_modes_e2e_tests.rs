@@ -1045,7 +1045,9 @@ async fn turn_decisions(w: &World, session_id: &str) -> Vec<CognitiveDecision> {
     let mut mine: Vec<CognitiveDecision> = decisions_of(w, session_id)
         .await
         .into_iter()
-        .filter(|d| d.turn_index.is_some_and(|i| i > 0))
+        // Only OPEN decisions (outcome None) are the turns' own: a provider move leaves its
+        // own decision CLOSED on the same thread, so it is not the decision of the next turn.
+        .filter(|d| d.outcome.is_none() && d.turn_index.is_some_and(|i| i > 0))
         .collect();
     mine.sort_by_key(|d| d.turn_index);
     mine

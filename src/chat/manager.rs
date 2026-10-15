@@ -3814,6 +3814,22 @@ impl ChatManager {
                     reason = %decision.reason,
                     "the router moved the conversation to another provider"
                 );
+                // A move is a completed transition, not a per-turn decision left open: close
+                // it so the store's open decisions are only the turns' own (an in-place switch
+                // keeps the move's decision on the SAME thread, which otherwise reads as the
+                // next turn's).
+                if let Some(store) = self
+                    .cognitive_routing
+                    .as_ref()
+                    .and_then(|r| r.store.clone())
+                {
+                    if let Err(error) = store
+                        .set_outcome(decision.id, decision.outcome.unwrap_or_default())
+                        .await
+                    {
+                        warn!(%decision.id, %error, "closing the move's routing decision failed");
+                    }
+                }
                 true
             }
             Err(error) => {

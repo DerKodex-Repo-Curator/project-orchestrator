@@ -508,15 +508,16 @@ impl TurnRouter {
                 (v as u64) ^ (v >> 64) as u64
             })
             .unwrap_or(0);
-        // The segmenter's turn base: `last_turn + 1` of the carried snapshot (so a moved-in
-        // router continues segmenting where the old one stopped, however the harness resets
-        // its own turn index), or 0 on a fresh conversation where the harness's index is the
-        // segmenter's.
+        // The segmenter's turn base: the carried snapshot's `last_turn` (NOT `last_turn + 1`).
+        // The relayed turn re-observes the message the move's own turn already carried, so it
+        // must land on the SAME segment id as that turn (the segmenter then tolerates it as a
+        // repeat); `last_turn + 1` made it a fresh turn, which misread the relay as a new
+        // segment and relaxed the "no two moves in a row" guard with a false direction change.
         let segment_turn = spec
             .segments
             .as_ref()
             .and_then(snapshot_last_turn)
-            .map_or(0, |last| last + 1);
+            .map_or(0, |last| last);
         Self {
             decider: spec.decider,
             pool: spec.pool,
