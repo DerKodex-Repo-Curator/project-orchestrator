@@ -8065,6 +8065,7 @@ impl GraphStore for MockGraphStore {
         provider_id: &str,
         model: &str,
         routed_by: &str,
+        engine: &str,
     ) -> Result<bool> {
         let mut sessions = self.chat_sessions.write().await;
         let Some(session) = sessions.get_mut(&id) else {
@@ -8078,7 +8079,7 @@ impl GraphStore for MockGraphStore {
         session.resume_token = None;
         session.capabilities = None;
         session.cli_session_id = None;
-        session.engine = Some("agent".to_owned());
+        session.engine = Some(engine.to_owned());
         session.updated_at = Utc::now();
         Ok(true)
     }

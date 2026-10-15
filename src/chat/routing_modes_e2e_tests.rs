@@ -338,6 +338,26 @@ fn is_result(event: &ChatEvent) -> bool {
     matches!(event, ChatEvent::Result { .. })
 }
 
+/// Waits for an in-place move to be stated on the SAME thread and returns the
+/// `ProviderSwitched` event. The in-place switch replaces the live broadcast channel, so a
+/// subscription taken before `send_message` would observe `RecvError::Closed`; the stored
+/// thread the session keeps is the reliable view.
+async fn switched_in_place(w: &World, session_id: &str) -> ChatEvent {
+    let id = Uuid::parse_str(session_id).unwrap();
+    for _ in 0..200 {
+        let events = w.graph.get_chat_events(id, 0, 500).await.unwrap();
+        if let Some(event) = events
+            .iter()
+            .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+            .find(|e| matches!(e, ChatEvent::ProviderSwitched { .. }))
+        {
+            return event;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the in-place move was never stated for {session_id}");
+}
+
 /// Opens a session and waits for the result of its opening turn.
 async fn open(w: &World, request: &ChatRequest) -> String {
     let created = w
@@ -698,9 +718,8 @@ async fn full_auto_moves_a_conversation_handed_back_to_po_to_another_provider() 
         )
         .await
         .unwrap();
-    let mut rx = w.manager.subscribe(&p).await.unwrap();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let relayed = wait_for(&mut rx, |e| matches!(e, ChatEvent::ProviderSwitched { .. })).await;
+    let relayed = switched_in_place(&w, &p).await;
     let ChatEvent::ProviderSwitched {
         session_id,
         from_provider,
@@ -1164,11 +1183,9 @@ async fn after_a_provider_move_the_next_turn_of_another_class_changes_model_not_
         )
         .await
         .unwrap();
-    let mut rx = w.manager.subscribe(&p).await.unwrap();
     let moved_at = std::time::Instant::now();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let ChatEvent::ProviderSwitched { session_id, .. } =
-        wait_for(&mut rx, |e| matches!(e, ChatEvent::ProviderSwitched { .. })).await
+    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await
     else {
         unreachable!()
     };
@@ -1268,10 +1285,8 @@ async fn after_a_provider_move_the_next_turn_of_the_same_class_is_steady() {
         )
         .await
         .unwrap();
-    let mut rx = w.manager.subscribe(&p).await.unwrap();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let ChatEvent::ProviderSwitched { session_id, .. } =
-        wait_for(&mut rx, |e| matches!(e, ChatEvent::ProviderSwitched { .. })).await
+    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await
     else {
         unreachable!()
     };

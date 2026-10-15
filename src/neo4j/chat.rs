@@ -449,25 +449,28 @@ impl Neo4jClient {
     /// Re-target a chat session IN PLACE to another provider (B-SW phase 1). Providers do
     /// not share a session format and a resume token is refused across families, so the
     /// provider-specific fields are cleared (read back as `None`, like every optional
-    /// session property). `false`: no such session.
+    /// session property), and `engine` is written to the engine the target runs on.
+    /// `false`: no such session.
     pub async fn update_chat_session_provider(
         &self,
         id: Uuid,
         provider_id: &str,
         model: &str,
         routed_by: &str,
+        engine: &str,
     ) -> Result<bool> {
         let q = query(
             "MATCH (s:ChatSession {id: $id}) \
              SET s.provider_id = $provider_id, s.model = $model, s.routed_by = $routed_by, \
                  s.resume_token = '', s.capabilities = '', s.cli_session_id = '', \
-                 s.engine = 'agent', s.updated_at = datetime() \
+                 s.engine = $engine, s.updated_at = datetime() \
              RETURN s.id AS id",
         )
         .param("id", id.to_string())
         .param("provider_id", provider_id.to_string())
         .param("model", model.to_string())
-        .param("routed_by", routed_by.to_string());
+        .param("routed_by", routed_by.to_string())
+        .param("engine", engine.to_string());
         let mut result = self.graph.execute(q).await?;
         Ok(result.next().await?.is_some())
     }

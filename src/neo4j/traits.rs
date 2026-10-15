@@ -2114,16 +2114,18 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<bool>;
 
     /// Re-target a chat session IN PLACE to another provider (B-SW phase 1): set
-    /// `provider_id`, `model` and `routed_by`, and clear the provider-specific fields
-    /// that do not survive a move across provider families (`resume_token`,
-    /// `capabilities`, `cli_session_id`, `engine`). `false` when the session does not
-    /// exist.
+    /// `provider_id`, `model`, `routed_by` and `engine`, and clear the provider-specific
+    /// fields that do not survive a move across provider families (`resume_token`,
+    /// `capabilities`, `cli_session_id`). `engine` names the engine the target runs on
+    /// (`agent` or `legacy`), so a later resume routes on the SAME branch the switch
+    /// reopened with. `false` when the session does not exist.
     async fn update_chat_session_provider(
         &self,
         id: Uuid,
         provider_id: &str,
         model: &str,
         routed_by: &str,
+        engine: &str,
     ) -> Result<bool>;
 
     /// Restore the provider fields of a chat session after a FAILED in-place re-target:

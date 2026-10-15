@@ -2517,8 +2517,9 @@ impl GraphStore for Neo4jClient {
         provider_id: &str,
         model: &str,
         routed_by: &str,
+        engine: &str,
     ) -> anyhow::Result<bool> {
-        self.update_chat_session_provider(id, provider_id, model, routed_by)
+        self.update_chat_session_provider(id, provider_id, model, routed_by, engine)
             .await
     }
 
