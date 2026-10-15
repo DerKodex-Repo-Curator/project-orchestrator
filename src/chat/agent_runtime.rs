@@ -32,6 +32,7 @@ use super::manager::{
     CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS,
 };
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
+use super::spill::SpillConfig;
 use super::types::{
     BackgroundTaskInfo, ChatEvent, PendingMessage, PendingMessageKind, PermissionAnswerScope,
 };
@@ -717,6 +718,9 @@ pub struct AgentSessionHandle {
     /// How a turn that failed before showing anything is retried: the chat's
     /// `RetryConfig` (`configure_retry`), as on the Claude Code engine.
     retry: std::sync::RwLock<RetryConfig>,
+    /// Whether an oversized tool result is spilled out of the transcript
+    /// (`super::spill`): the budget and preview sizes this session keeps.
+    spill: SpillConfig,
     /// When the session last did something (an event, a message): what the idle
     /// cleanup reads (`ChatManager::start_cleanup_task`).
     last_activity: std::sync::Mutex<Instant>,
@@ -806,6 +810,22 @@ impl AgentSessionHandle {
         mut event: ChatEvent,
     ) -> Option<(String, super::session_grants::Cover)> {
         self.touch();
+        // Spill an oversized tool result BEFORE it reaches the transcript, the
+        // observers and the broadcast: the stored `tool_result` (the model-facing
+        // copy) keeps a bounded preview, and the full text lands in a
+        // `tool_result_spill` record under a stable key (`super::spill`). Small
+        // results, a disabled budget, and a store failure leave it inline.
+        if let ChatEvent::ToolResult { id, result, .. } = &mut event {
+            super::spill::spill_if_oversized(
+                &self.graph,
+                self.uuid,
+                id,
+                &self.next_seq,
+                result,
+                &self.spill,
+            )
+            .await;
+        }
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
             provider,
@@ -2123,6 +2143,9 @@ pub struct AgentRuntime {
     /// (`ChatConfig::read_only_mcp_tools`): what each session's grants may cover
     /// (`session_grants::SessionGrants::declaring`).
     read_only_mcp_tools: Vec<String>,
+    /// How an oversized tool result is spilled out of the transcript
+    /// (`super::spill`), copied onto every session this runtime adopts.
+    spill: SpillConfig,
 }
 
 impl AgentRuntime {
@@ -2132,6 +2155,7 @@ impl AgentRuntime {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             graph,
             read_only_mcp_tools: Vec::new(),
+            spill: SpillConfig::from_env(),
         }
     }
 
@@ -2139,6 +2163,13 @@ impl AgentRuntime {
     /// `mcp__<server>__<tool>` names): the only ones a session grant may cover.
     pub fn declaring_read_only_mcp_tools(mut self, tools: Vec<String>) -> Self {
         self.read_only_mcp_tools = tools;
+        self
+    }
+
+    /// This runtime, its sessions spilling oversized tool results per `spill`
+    /// (the default reads the operator's environment).
+    pub fn spilling(mut self, spill: SpillConfig) -> Self {
+        self.spill = spill;
         self
     }
 
@@ -2296,6 +2327,7 @@ impl AgentRuntime {
             record: Mutex::new(()),
             opening_counted: AtomicBool::new(false),
             retry: std::sync::RwLock::new(RetryConfig::default()),
+            spill: self.spill,
             last_activity: std::sync::Mutex::new(Instant::now()),
             registry: Arc::downgrade(&self.sessions),
         });

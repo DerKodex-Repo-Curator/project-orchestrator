@@ -2323,6 +2323,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                         session_id,
                         ctx.project_slug.as_deref(),
                         Some(snapshot),
+                        outcome.context_window,
                     ),
                 )
                 .await

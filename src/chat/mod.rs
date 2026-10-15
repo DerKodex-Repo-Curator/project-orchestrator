@@ -53,6 +53,7 @@ mod routing_modes_e2e_tests;
 pub mod session_grants;
 pub mod session_record;
 pub(crate) mod skill_hook;
+pub(crate) mod spill;
 pub mod stages;
 pub(crate) mod subagents;
 pub(crate) mod tool_clock;

@@ -169,6 +169,19 @@ pub(crate) fn turn_enrichment_cap(window_tokens: Option<u64>) -> usize {
 ///
 /// It is stateless — each call to `compose()` produces a fresh prompt string.
 /// All state (project context, protocol runs, etc.) is passed via `ComposerInput`.
+///
+/// # Prefix byte-stability (cache)
+///
+/// The system prompt is the FIRST message the provider sends, so it is the head of
+/// the prefix a KV/prompt cache reuses across turns (system message + tools +
+/// replayed history). For that cache to hit, the composed prefix must be
+/// byte-identical from one request to the next. The composer guarantees this
+/// structurally: it is a pure function of `ComposerInput` — it reads no global or
+/// mutable state, holds no counter, and takes no conversation history. A turn only
+/// appends to the provider's replayed history (which the composer never sees), so
+/// recomposing with the same session-frozen inputs yields the same bytes. Any
+/// change that must reach the model (re-summarisation, a new instruction) is done
+/// APPEND-ONLY by the provider as a trailing message, never by rewriting this head.
 pub struct FsmPromptComposer;
 
 impl FsmPromptComposer {
@@ -1406,5 +1419,75 @@ mod tests {
             FsmPromptComposer::compose(&input),
             FsmPromptComposer::compose(&input)
         );
+    }
+
+    // ── Prefix byte-stability (cache) ─────────────────────────────────
+
+    /// The system prompt is the head of the provider-facing prefix (system +
+    /// tools + replayed history), so it must be byte-identical across turns for
+    /// the KV/prefix cache to hit. This test proves the half the composer owns —
+    /// PURITY: recomposing the same session-frozen inputs yields the same bytes.
+    ///
+    /// It does NOT, by itself, prove byte-stability *across a turn*: the composer
+    /// produces only the head and has no input for the provider's replayed
+    /// history, so it cannot express "append a trailing turn" in isolation. That
+    /// append-only contract is proven at the boundary that owns the history —
+    /// `provider/transcripts.rs::a_turn_appends_to_the_replayed_history_without_touching_its_prefix`
+    /// (save → resume → append → save, the cached prefix stays byte-identical).
+    #[test]
+    fn the_system_prompt_is_a_pure_function_of_its_session_frozen_inputs() {
+        let runs = vec![ProtocolRunStatus {
+            protocol_name: "code-review".to_string(),
+            current_state: "analyzing".to_string(),
+            progress: 25,
+            status_message: "Analyzing changes".to_string(),
+            prompt_fragment: Some("Focus on test coverage.".to_string()),
+            available_tools: Some(vec!["code".to_string(), "note".to_string()]),
+            forbidden_actions: Some(vec!["Do NOT commit".to_string()]),
+        }];
+        let input = ComposerInput {
+            model: "deepseek-chat",
+            context_window: Some(128_000),
+            scaffolding_level: 1,
+            protocol_runs: &runs,
+            project_context_markdown: "## Project: my-app\n- [High] keep the auth flow\n- [Low] ui",
+            continuity_markdown: "## Previous Session\n- worked on the auth module",
+            enrichment_markdown: "## Notes\n- a propagated note",
+            is_multi_project: true,
+            has_active_plan: true,
+            task_count: 6,
+            ..Default::default()
+        };
+
+        let before = FsmPromptComposer::compose(&input);
+        // Nothing about a turn reaches the composer (it reads no history and
+        // holds no state), so recomposing the same frozen inputs yields the same
+        // bytes.
+        let after = FsmPromptComposer::compose(&input);
+
+        assert!(!before.is_empty());
+        assert_eq!(
+            before, after,
+            "the composer is pure: same inputs, same bytes"
+        );
+    }
+
+    /// The composer holds no state between calls: composing another prompt in
+    /// between must not disturb a later recomposition of the first. A session's
+    /// prefix is never influenced by the prompts of any other session.
+    #[test]
+    fn compose_holds_no_state_between_calls() {
+        let a = ComposerInput {
+            project_context_markdown: "## A\n- alpha",
+            ..Default::default()
+        };
+        let b = ComposerInput {
+            project_context_markdown: "## B\n- beta",
+            ..Default::default()
+        };
+        let a1 = FsmPromptComposer::compose(&a);
+        let _b = FsmPromptComposer::compose(&b);
+        let a2 = FsmPromptComposer::compose(&a);
+        assert_eq!(a1, a2, "composing `b` in between must not leak into `a`");
     }
 }

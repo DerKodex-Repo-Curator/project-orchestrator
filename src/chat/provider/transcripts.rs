@@ -298,4 +298,92 @@ mod tests {
         assert_eq!(back[1].tool_calls[0].arguments, long);
         assert_eq!(back[1..], conversation[1..]);
     }
+
+    /// The provider-facing prefix is the system message + tools + replayed history.
+    /// This store holds the history; a resume replays it byte for byte, and a later
+    /// turn APPENDS to it — never rewrites the part the endpoint already cached.
+    /// This proves the append-only contract over a full save → load (resume) →
+    /// append (turn) → save cycle: the cached prefix stays byte-identical.
+    #[test]
+    fn a_turn_appends_to_the_replayed_history_without_touching_its_prefix() {
+        use nexus_claude::model::ToolCallChunk;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_for(tmp.path(), "local", KnownSecrets::new()).unwrap();
+        let prefix = vec![
+            ChatMessage::user("plan the auth module"),
+            ChatMessage::assistant("Sure, here is the plan."),
+            ChatMessage::assistant_tool_calls(vec![ToolCallChunk {
+                id: "c1".into(),
+                name: "mcp__po__plan".into(),
+                arguments: r#"{"title":"auth"}"#.into(),
+            }]),
+            ChatMessage::tool("c1", "created plan 42"),
+        ];
+        store.save("t", &prefix).unwrap();
+
+        // Resume: the transcript replays byte for byte.
+        let resumed = store.load("t").unwrap().unwrap();
+        assert_eq!(resumed, prefix, "resume replays the history verbatim");
+
+        // A turn appends a new exchange; the already-sent prefix is never rewritten.
+        let mut next = resumed;
+        next.push(ChatMessage::user("continue with the tests"));
+        next.push(ChatMessage::assistant("Wrote the tests."));
+        assert_eq!(
+            &next[..prefix.len()],
+            prefix.as_slice(),
+            "the appended turn leaves the cached prefix byte-identical"
+        );
+        store.save("t", &next).unwrap();
+        let after = store.load("t").unwrap().unwrap();
+        assert_eq!(after, next, "the turn is saved append-only, byte for byte");
+        assert_eq!(&after[..prefix.len()], prefix.as_slice());
+    }
+
+    /// CACHE-HIT ACCOUNTING — the nexus boundary, documented precisely.
+    ///
+    /// The wire parse of a cache hit lives in NEXUS, not here:
+    /// `claude-code-sdk-rs/src/model/wire.rs::parse_usage` reads an
+    /// OpenAI-compatible `usage` object and splits the cached part OUT of the
+    /// prompt: `prompt_tokens_details.cached_tokens` (OpenAI form) or
+    /// `prompt_cache_hit_tokens` (DeepSeek form) becomes `Usage.cache_read_tokens`,
+    /// and `Usage.input_tokens` is set to `prompt_tokens - cached` — what was NOT
+    /// served from the cache, i.e. what the price table bills. That function is
+    /// `pub(crate)` in the `nexus-claude` git dependency, so it is not reachable
+    /// from this crate's tests.
+    ///
+    /// The highest layer of THIS crate that surfaces a turn's usage is
+    /// `chat::cost::session_usage`: it reads the `result` event payloads that
+    /// `chat::provider::event_map::usage_value` filled from the nexus `Usage`
+    /// (the same `cache_read_tokens` field as Claude Code's), sums the cache reads
+    /// apart from the billed input and computes the cache-hit ratio. This test
+    /// proves that accounting at that boundary with a fake provider usage (no
+    /// network): the cache hit is reported, and the billed input does not count it
+    /// twice.
+    #[test]
+    fn cache_reads_flow_into_the_turn_usage_without_double_counting_input() {
+        use serde_json::json;
+        // What nexus `parse_usage` yields for a DeepSeek turn that reported
+        // `prompt_cache_hit_tokens: 3800` and `prompt_cache_miss_tokens: 200`
+        // (`prompt_tokens: 4000`): the miss is the billed input, the hit the cache
+        // read — the total prompt is their sum, never the input twice.
+        let first = json!({"type": "result", "model": "deepseek-chat",
+            "usage": {"input_tokens": 200, "output_tokens": 60, "cache_read_tokens": 3800}});
+        let second = json!({"type": "result", "model": "deepseek-chat",
+            "usage": {"input_tokens": 150, "output_tokens": 40, "cache_read_tokens": 0}});
+        let usage = crate::chat::cost::session_usage([(1, &first), (2, &second)]);
+
+        assert_eq!((usage.turns, usage.turns_with_usage), (2, 2));
+        // The cache hit is surfaced, and it is > 0 (what the DSH e2e asserts).
+        assert_eq!(usage.cache_read_tokens, Some(3800));
+        assert!(usage.by_turn[0].cache_read_tokens.unwrap() > 0);
+        // The billed input does NOT double-count the cached part: 200 + 150, not
+        // (200 + 3800) + 150.
+        assert_eq!(usage.input_tokens, Some(350));
+        assert_eq!(usage.output_tokens, Some(100));
+        // cache_hit_ratio = cache_read / (input + cache_read).
+        assert_eq!(usage.by_turn[0].cache_hit_ratio, Some(3800.0 / 4000.0));
+        assert_eq!(usage.by_turn[1].cache_hit_ratio, Some(0.0));
+        assert!((usage.cache_hit_ratio.unwrap() - 3800.0 / 4150.0).abs() < 1e-12);
+    }
 }

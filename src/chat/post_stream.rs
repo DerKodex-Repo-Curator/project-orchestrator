@@ -10,6 +10,7 @@
 //! - Memory/feedback/RFC recording
 
 use super::manager::ActiveSession;
+use super::provider::cognitive::segment::{Boundary, Segment};
 use super::types::{ChatEvent, PendingMessage};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -19,6 +20,7 @@ use nexus_claude::{
     InteractiveClient,
 };
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
@@ -352,11 +354,18 @@ impl PostStreamHandler {
     pub async fn handle_post_compaction(&self, needs_injection: bool) {
         if needs_injection && !self.interrupt_flag.load(Ordering::SeqCst) {
             let snapshot = self.work_log.lock().await.snapshot();
+            let window = self
+                .active_sessions
+                .read()
+                .await
+                .get(&self.session_id)
+                .and_then(|s| s.context_window);
             let (hint, recovery_event) = post_compaction_recovery(
                 &self.graph,
                 &self.session_id,
                 self.ctx.project_slug.as_deref(),
                 Some(snapshot),
+                window,
             )
             .await;
             if let Some(hint) = hint {
@@ -752,6 +761,7 @@ pub(crate) async fn post_compaction_recovery(
     session_id: &str,
     project_slug: Option<&str>,
     work_log: Option<super::types::SessionWorkLogSnapshot>,
+    context_window: Option<u64>,
 ) -> (Option<String>, ChatEvent) {
     info!(
         "Post-compaction injection triggered for session {}",
@@ -772,7 +782,24 @@ pub(crate) async fn post_compaction_recovery(
                     ctx.work_log = Some(snapshot);
                 }
             }
-            let hint = ctx.to_markdown();
+            let mut hint = ctx.to_markdown();
+            // When the recovered context would itself overflow a known, tight window,
+            // cutting it mid-section (the `HeldContext::cap` path) recurses the overflow
+            // the compaction just hit. Fall back to a bounded checkpoint assembled from
+            // the conversation's persisted segments and boundaries — lossy, but bounded,
+            // and never without the user's latest turn. No persisted graph material: the
+            // normal recovery is kept (the existing behavior).
+            if recovered_context_overflows(context_window, hint.chars().count()) {
+                if let Some(checkpoint) = segment_checkpoint_from_store(graph, session_id).await {
+                    info!(
+                        "Post-compaction context would overflow the window for session {}; \
+                         re-injecting a bounded segment checkpoint ({} chars) instead",
+                        session_id,
+                        checkpoint.chars().count()
+                    );
+                    hint = checkpoint;
+                }
+            }
             if !hint.is_empty() {
                 info!(
                     "Injecting post-compaction context for session {} ({} chars)",
@@ -803,6 +830,178 @@ pub(crate) async fn post_compaction_recovery(
         recovery_success,
     };
     ((!hint.is_empty()).then_some(hint), event)
+}
+
+// ── Bounded segment checkpoint (overflow-recovery fallback) ─────────────
+
+/// The share of a known window the recovered context may take, mirroring the cap
+/// applied downstream (`manager::HELD_CONTEXT_WINDOW_SHARE`), four characters a
+/// token. The recovery is "tight" when the window is known and this share is
+/// smaller than what the builder produced.
+const RECOVERY_WINDOW_SHARE: f64 = 0.05;
+
+/// A hard cap on the checkpoint, in characters (~a few hundred tokens). It keeps
+/// the fallback bounded whatever the conversation size, but it is NOT derived
+/// from the window: a window tighter than ~375 tokens may still overflow it. The
+/// checkpoint is a lossy last resort, not a promise it fits every window.
+const SEGMENT_CHECKPOINT_MAX_CHARS: usize = 1500;
+
+/// Most segments and boundaries (each recent-first) the checkpoint keeps.
+const CHECKPOINT_MAX_SEGMENTS: usize = 10;
+const CHECKPOINT_MAX_BOUNDARIES: usize = 10;
+
+/// The user's latest turn keeps at most this many characters (its start).
+const CHECKPOINT_LAST_TURN_CHARS: usize = 600;
+
+/// Whether a recovered context of `recovered_chars` would overflow the window:
+/// only with a KNOWN window whose [`RECOVERY_WINDOW_SHARE`] is smaller than the
+/// context. An unknown window is never overflow — the builder's own 6000-char
+/// cap is the bound then.
+fn recovered_context_overflows(window_tokens: Option<u64>, recovered_chars: usize) -> bool {
+    match window_tokens {
+        Some(window) => {
+            let budget = ((window as f64) * RECOVERY_WINDOW_SHARE * 4.0) as usize;
+            recovered_chars > budget
+        }
+        None => false,
+    }
+}
+
+/// A bounded, deterministic, lossy checkpoint assembled from the conversation's
+/// persisted segments and boundaries — never the raw messages — plus the user's
+/// latest turn, listed first so even a later cap keeps it. The "Latest request"
+/// section is absent when no user message appears in the bounded scan
+/// ([`last_user_turn_text`]). Used ONLY when the normal post-compaction recovery
+/// would overflow.
+fn bounded_segment_checkpoint(
+    segments: &[Segment],
+    boundaries: &[Boundary],
+    last_turn_text: Option<&str>,
+) -> String {
+    let mut out = String::with_capacity(SEGMENT_CHECKPOINT_MAX_CHARS);
+    out.push_str("<system-reminder>\n# Conversation Checkpoint (bounded)\n");
+
+    // The user's latest turn first: nothing may cut it off. Absent when the
+    // scan found no user message (`last_turn_text` is `None`).
+    if let Some(text) = last_turn_text {
+        if !text.is_empty() {
+            out.push_str("\n## Latest request\n");
+            out.push_str(&truncate_chars(text, CHECKPOINT_LAST_TURN_CHARS));
+            out.push('\n');
+        }
+    }
+
+    // Recent segments: most recently active first (highest `last_turn`), then axis
+    // (enum order) for a stable result.
+    if !segments.is_empty() {
+        let mut recent: Vec<&Segment> = segments.iter().collect();
+        recent.sort_by(|a, b| {
+            b.last_turn
+                .cmp(&a.last_turn)
+                .then(a.dimension.cmp(&b.dimension))
+        });
+        out.push_str("\n## Recent direction\n");
+        for segment in recent.into_iter().take(CHECKPOINT_MAX_SEGMENTS) {
+            let labels: Vec<&str> = segment.fingerprint.labels().collect();
+            let _ = writeln!(
+                out,
+                "- {}: {} (turns {}-{})",
+                segment.dimension.as_str(),
+                labels.join(", "),
+                segment.start_turn,
+                segment.last_turn
+            );
+        }
+    }
+
+    // Recent boundaries: most recent first (highest `at_turn`), then axis.
+    if !boundaries.is_empty() {
+        let mut recent: Vec<&Boundary> = boundaries.iter().collect();
+        recent.sort_by(|a, b| {
+            b.at_turn
+                .cmp(&a.at_turn)
+                .then(a.dimension.cmp(&b.dimension))
+        });
+        out.push_str("\n## Direction changes\n");
+        for boundary in recent.into_iter().take(CHECKPOINT_MAX_BOUNDARIES) {
+            let _ = writeln!(
+                out,
+                "- {} @ turn {}: {} -> {}",
+                boundary.dimension.as_str(),
+                boundary.at_turn,
+                boundary.from.as_str(),
+                boundary.to.as_str()
+            );
+        }
+    }
+
+    out.push_str("</system-reminder>");
+    // Final safety: never past the checkpoint budget, and always a closed tag.
+    if out.chars().count() > SEGMENT_CHECKPOINT_MAX_CHARS {
+        const TAIL: &str = "\n</system-reminder>";
+        let keep = SEGMENT_CHECKPOINT_MAX_CHARS.saturating_sub(TAIL.chars().count());
+        let mut cut: String = out.chars().take(keep).collect();
+        cut.push_str(TAIL);
+        out = cut;
+    }
+    out
+}
+
+/// The user's latest turn text, read from the session's persisted events (the last
+/// `user_message` in sequence order). `None` when there is none, when none appears
+/// in the bounded scan, or when the store cannot be read — the checkpoint's
+/// "Latest request" section is then simply absent. Bounded: only the last
+/// [`LAST_USER_MSG_SCAN`] events are read.
+async fn last_user_turn_text(graph: &Arc<dyn GraphStore>, session_id: &str) -> Option<String> {
+    const LAST_USER_MSG_SCAN: i64 = 64;
+    let uuid = Uuid::parse_str(session_id).ok()?;
+    let total = graph.count_chat_events(uuid).await.ok()?;
+    let offset = (total - LAST_USER_MSG_SCAN).max(0);
+    let events = graph
+        .get_chat_events_paginated(uuid, offset, LAST_USER_MSG_SCAN)
+        .await
+        .ok()?;
+    for record in events.iter().rev() {
+        if record.event_type != "user_message" {
+            continue;
+        }
+        if let Ok(ChatEvent::UserMessage { content }) = serde_json::from_str(&record.data) {
+            if !content.is_empty() {
+                return Some(content);
+            }
+        }
+    }
+    None
+}
+
+/// A bounded checkpoint from the session's persisted segments and boundaries, or
+/// `None` when there is no graph material to checkpoint (the caller keeps the
+/// existing behavior) or the store cannot be read.
+async fn segment_checkpoint_from_store(
+    graph: &Arc<dyn GraphStore>,
+    session_id: &str,
+) -> Option<String> {
+    let segments = graph.get_segments(session_id).await.ok()?;
+    let boundaries = graph.get_boundaries(session_id).await.ok()?;
+    if segments.is_empty() && boundaries.is_empty() {
+        return None;
+    }
+    let last_turn = last_user_turn_text(graph, session_id).await;
+    Some(bounded_segment_checkpoint(
+        &segments,
+        &boundaries,
+        last_turn.as_deref(),
+    ))
+}
+
+/// Truncate to `max` characters on a UTF-8 boundary, adding "…" when cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// The objective-reminder state of a session (both engines keep one).
@@ -2000,6 +2199,134 @@ mod integration_tests {
             content.len() > 500,
             "Auto-continue message too short ({} chars), expected >500",
             content.len()
+        );
+    }
+
+    // ── Bounded segment checkpoint (overflow-recovery fallback) ──────────
+
+    /// A conversation's segmentation for the checkpoint tests: two turns on one
+    /// topic, then a drift confirmed on the fourth turn (two segments, one boundary).
+    fn checkpoint_segments() -> (Vec<Segment>, Vec<Boundary>) {
+        use crate::chat::provider::cognitive::segment::{
+            Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter,
+        };
+        fn obs(turn: u32, labels: &[&str]) -> Observation {
+            Observation {
+                turn,
+                prints: std::iter::once((
+                    Dimension::Topic,
+                    Fingerprint::new(labels.iter().copied()),
+                ))
+                .collect(),
+            }
+        }
+        let history = vec![
+            obs(0, &["relay"]),
+            obs(1, &["relay"]),
+            obs(2, &["docker"]),
+            obs(3, &["docker"]),
+        ];
+        let segmenter = Segmenter::replay(SegmentPolicy::default(), 7, &history).unwrap();
+        (segmenter.segments(), segmenter.boundaries().to_vec())
+    }
+
+    #[test]
+    fn a_checkpoint_is_deterministic() {
+        let (segments, boundaries) = checkpoint_segments();
+        let first = bounded_segment_checkpoint(&segments, &boundaries, Some("Fix the relay"));
+        let second = bounded_segment_checkpoint(&segments, &boundaries, Some("Fix the relay"));
+        assert_eq!(
+            first, second,
+            "the checkpoint must not depend on arrival order"
+        );
+        assert!(
+            first.chars().count() <= SEGMENT_CHECKPOINT_MAX_CHARS,
+            "the checkpoint must stay bounded: {}",
+            first.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_the_latest_turn_even_without_segments() {
+        let checkpoint = bounded_segment_checkpoint(&[], &[], Some("The latest request"));
+        assert!(
+            checkpoint.contains("The latest request"),
+            "the user's latest turn must always be kept: {checkpoint}"
+        );
+        assert!(
+            checkpoint.contains("# Conversation Checkpoint"),
+            "a checkpoint with only a latest turn is still a checkpoint: {checkpoint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_segments_builds_a_bounded_checkpoint_when_the_window_is_tight() {
+        const SID: &str = "00000000-0000-0000-0000-000000000001";
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let (segments, boundaries) = checkpoint_segments();
+        graph.put_segments(SID, &segments).await.unwrap();
+        graph.put_boundaries(SID, &boundaries).await.unwrap();
+        // The user's latest turn, persisted like any event.
+        let uuid = Uuid::parse_str(SID).unwrap();
+        graph
+            .store_chat_events(
+                uuid,
+                vec![ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: 1,
+                    event_type: "user_message".to_string(),
+                    data: serde_json::to_string(&ChatEvent::UserMessage {
+                        content: "Fix the relay timeout please".to_string(),
+                    })
+                    .unwrap(),
+                    created_at: chrono::Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // A tight window: the normal recovery (~75 chars) already overflows its 5 % share.
+        let (hint, _event) = post_compaction_recovery(&graph, SID, None, None, Some(100)).await;
+        let hint = hint.expect("a checkpoint should be injected");
+
+        assert!(
+            hint.contains("# Conversation Checkpoint"),
+            "the bounded checkpoint should replace the normal recovery: {hint}"
+        );
+        assert!(hint.contains("relay"), "missing segment label: {hint}");
+        assert!(hint.contains("docker"), "missing segment label: {hint}");
+        assert!(
+            hint.contains("Fix the relay timeout please"),
+            "the latest turn was lost: {hint}"
+        );
+        assert!(
+            hint.chars().count() <= SEGMENT_CHECKPOINT_MAX_CHARS,
+            "the checkpoint must stay bounded: {}",
+            hint.chars().count()
+        );
+        // The latest turn is listed first, so a later cap still keeps it.
+        assert!(
+            hint.find("Latest request").unwrap() < hint.find("Recent direction").unwrap(),
+            "the latest request must precede the segment labels: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_without_segments_keeps_the_existing_recovery_when_the_window_is_tight() {
+        const SID: &str = "00000000-0000-0000-0000-000000000002";
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        // No segments, no boundaries, no user message: there is no graph material
+        // to checkpoint, so the normal recovery is kept.
+        let (hint, _event) = post_compaction_recovery(&graph, SID, None, None, Some(100)).await;
+        let hint = hint.expect("a hint should be injected");
+        assert!(
+            hint.contains("# Post-Compaction Context"),
+            "the existing behavior should be kept: {hint}"
+        );
+        assert!(
+            !hint.contains("# Conversation Checkpoint"),
+            "no checkpoint without segments: {hint}"
         );
     }
 }
