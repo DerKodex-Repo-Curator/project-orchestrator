@@ -896,7 +896,8 @@ pub struct ChatManager {
     pub(crate) cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
     /// Open cognitive decisions of live chat sessions (session id -> decision id),
     /// closed with what happened when the session is closed.
-    pub(crate) open_decisions: std::sync::Mutex<std::collections::HashMap<String, Uuid>>,
+    pub(crate) open_decisions:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Uuid>>>,
     /// Whether the Claude Code CLI is on this server (B2): what the resolver knows of the
     /// built-in instance's health. See [`super::cli_version::ClaudeCliProbe`].
     claude_cli: super::cli_version::ClaudeCliProbe,
@@ -1581,6 +1582,9 @@ pub(crate) struct ManagerTurnServices {
     /// Where routing decisions are stored (`CognitiveRouting::store`): a change of model a
     /// turn could not make is written back on its decision. `None`: nowhere.
     routing_store: Option<Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
+    /// The decisions still open, keyed by session id (shared with [`ChatManager`]),
+    /// so a turn's ending can feed its reward to the arm it routed.
+    open_decisions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Uuid>>>,
     /// Mirrors the sub-agents of a Claude Code session into read-only child conversations
     /// (`chat::mirror`, P18c), from [`Self::observe`]. `None` for every other provider.
     mirror: Option<Arc<super::mirror::MirrorTap>>,
@@ -2237,6 +2241,46 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     ) -> super::agent_runtime::AfterTurn {
         let mut after = super::agent_runtime::AfterTurn::default();
         let uuid = Uuid::parse_str(session_id).ok();
+        // Gap 2: feed the bandit the outcome of the turn it routed. Only for the
+        // OPEN decision of a turn that reached a terminal `done`; an overridden
+        // decision is skipped — `close_routing_decision` already feeds it.
+        if let (Some(store), Some(stop_reason)) =
+            (self.routing_store.clone(), outcome.stop_reason.as_deref())
+        {
+            let decision_id = self
+                .open_decisions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(session_id)
+                .copied();
+            if let Some(decision_id) = decision_id {
+                if let Ok(Some(decision)) = store.decision(decision_id).await {
+                    if !decision.outcome.as_ref().is_some_and(|o| o.overridden) {
+                        let reward = super::provider::cognitive::decision::turn_reward(
+                            Some(stop_reason),
+                            &outcome.subtype,
+                            outcome.is_error,
+                            outcome.error_code.is_some(),
+                        );
+                        if let (Some(reward), Some(arm)) = (reward, decision.served_arm()) {
+                            let observation = super::provider::cognitive::store::ArmObservation {
+                                reward,
+                                success_threshold:
+                                    super::provider::cognitive::decider::TURN_REWARD_THRESHOLD,
+                                cost_usd: None,
+                                latency_ms: None,
+                            };
+                            if let Err(error) = store.observe(&arm, &observation).await {
+                                warn!(
+                                    %session_id, %decision_id, %error,
+                                    "feeding the turn reward failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // The turn carried what waited since the last compaction and was answered:
         // dropped in memory before anything else (before the first await, so the
         // backstop cannot skip it), a compaction of this same turn holding its own
@@ -3282,7 +3326,9 @@ impl ChatManager {
             builtin_cli_path,
             recovery_resumes_claude_code: false,
             cognitive_routing: None,
-            open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             native_probers: Arc::new(RwLock::new(HashMap::new())),
@@ -3379,7 +3425,9 @@ impl ChatManager {
             builtin_cli_path,
             recovery_resumes_claude_code: false,
             cognitive_routing: None,
-            open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             native_probers: Arc::new(RwLock::new(HashMap::new())),
@@ -15817,6 +15865,7 @@ impl ChatManager {
                 .cognitive_routing
                 .as_ref()
                 .and_then(|routing| routing.store.clone()),
+            open_decisions: std::sync::Arc::clone(&self.open_decisions),
             mirror,
         })
     }
@@ -32031,6 +32080,9 @@ mod refs_turn_services_tests {
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
             routing_store: None,
+            open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             mirror: None,
         };
 
@@ -32460,6 +32512,9 @@ mod held_context_tests {
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
             routing_store: None,
+            open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             mirror: None,
         }
     }
@@ -33020,6 +33075,9 @@ mod image_turn_services_tests {
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
             routing_store: Some(store.clone()),
+            open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             mirror: None,
         };
         // Before any turn input, nothing says an image comes.

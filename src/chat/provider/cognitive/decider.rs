@@ -33,7 +33,7 @@ pub const NO_CANDIDATE: &str = "no_candidate";
 /// `1.0`, so any threshold strictly inside `(0, 1)` splits them the same; this
 /// one matches the arm store's binary split (a success counts `alpha += 1`, a
 /// failure `beta += 1`, i.e. `alpha += reward`, `beta += 1 - reward`).
-const TURN_REWARD_THRESHOLD: f64 = 0.5;
+pub(crate) const TURN_REWARD_THRESHOLD: f64 = 0.5;
 
 /// Whether a choice is used, from the mode, the stage and the role.
 ///
