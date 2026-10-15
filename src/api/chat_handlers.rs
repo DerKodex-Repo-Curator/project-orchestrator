@@ -3122,7 +3122,6 @@ mod tests {
             spawned_by: None,
             task_context: None,
             subagent_type: None,
-
             route_auto: false,
             scaffolding_override: None,
             runner_context: None,

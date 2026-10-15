@@ -306,20 +306,39 @@ impl TaskSignature {
         }
     }
 
+    /// The class of an `Agent` call, from the kind of agent the model named. The tool's
+    /// own schema calls `subagent_type` "the kind of agent" and Claude Code's kinds are
+    /// `Explore`, `Plan`, `general-purpose` (nexus, `providers/native/builtin.rs`), none of
+    /// which [`TaskClass::parse`] knows: reading the kind as a class therefore always
+    /// answered `None`, and every routed sub-agent was `Simple` — the router read
+    /// sub-agents as cheap work. An unknown kind (and an `Agent` call that names none) is
+    /// no class here.
+    fn subagent_class(kind: &str) -> Option<TaskClass> {
+        Some(match kind.trim().to_lowercase().as_str() {
+            // A read-only investigation: what a sub-agent is asked for to spare the parent's
+            // context, and Claude Code's guide lookup.
+            "explore" | "claude-code-guide" => TaskClass::Simple,
+            // The general-purpose agent: a whole task handed over.
+            "general-purpose" => TaskClass::Complex,
+            // Designing an approach rather than carrying it out.
+            "plan" => TaskClass::Creative,
+            _ => return None,
+        })
+    }
+
     /// A sub-agent of a native parent (the `Agent` tool): an executor whose class comes
-    /// from the agent the model named (`subagent_type`) or, failing that, the task
-    /// description; the prompt's length grows the complexity and the context need. A
+    /// from the kind of agent the model named (`subagent_type`), or from a class it stated
+    /// outright; the prompt's length grows the complexity and the context need. A
     /// sub-agent always calls tools and never carries images of its own.
     pub fn from_subagent(
         subagent_type: Option<&str>,
-        description: Option<&str>,
         prompt: &str,
         project_slug: Option<&str>,
         hints: ContextHints,
     ) -> Self {
         let class = subagent_type
-            .and_then(TaskClass::parse)
-            .or_else(|| description.and_then(TaskClass::parse))
+            .and_then(Self::subagent_class)
+            .or_else(|| subagent_type.and_then(TaskClass::parse))
             .unwrap_or(TaskClass::Simple);
         let length_bonus = (prompt.chars().count() / 800).min(2) as u8;
         let message_tokens = prompt.chars().count() as u64 / CHARS_PER_TOKEN;
@@ -597,5 +616,44 @@ mod tests {
         let json = serde_json::to_string(&signature).unwrap();
         let back: TaskSignature = serde_json::from_str(&json).unwrap();
         assert_eq!(back, signature);
+    }
+
+    /// AUTO-SUB (review point 3): the `subagent_type` of an `Agent` call is the KIND of
+    /// agent the model wants, not a class of work. `TaskClass::parse` reads class names and
+    /// answered `None` for every real kind (`Explore`, `general-purpose`, `Plan`), so every
+    /// routed sub-agent came out `Simple` and the router read sub-agents as cheap work.
+    #[test]
+    fn an_agent_call_is_classed_by_the_kind_of_agent_it_names() {
+        let hints = ContextHints::default();
+        let sig =
+            |kind: Option<&str>| TaskSignature::from_subagent(kind, "Find the spec", None, hints);
+        // Real kinds, as Claude Code states them (nexus `providers/native/builtin.rs`).
+        assert_eq!(sig(Some("Explore")).class, TaskClass::Simple);
+        assert_eq!(sig(Some("general-purpose")).class, TaskClass::Complex);
+        assert_eq!(sig(Some("Plan")).class, TaskClass::Creative);
+        // The kinds are read case-insensitively and trimmed.
+        assert_eq!(sig(Some("  general-purpose ")).class, TaskClass::Complex);
+        // A kind that names no class, and an `Agent` call that names none: `Simple`, never
+        // a silent promotion — the prompt's own length is all that raises it.
+        assert_eq!(sig(None).class, TaskClass::Simple);
+        assert_eq!(sig(Some("something-else")).class, TaskClass::Simple);
+        assert_eq!(sig(Some("something-else")).complexity, 2);
+        // The kinds are not all the same class: the test would prove nothing.
+        let classes: std::collections::HashSet<_> = ["Explore", "general-purpose", "Plan"]
+            .into_iter()
+            .map(|kind| sig(Some(kind)).class)
+            .collect();
+        assert_eq!(classes.len(), 3, "the kinds map to distinct classes");
+        // The prompt's length still grows the complexity, capped at the same +2.
+        let long = "x".repeat(2_400);
+        let long_sig = TaskSignature::from_subagent(Some("Explore"), &long, None, hints);
+        assert_eq!(
+            (long_sig.class, long_sig.complexity),
+            (TaskClass::Simple, 4)
+        );
+        // A sub-agent is an executor that calls tools and carries no image of its own.
+        let sub = sig(Some("Explore"));
+        assert_eq!(sub.role, Role::Executor);
+        assert!(sub.needs_tools && !sub.needs_images);
     }
 }

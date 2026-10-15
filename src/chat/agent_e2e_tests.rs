@@ -247,7 +247,6 @@ pub(super) fn request(provider: Option<&str>, project: Option<&str>, mode: &str)
         spawned_by: None,
         task_context: None,
         subagent_type: None,
-
         route_auto: false,
         scaffolding_override: None,
         runner_context: None,
@@ -1348,7 +1347,9 @@ mod cognitive_routing {
     }
 
     /// An `Agent` call of a native parent in Auto: a child of a conversation, routing in
-    /// `full` mode, with the sub-task's description and the agent kind the model named.
+    /// `full` mode, with the agent kind a model actually names. `complex` was a value no
+    /// model produces: it made the class assertion pass whatever `subagent_type` was read
+    /// as (review point 3).
     fn subagent_request() -> ChatRequest {
         let mut r = request(None, Some("proj"), "default");
         r.spawned_by = Some(
@@ -1360,7 +1361,7 @@ mod cognitive_routing {
         );
         r.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
         r.task_context = Some("refactor the parser".into());
-        r.subagent_type = Some("complex".into());
+        r.subagent_type = Some("general-purpose".into());
         r
     }
 
@@ -2012,8 +2013,8 @@ mod cognitive_routing {
             ("other", Some("o1"), RoutedBy::Auto),
             "the child opens on the router's pair, attributed to Auto"
         );
-        // The signature the manager built names the sub-task — the class the model stated
-        // (`subagent_type`), an executor — not a plain `simple` delegation.
+        // The signature the manager built names the sub-task — the class of the agent kind
+        // the model named (`subagent_type`), an executor — not a plain `simple` delegation.
         let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(seen.len(), 1, "the router was handed one signature");
         assert_eq!(
@@ -2024,6 +2025,119 @@ mod cognitive_routing {
             seen[0].role,
             crate::chat::provider::resolver::Role::Executor
         ));
+    }
+
+    /// A decider that applies nothing: the fallback path of a routed sub-agent is the one
+    /// under test (review point 1).
+    struct DeclinesPick;
+
+    #[async_trait::async_trait]
+    impl crate::chat::provider::cognitive::decision::Decider for DeclinesPick {
+        async fn decide(
+            &self,
+            request: &crate::chat::provider::cognitive::decision::DecideRequest,
+        ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+            use crate::chat::provider::cognitive::decision::CognitiveDecision;
+            Ok(CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: None,
+                score: None,
+                explored: false,
+                reason: "declines: fake".into(),
+                alternatives: Vec::new(),
+                applied: false,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            })
+        }
+    }
+
+    /// AUTO-SUB (review point 1): the router applies nothing — the child must open on the
+    /// pair of the session that spawned it, NEVER on the declared rules. The global
+    /// executor rule names `local` and the parent runs on `other`: the two differ, so only
+    /// the parent's pair can satisfy the assertion.
+    #[tokio::test]
+    async fn a_subagent_whose_router_applies_nothing_opens_on_its_parents_pair() {
+        let Setup {
+            _fake,
+            graph,
+            manager,
+        } = setup_with("full", "auto", false, true).await;
+        // The parent's instance: a second one the project consented to.
+        let mut record = instance(&_fake, "none");
+        record.id = "other".into();
+        record.label = "Other".into();
+        record.default_model = Some("o1".into());
+        store_instance(&graph, &record).await;
+        consent(&graph, "proj", "other", &_fake.origin()).await;
+        // The declared rule a child would otherwise fall through to.
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "roles",
+                &json!({"executor": {"provider": "local", "model": "m"}}).to_string(),
+            )
+            .await
+            .unwrap();
+        // A real parent session, on `other`/`o1`.
+        let mut parent_request = request(Some("other"), Some("proj"), "default");
+        parent_request.model = Some("o1".into());
+        let parent = manager
+            .create_session(&parent_request)
+            .await
+            .unwrap_or_else(|e| panic!("the parent opens: {e:#}"));
+        let parent_uuid = Uuid::parse_str(&parent.session_id).unwrap();
+        let parent_node = graph.get_chat_session(parent_uuid).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                parent_node.provider_id.as_deref(),
+                parent_node.model.as_str()
+            ),
+            (Some("other"), "o1"),
+            "the parent is on the pair the child must inherit"
+        );
+        // The `Agent` call: a child of that conversation, routed by PO, no pair of its own.
+        let mut child = request(None, Some("proj"), "default");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: parent_uuid,
+                tool_use_id: Some("toolu_fallback".into()),
+            }
+            .to_json_string(),
+        );
+        child.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        child.subagent_type = Some("Explore".into());
+        child.route_auto = true;
+        let s = Setup {
+            _fake,
+            graph,
+            manager: manager
+                .with_cognitive_routing(CognitiveRouting::with_decider(Arc::new(DeclinesPick))),
+        };
+        let c = choose(&s, &child).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("other", Some("o1")),
+            "the router applied nothing: the child opens on its parent's pair"
+        );
+        // The control: the declared rules would have opened it on `local`/`m`, so the
+        // assertion above is not just the global executor rule again.
+        let mut unrouted = child.clone();
+        unrouted.route_auto = false;
+        let c = choose(&s, &unrouted).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("local", Some("m")),
+            "without the fallback the declared executor rule opens it"
+        );
     }
 
     /// A manager whose router applies `other/o1` (consent not given), its decisions stored
@@ -2658,6 +2772,46 @@ mod auto_on_a_locked_vault {
             .unlock(PASS.into(), ChronoDuration::hours(1))
             .await
             .unwrap();
+    }
+
+    /// AUTO-SUB (review point 2): the `Agent` call of a parent that is ALREADY open still
+    /// runs on a locked vault. The refusal exists for a conversation the user put in Auto;
+    /// a routed child has a stated fallback (the pair of the session it came from), so
+    /// failing the tool call bought no safety — and it took only one vault-keyed instance
+    /// in the project to turn a working `Agent` call into an error.
+    #[tokio::test]
+    async fn a_routed_subagent_is_not_refused_on_a_locked_vault() {
+        let s = setup(Given::default()).await;
+        // What the user sends to an Auto conversation is refused, exactly as before.
+        let error = resolve(&s).await.unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+        // The parent, opened on `free` (keyed nowhere): the session that was already
+        // running when the vault locked again.
+        let parent = s
+            .manager
+            .create_session(&request(Some("free"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the parent opens: {e:#}"));
+        let mut child = request(None, Some("proj"), "default");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::parse_str(&parent.session_id).unwrap(),
+                tool_use_id: Some("toolu_vault".into()),
+            }
+            .to_json_string(),
+        );
+        child.subagent_type = Some("Explore".into());
+        child.route_auto = true;
+        let choice = s
+            .manager
+            .resolve_provider_choice(&child, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("the Agent call still opens: {e:#}"));
+        assert_eq!(
+            (choice.provider_id.as_str(), choice.model.as_deref()),
+            ("free", Some("m")),
+            "the child opens off the vault-keyed instance"
+        );
     }
 
     /// The refusal reaches the caller with the models that need no vault, and it is
@@ -13710,6 +13864,110 @@ mod native_subagents {
             "the child opens on the router's pair, not the parent's"
         );
         assert_eq!(children[0].model, "d1");
+    }
+
+    /// AUTO-SUB (review point 4): a model pinned BY HAND on an Auto parent is never moved,
+    /// so its `Agent` calls inherit like any other pinned parent's. `set_session_model` is
+    /// the manual path (the API's model change): it pins WITHOUT touching `routed_by` or
+    /// `routing_mode`, the two signals `pinned` used to read — so this parent used to be
+    /// routed even though the human had taken its model over.
+    #[tokio::test]
+    async fn a_hand_pinned_model_on_an_auto_parent_keeps_its_children() {
+        // The parent (a pilot) keeps `local`; every child (an executor) would be routed to
+        // `other` — a pair a routed child opens on and an inheriting one does not.
+        struct RoutesChildren;
+        #[async_trait::async_trait]
+        impl crate::chat::provider::cognitive::decision::Decider for RoutesChildren {
+            async fn decide(
+                &self,
+                request: &crate::chat::provider::cognitive::decision::DecideRequest,
+            ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision>
+            {
+                use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+                let pick = match request.signature.role {
+                    crate::chat::provider::resolver::Role::Pilot => Pick::new("local", "m"),
+                    crate::chat::provider::resolver::Role::Executor => Pick::new("other", "o1"),
+                };
+                Ok(CognitiveDecision {
+                    id: Uuid::new_v4(),
+                    at: Utc::now(),
+                    signature: request.signature.clone(),
+                    chosen: Some(pick),
+                    score: Some(0.9),
+                    explored: false,
+                    reason: "routes children: fake".into(),
+                    alternatives: Vec::new(),
+                    applied: true,
+                    mode: request.settings.mode,
+                    stage: request.settings.stage,
+                    session_id: request.session_id,
+                    task_id: None,
+                    run_id: None,
+                    turn_index: request.turn_index,
+                    outcome: None,
+                    used: None,
+                })
+            }
+        }
+
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let mut other = instance(&fake, "none");
+        other.id = "other".into();
+        other.label = "Other".into();
+        other.default_model = Some("o1".into());
+        store_instance(&graph, &other).await;
+        consent(&graph, "proj", "other", &fake.origin()).await;
+        let manager = Arc::new(manager(graph.clone(), true).with_cognitive_routing(
+            crate::chat::provider::cognitive::decider::CognitiveRouting::with_decider(Arc::new(
+                RoutesChildren,
+            )),
+        ));
+        manager.enable_subagents();
+        let mut req = request(None, Some("proj"), "default");
+        req.routing_mode = Some(crate::chat::provider::cognitive::ConversationRoutingMode::Full);
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        let parent_uuid = Uuid::parse_str(&parent).unwrap();
+        let pnode = graph.get_chat_session(parent_uuid).await.unwrap().unwrap();
+        assert_eq!(
+            (pnode.provider_id.as_deref(), pnode.model.as_str()),
+            (Some("local"), "m"),
+            "the parent runs on the pilot's pair"
+        );
+        assert_eq!(
+            pnode.routed_by.as_deref(),
+            Some("auto"),
+            "and it is an Auto parent"
+        );
+        // The human takes the model over, by hand (the API's model change). The pin is what
+        // matters here; the model itself is left alone.
+        let _ = manager.set_session_model(&parent, "m").await;
+        assert!(
+            manager.model_is_pinned(&parent).await,
+            "the model is pinned by hand"
+        );
+        let out = manager
+            .clone()
+            .run_subagent(
+                &parent,
+                None,
+                &SubagentRequest::new("t-pin", "hi there: the child's task"),
+            )
+            .await;
+        out.as_ref()
+            .unwrap_or_else(|e| panic!("the Agent call ran: {e}"));
+        let children = graph.get_session_children(parent_uuid).await.unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            (
+                children[0].provider_id.as_deref(),
+                children[0].model.as_str()
+            ),
+            (Some("local"), "m"),
+            "a hand-pinned parent's child inherits: it is not routed to `other`"
+        );
     }
 }
 

@@ -412,7 +412,12 @@ impl ChatManager {
             routing_pool.as_ref().map_or(0, Vec::len),
         );
         let pinned = parent.routed_by.as_deref() == Some("request")
-            || routing_pool.as_ref().is_some_and(|p| p.len() == 1);
+            || routing_pool.as_ref().is_some_and(|p| p.len() == 1)
+            // A model pinned BY HAND (`set_session_model(manual = true)` ->
+            // `pin_session_model`) is never moved, everywhere else in this host: the manual
+            // change updates neither `routed_by` nor `routing_mode`, so the two tests above
+            // miss it (review point 4). Its `Agent` calls inherit like any other pin's.
+            || self.model_is_pinned(parent_session_id).await;
         let route_child = parent_routes && !pinned && self.cognitive_routing.is_some();
         tracing::debug!(
             route_child = route_child,
