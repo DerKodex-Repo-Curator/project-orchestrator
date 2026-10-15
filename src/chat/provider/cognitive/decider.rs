@@ -13,12 +13,14 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::candidates::{self, ModelFacts, Slot};
-use super::decision::{CognitiveDecision, DecideRequest, Decider, DecisionAlternative, Pick};
+use super::decision::{
+    turn_reward, CognitiveDecision, DecideRequest, Decider, DecisionAlternative, Pick,
+};
 use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings};
 use super::scorer::{self, PriorHints, Scored};
 use super::segment_store::SegmentStore;
 use super::signature::TaskSignature;
-use super::store::{ArmStats, RoutingArmStore};
+use super::store::{ArmObservation, ArmStats, RoutingArmStore};
 use crate::chat::provider::resolver::Role;
 
 /// A challenger must beat the pair in force by this much to replace it.
@@ -26,6 +28,12 @@ pub const HYSTERESIS_MARGIN: f64 = 0.1;
 
 /// Reason of a decision that found nothing eligible.
 pub const NO_CANDIDATE: &str = "no_candidate";
+
+/// The success threshold of the turn reward. The reward is exactly `0.0` or
+/// `1.0`, so any threshold strictly inside `(0, 1)` splits them the same; this
+/// one matches the arm store's binary split (a success counts `alpha += 1`, a
+/// failure `beta += 1`, i.e. `alpha += reward`, `beta += 1 - reward`).
+const TURN_REWARD_THRESHOLD: f64 = 0.5;
 
 /// Whether a choice is used, from the mode, the stage and the role.
 ///
@@ -321,6 +329,40 @@ impl Decider for CognitiveDecider {
             &arms,
             &hints,
         ))
+    }
+
+    /// Feeds the turn's ending back to the arm that served it: a concluded
+    /// success raises its mean, a provider error lowers it, and an ambiguous
+    /// ending (interrupted, max_turns, budget, user-stopped, …) leaves the
+    /// posterior untouched. The arm is keyed exactly as at decision time
+    /// (class × provider × model); a decision without a served pair is never
+    /// fed, so the Beta(1, 1) prior of an unknown arm is not corrupted.
+    async fn observe_turn(
+        &self,
+        decision: &CognitiveDecision,
+        stop_reason: Option<&str>,
+        subtype: &str,
+        is_error: bool,
+        provider_error: bool,
+    ) -> anyhow::Result<()> {
+        let Some(reward) = turn_reward(stop_reason, subtype, is_error, provider_error) else {
+            return Ok(());
+        };
+        let Some(arm) = decision.served_arm() else {
+            return Ok(());
+        };
+        self.store
+            .observe(
+                &arm,
+                &ArmObservation {
+                    reward,
+                    success_threshold: TURN_REWARD_THRESHOLD,
+                    cost_usd: None,
+                    latency_ms: None,
+                },
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -787,6 +829,102 @@ mod tests {
         let store = Arc::new(InMemoryRoutingStore::new());
         let decider = CognitiveDecider::new(store.clone());
         (decider.decide(request).await.unwrap(), store)
+    }
+
+    /// A decision with a known chosen pair, made from an empty store: its arm is
+    /// not observed yet, which is what the reward half feeds.
+    fn routed_decision() -> CognitiveDecision {
+        let req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        decide_with(
+            Uuid::from_u128(7),
+            Utc::now(),
+            &req,
+            &[],
+            &PriorHints::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_successful_turn_raises_the_served_arms_mean() {
+        let store = Arc::new(InMemoryRoutingStore::new());
+        let decider = CognitiveDecider::new(store.clone());
+        let decision = routed_decision();
+        let arm = decision.served_arm().unwrap();
+        decider
+            .observe_turn(&decision, Some("completed"), "success", false, false)
+            .await
+            .unwrap();
+        let stats = store.arm(&arm).await.unwrap().unwrap();
+        assert_eq!((stats.alpha, stats.beta, stats.n), (2.0, 1.0, 1));
+        assert!(stats.mean() > 0.5);
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_lowers_the_served_arms_mean() {
+        let store = Arc::new(InMemoryRoutingStore::new());
+        let decider = CognitiveDecider::new(store.clone());
+        let decision = routed_decision();
+        let arm = decision.served_arm().unwrap();
+        decider
+            .observe_turn(
+                &decision,
+                Some("error"),
+                "error_during_execution",
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let stats = store.arm(&arm).await.unwrap().unwrap();
+        assert_eq!((stats.alpha, stats.beta, stats.n), (1.0, 2.0, 1));
+        assert!(stats.mean() < 0.5);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_or_max_turns_turn_leaves_the_posterior_untouched() {
+        let store = Arc::new(InMemoryRoutingStore::new());
+        let decider = CognitiveDecider::new(store.clone());
+        let decision = routed_decision();
+        let arm = decision.served_arm().unwrap();
+        for (reason, subtype) in [
+            ("interrupted", "interrupted"),
+            ("max_turns", "error_max_turns"),
+        ] {
+            decider
+                .observe_turn(&decision, Some(reason), subtype, false, false)
+                .await
+                .unwrap();
+        }
+        // An error without a provider cause is ambiguous too.
+        decider
+            .observe_turn(
+                &decision,
+                Some("error"),
+                "error_during_execution",
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.arm(&arm).await.unwrap().is_none(),
+            "an ambiguous ending must not create nor move the arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_without_a_served_pair_is_never_fed() {
+        let store = Arc::new(InMemoryRoutingStore::new());
+        let decider = CognitiveDecider::new(store.clone());
+        let mut decision = routed_decision();
+        decision.chosen = None;
+        decision.used = None;
+        decider
+            .observe_turn(&decision, Some("completed"), "success", false, false)
+            .await
+            .unwrap();
+        let class = decision.signature.arm_key();
+        assert!(store.arms_of_class(&class).await.unwrap().is_empty());
     }
 
     #[tokio::test]

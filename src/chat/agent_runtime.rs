@@ -97,6 +97,37 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     }
 }
 
+/// The failure of a turn that already showed text but no tool, and is still worth
+/// trying again mid-generation: the transient mid-stream errors only — the rate
+/// limit (429) and the upstream timeout (504). A turn its configured time limit
+/// stopped (`error_timeout`) is not a transient failure (ISO5); the other
+/// retryable classes (`Overloaded`, `EndpointUnreachable`) keep the old rule that
+/// a turn which already showed something is not replayed, since they are more
+/// likely a systemic condition than a mid-stream blip. Quota (402) is handled
+/// elsewhere and never arrives as a retryable error here.
+fn mid_generation_retryable(event: &AgentEvent) -> Option<ProviderError> {
+    match event {
+        AgentEvent::Done {
+            subtype: Some(subtype),
+            ..
+        } if subtype == "error_timeout" => None,
+        AgentEvent::Done {
+            is_error: true,
+            error: Some(error),
+            ..
+        }
+        | AgentEvent::Error { error }
+            if matches!(
+                error,
+                ProviderError::RateLimited { .. } | ProviderError::Timeout { .. }
+            ) =>
+        {
+            Some(error.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Whether an event says the provider process is gone: the turn cannot go on, and
 /// no later message can be delivered to this session (it must be resumed instead).
 fn process_exited(event: &AgentEvent) -> bool {
@@ -469,6 +500,19 @@ pub struct TurnOutcome {
     /// are spent). Not on the `done` the runtime makes itself for a Stop during the
     /// pause before a retry: no attempt of the turn was answered.
     pub answered: bool,
+    /// The terminal `result` of the turn, captured from its final `done` (the same
+    /// wire form `ChatEvent::Result` carries): its neutral stop reason, its result
+    /// subtype and whether it was an error. Empty on a turn with no terminal `done`
+    /// (stopped before it was answered), which must never read as a success.
+    pub stop_reason: Option<String>,
+    /// Result subtype: `success`, `error_during_execution`, … (see
+    /// [`ChatEvent::Result`]).
+    pub subtype: String,
+    /// Whether the turn ended in error.
+    pub is_error: bool,
+    /// The typed provider error that caused a failure, as its stable code (ERR-1);
+    /// `None` for a clean stop or an error without a typed provider cause.
+    pub error_code: Option<String>,
 }
 
 /// What the host asks of the session after a turn: events to emit, then system
@@ -1336,8 +1380,11 @@ impl AgentSessionHandle {
         // the session instead of re-failing on a closed process.
         let mut exited = false;
         loop {
-            // Did the turn already show the user anything? A turn that did is
-            // never replayed: it would repeat text or tool calls.
+            // Did the turn already show the user anything? A turn that showed
+            // nothing is retried on any retryable failure; a turn that showed
+            // text but no tool is retried on a transient mid-generation failure
+            // only (rate limit, upstream timeout). A turn that already called a
+            // tool is never replayed: the tool may have had a side effect.
             let mut shown = false;
             let mut retry: Option<ProviderError> = None;
             while let Some(event) = stream.next().await {
@@ -1351,11 +1398,16 @@ impl AgentSessionHandle {
                 if terminal || matches!(event, AgentEvent::SessionStarted { .. }) {
                     self.sync_resume_token().await;
                 }
-                if !shown {
-                    retry = retryable_failure(&event).filter(|_| attempt < max_attempts);
-                    if retry.is_some() {
-                        break;
-                    }
+                let failure = if !shown {
+                    retryable_failure(&event)
+                } else if outcome.tools.is_empty() {
+                    mid_generation_retryable(&event)
+                } else {
+                    None
+                };
+                retry = failure.filter(|_| attempt < max_attempts);
+                if retry.is_some() {
+                    break;
                 }
                 shown |= shows_content(&event);
                 outcome.hit_turn_limit |= matches!(
@@ -2958,6 +3010,59 @@ mod mask_tests {
         };
         assert!(retryable_failure(&timeout("error_timeout")).is_none());
         assert!(retryable_failure(&timeout("error_during_execution")).is_some());
+    }
+
+    /// A2/D1: mid-generation retries are narrower than pre-content retries — only the
+    /// transient 429/504, never a turn its own limit stopped or a systemic 503.
+    #[test]
+    fn only_a_rate_limit_or_timeout_is_retried_mid_generation() {
+        let done = |is_error, error| AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error,
+        };
+        let limited = ProviderError::RateLimited {
+            retry_after_ms: Some(5),
+        };
+        let timeout = ProviderError::Timeout { after_ms: 60_000 };
+        assert!(mid_generation_retryable(&done(true, Some(limited))).is_some());
+        assert!(mid_generation_retryable(&done(true, Some(timeout.clone()))).is_some());
+        assert!(mid_generation_retryable(&AgentEvent::Error { error: timeout }).is_some());
+        // The other retryable classes keep the old "already showed something" rule.
+        assert!(mid_generation_retryable(&done(true, Some(ProviderError::Overloaded))).is_none());
+        assert!(mid_generation_retryable(&done(
+            true,
+            Some(ProviderError::EndpointUnreachable { detail: "d".into() })
+        ))
+        .is_none());
+        // Non-retryable failures are not retried, and a clean done neither.
+        assert!(mid_generation_retryable(&done(true, Some(ProviderError::Unauthorized))).is_none());
+        assert!(mid_generation_retryable(&done(false, None)).is_none());
+        assert!(mid_generation_retryable(&done(true, None)).is_none());
+        // A turn its configured time limit stopped is not run again (ISO5).
+        let limit_stopped = {
+            let mut event = done(
+                true,
+                Some(ProviderError::Timeout {
+                    after_ms: 1_800_000,
+                }),
+            );
+            if let AgentEvent::Done { subtype: s, .. } = &mut event {
+                *s = Some("error_timeout".to_string());
+            }
+            event
+        };
+        assert!(mid_generation_retryable(&limit_stopped).is_none());
     }
 }
 
@@ -4726,6 +4831,173 @@ mod answered_tests {
         }
         assert_eq!(provider.state.turns_started.lock().unwrap().len(), 1);
         assert_eq!(host.seen(), [false]);
+    }
+
+    fn text(content: &str) -> AgentEvent {
+        AgentEvent::Text {
+            text: content.to_string(),
+            seq: None,
+            parent: None,
+        }
+    }
+
+    /// Drives one run whose attempts each yield the next of `turns` (a turn = the
+    /// events its stream yields, in order), then returns every event the client saw.
+    async fn play_events(
+        provider: &FakeProvider,
+        handle: &Arc<AgentSessionHandle>,
+        turns: Vec<Vec<AgentEvent>>,
+    ) -> Vec<ChatEvent> {
+        let mut rx = handle.events_tx.subscribe();
+        let mut answered = provider.state.turns_started.lock().unwrap().len();
+        handle.send_message("go").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for turn in turns {
+            while provider.state.turns_started.lock().unwrap().len() == answered {
+                assert!(Instant::now() < deadline, "an attempt never started");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            answered = provider.state.turns_started.lock().unwrap().len();
+            for event in turn {
+                provider.state.push(event);
+            }
+        }
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the run never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The final `streaming_status { false }` is broadcast right after the flag
+        // flips; a short settle lets it and any tail land in the receiver.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(event);
+        }
+        seen
+    }
+
+    /// A2/D1: partial text then a transient 429 is retried — the prefix stays and
+    /// the assistant content resumes on the same turn, which answers once.
+    #[tokio::test]
+    async fn partial_text_then_a_rate_limit_is_retried_and_resumes() {
+        let (provider, handle, host) = session(1).await;
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![
+                vec![
+                    text("Hel"),
+                    text("lo"),
+                    done(
+                        true,
+                        Some(ProviderError::RateLimited {
+                            retry_after_ms: Some(5),
+                        }),
+                    ),
+                ],
+                vec![text(" world"), done(false, None)],
+            ],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            2,
+            "the turn and its retry"
+        );
+        assert_eq!(host.seen(), [true], "one turn, answered once");
+        let assistant: String = seen
+            .into_iter()
+            .filter_map(|event| match event {
+                ChatEvent::AssistantText { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistant, "Hello world",
+            "the prefix stays and the turn resumes"
+        );
+    }
+
+    /// A2/D1: partial text then a non-retryable failure keeps the old behaviour —
+    /// the turn ends in error and is not replayed.
+    #[tokio::test]
+    async fn partial_text_then_a_non_retryable_error_still_ends() {
+        let (provider, handle, host) = session(2).await;
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![vec![
+                text("Hel"),
+                done(true, Some(ProviderError::Unauthorized)),
+            ]],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "no retry for a failure that is not transient"
+        );
+        assert_eq!(
+            host.seen(),
+            [false],
+            "a failed-for-good turn is not answered"
+        );
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, ChatEvent::Result { is_error: true, .. })),
+            "the failure is said on the wire"
+        );
+    }
+
+    /// A2/D1: a turn that already ran a tool is never replayed, whatever the error —
+    /// the tool may have had a side effect.
+    #[tokio::test]
+    async fn a_turn_that_already_ran_a_tool_is_not_retried() {
+        let (provider, handle, host) = session(2).await;
+        let tool_call = AgentEvent::ToolCall {
+            id: "t1".to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({ "command": "ls" }),
+            category: Default::default(),
+            canonical: None,
+            input_complete: true,
+            seq: None,
+            parent: None,
+        };
+        let tool_result = AgentEvent::ToolResult {
+            id: "t1".to_string(),
+            output: None,
+            is_error: false,
+            seq: None,
+            parent: None,
+        };
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![vec![
+                text("Hel"),
+                tool_call,
+                tool_result,
+                done(
+                    true,
+                    Some(ProviderError::RateLimited {
+                        retry_after_ms: Some(5),
+                    }),
+                ),
+            ]],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "no replay after a side-effecting tool"
+        );
+        assert_eq!(host.seen(), [false]);
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, ChatEvent::Result { is_error: true, .. })),
+            "the failure is said on the wire"
+        );
     }
 }
 

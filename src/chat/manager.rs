@@ -3782,6 +3782,112 @@ impl ChatManager {
         }
     }
 
+    /// A terminal provider failure — the chosen provider's retries exhausted, an
+    /// out-of-credit refusal (402), or a non-retryable send error — must not end the
+    /// chat. The conversation falls back to the NEXT eligible provider of its routing
+    /// pool and resumes there, exactly as an explicit provider move
+    /// ([`Self::move_provider_before_turn`]) would, through the same relay.
+    ///
+    /// The failed instance is first marked out of credit, so the next decision (and
+    /// any later fallback) does not pick it again. Returns `true` when the conversation
+    /// moved; `false` keeps the current error-ending behaviour (no eligible provider,
+    /// or a relay the target refused). A fallback is attempted at most once per turn by
+    /// the caller: it is a single relay, and a session already moved this turn is no
+    /// longer live (the relay closed it), so it cannot be moved twice.
+    pub(crate) async fn fallback_provider_after_failure(
+        &self,
+        session_id: &str,
+        failed_provider: &str,
+        message: &str,
+    ) -> bool {
+        if let Some(routing) = self.cognitive_routing.as_ref() {
+            routing.mark_out_of_credit(failed_provider, std::time::Instant::now());
+        }
+        let Some(pick) = self.next_fallback_pick(session_id, failed_provider).await else {
+            return false;
+        };
+        match self
+            .relay_conversation(
+                session_id,
+                &pick.provider_id,
+                Some(&pick.model),
+                message,
+                None,
+                super::relay::MOVED_BY_AUTO,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    from_session = session_id,
+                    to_provider = %pick.provider_id,
+                    model = %pick.model,
+                    failed = %failed_provider,
+                    "the failed provider was abandoned: the conversation fell back to another provider"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    session_id,
+                    failed = %failed_provider,
+                    to_provider = %pick.provider_id,
+                    error = %error,
+                    "the fallback provider move was refused: the conversation keeps its error"
+                );
+                false
+            }
+        }
+    }
+
+    /// The next provider the conversation may fall back to after `failed_provider`
+    /// failed terminally. An explicit routing pool wins and is the ONLY place it may
+    /// fall back to (never the project pool); a `primary`/pinned conversation is never
+    /// moved at all. Only a conversation with no explicit pin consults the project
+    /// pool (the consented models of every instance). Out-of-credit instances are
+    /// excluded wherever the pick is made.
+    async fn next_fallback_pick(
+        &self,
+        session_id: &str,
+        failed_provider: &str,
+    ) -> Option<super::provider::cognitive::decision::Pick> {
+        use super::provider::cognitive::decision::Pick;
+        let uuid = Uuid::parse_str(session_id).ok()?;
+        let node = self.graph.get_chat_session(uuid).await.ok().flatten()?;
+        let now = std::time::Instant::now();
+        let out_of_credit = |provider: &str| {
+            self.cognitive_routing
+                .as_ref()
+                .is_some_and(|routing| routing.out_of_credit(provider, now))
+        };
+        // An explicit routing pool: fall back within it only, in the user's order. A
+        // pool of one (a pin) offers nothing, and it never falls through to the
+        // project pool.
+        if let Some(pool) = node
+            .routing_pool
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<super::types::RoutingPoolEntry>>(json).ok())
+        {
+            return pool
+                .into_iter()
+                .find(|entry| entry.provider != failed_provider && !out_of_credit(&entry.provider))
+                .map(|entry| Pick::new(entry.provider, entry.model));
+        }
+        // A `primary` conversation ("never substituted"), a provider the request
+        // imposed (`routed_by: request`), or a model pinned by hand: never moved.
+        if node.routing_mode.as_deref() == Some("primary")
+            || node.routed_by.as_deref() == Some("request")
+            || self.model_is_pinned(session_id).await
+        {
+            return None;
+        }
+        let pool = self.routing_pool_known(node.project_slug.as_deref()).await;
+        let next = pool.into_iter().find(|facts| {
+            facts.provider_id != failed_provider && !out_of_credit(&facts.provider_id)
+        })?;
+        Some(Pick::new(next.provider_id, next.model))
+    }
+
     /// The decision of a model change that could not be sent says so: not applied, and why.
     async fn record_refused_change(
         &self,
@@ -9574,7 +9680,33 @@ impl ChatManager {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             // The turn router learns the text when the turn is prepared
             // (`ManagerTurnServices::prepare`): a queued message must not overwrite it.
-            return handle.send_message(message).await;
+            let provider_id = handle.provider_id.clone();
+            match handle.send_message(message).await {
+                Ok(()) => return Ok(()),
+                // A terminal provider failure (out of credit, a non-retryable send
+                // error) must not end the chat: fall back to the next eligible provider
+                // and resume there. Without one, the error is surfaced unchanged (ERR-1).
+                Err(error)
+                    if error
+                        .chain()
+                        .find_map(|cause| {
+                            cause.downcast_ref::<nexus_claude::agent::ProviderError>()
+                        })
+                        .is_some_and(|err| {
+                            super::provider::cognitive::decider::is_out_of_credit(err)
+                                || !err.retryable()
+                        }) =>
+                {
+                    if self
+                        .fallback_provider_after_failure(session_id, &provider_id, message)
+                        .await
+                    {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
         // Check is_streaming with read lock first — if streaming, queue the message
         // AND trigger an interrupt so the stream breaks and processes it sooner (T4 fix, Gap 8).
@@ -24484,6 +24616,126 @@ mod tests {
             .push(done_event(true, Some(ProviderError::Unauthorized)));
         let result = next_matching(&mut rx2, |e| matches!(e, ChatEvent::Result { .. })).await;
         assert!(matches!(result, ChatEvent::Result { is_error: true, .. }));
+    }
+
+    /// The fallback reads the conversation's routing pool in order, skips the failed
+    /// instance, and finds nothing when the pool holds only the failed provider.
+    #[tokio::test]
+    async fn the_fallback_picks_the_next_pool_provider_and_none_when_it_is_alone() {
+        use crate::chat::types::RoutingPoolEntry;
+        let (manager, graph) = manager_with_mock();
+        let pool = vec![
+            RoutingPoolEntry {
+                provider: "a".into(),
+                model: "m1".into(),
+            },
+            RoutingPoolEntry {
+                provider: "b".into(),
+                model: "m2".into(),
+            },
+        ];
+        let mut session = test_chat_session(None);
+        session.provider_id = Some("a".into());
+        session.routing_pool = Some(serde_json::to_string(&pool).unwrap());
+        graph.create_chat_session(&session).await.unwrap();
+        let pick = manager
+            .next_fallback_pick(&session.id.to_string(), "a")
+            .await
+            .expect("a fallback among the pool");
+        assert_eq!(pick.provider_id, "b");
+        assert_eq!(pick.model, "m2");
+
+        // A pool with only the failed provider offers no fallback.
+        let mut alone = test_chat_session(None);
+        alone.provider_id = Some("a".into());
+        alone.routing_pool = Some(
+            serde_json::to_string(&vec![RoutingPoolEntry {
+                provider: "a".into(),
+                model: "m1".into(),
+            }])
+            .unwrap(),
+        );
+        graph.create_chat_session(&alone).await.unwrap();
+        assert!(manager
+            .next_fallback_pick(&alone.id.to_string(), "a")
+            .await
+            .is_none());
+    }
+
+    /// A provider whose send fails terminally with no other provider to fall back to
+    /// keeps the error: the turn is not replayed, no session is opened by a fallback.
+    #[tokio::test]
+    async fn a_terminal_send_failure_without_another_provider_keeps_the_error() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+        let (manager, graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        // Finish the opening turn so the session is idle for the next message.
+        fake.state.push(AgentEvent::Text {
+            text: "ok".into(),
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(done_event(false, None));
+        let _ = next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+        // A non-retryable send failure on the only provider must not loop: the error
+        // is surfaced and no fallback session is opened.
+        *fake.state.fail_next_turn.lock().unwrap() = Some(ProviderError::Unauthorized);
+        let err = manager.send_message(&sid, "again").await.unwrap_err();
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<ProviderError>(),
+                Some(ProviderError::Unauthorized)
+            )),
+            "the original failure is surfaced: {err}"
+        );
+        assert_eq!(
+            fake.state.turns_started.lock().unwrap().as_slice(),
+            ["go"],
+            "the failed turn never started (no replay)"
+        );
+        assert_eq!(
+            graph.chat_sessions.read().await.len(),
+            1,
+            "no fallback session opened"
+        );
+    }
+
+    /// The failed provider is abandoned (marked out of credit) even when the pool
+    /// holds no other provider: the fallback then returns `false`, never loops.
+    #[tokio::test]
+    async fn a_failed_provider_is_abandoned_even_when_no_fallback_is_eligible() {
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, test_config())
+            .with_cognitive_routing(CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new())));
+        // A session on the only provider, without a routing pool: no fallback target.
+        let mut session = test_chat_session(None);
+        session.provider_id = Some("a".into());
+        graph.create_chat_session(&session).await.unwrap();
+
+        let moved = manager
+            .fallback_provider_after_failure(&session.id.to_string(), "a", "go")
+            .await;
+        assert!(!moved, "no other provider to fall back to");
+        let routing = manager.cognitive_routing.as_ref().unwrap();
+        assert!(
+            routing.out_of_credit("a", std::time::Instant::now()),
+            "the failed provider is abandoned (out of credit)"
+        );
+        assert_eq!(
+            graph.chat_sessions.read().await.len(),
+            1,
+            "no fallback opened"
+        );
     }
 
     /// M2: the engine is frozen at opening. A Claude Code session opened on the agent

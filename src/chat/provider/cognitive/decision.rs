@@ -115,6 +115,61 @@ impl CognitiveDecision {
             super::store::ArmKey::new(self.signature.arm_key(), &pick.provider_id, &pick.model)
         })
     }
+
+    /// The arm key of the pair that actually served the turn, `None` when
+    /// neither the served nor the chosen pair is known. Differs from
+    /// [`Self::arm`] only when the declarative choice was kept but the work ran
+    /// elsewhere (`used`); equals it when the decision was applied. A decision
+    /// that was NOT applied ran on the session's current provider, not on
+    /// `chosen`, so it never attributes a reward to `chosen` (only `used` may
+    /// name the pair that really served it).
+    pub fn served_arm(&self) -> Option<super::store::ArmKey> {
+        let pick = match &self.used {
+            Some(used) => used,
+            None if self.applied => self.chosen.as_ref()?,
+            None => return None,
+        };
+        Some(super::store::ArmKey::new(
+            self.signature.arm_key(),
+            &pick.provider_id,
+            &pick.model,
+        ))
+    }
+}
+
+/// The reward a routed turn earns for the arm that served it, from how the
+/// turn ended; `None` when the ending is ambiguous and must not move the
+/// posterior.
+///
+/// `stop_reason` is the neutral stop reason (`completed`, `max_turns`,
+/// `max_tokens`, `interrupted`, `refusal`, `budget_exceeded`, `error`),
+/// `subtype` the provider's result subtype (`success`,
+/// `error_during_execution`, …), `is_error` whether the turn reported an
+/// error, and `provider_error` whether a typed provider error was the cause
+/// (the turn's `error_code`, surfaced by ERR-1).
+///
+/// * a concluded success (`stop_reason == "completed"`; `subtype == "success"`
+///   only when no stop reason is known) earns `1.0`;
+/// * a provider error (`is_error` with a provider cause) earns `0.0`;
+/// * every other ending — interrupted, max_turns, max_tokens, budget,
+///   user-stopped, refusal, an error without a provider cause — is `None`, so
+///   the bandit learns which arm is right for the job, not which arm merely
+///   did not error.
+pub fn turn_reward(
+    stop_reason: Option<&str>,
+    subtype: &str,
+    is_error: bool,
+    provider_error: bool,
+) -> Option<f64> {
+    if is_error {
+        return provider_error.then_some(0.0);
+    }
+    let success = match stop_reason {
+        Some("completed") => true,
+        Some(_) => false,
+        None => subtype == "success",
+    };
+    success.then_some(1.0)
 }
 
 /// A request to decide.
@@ -207,5 +262,125 @@ pub trait Decider: Send + Sync {
     /// no session will ever close. The default decides (a test fake has no store).
     async fn preview(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
         self.decide(request).await
+    }
+
+    /// Feeds the outcome of the turn a decision routed back to the arm that
+    /// served it: `1.0` for a concluded success, `0.0` for a provider error,
+    /// nothing for an ambiguous ending (interrupted, max_turns, budget, …).
+    /// See [`turn_reward`]. The default is a no-op — a fake decider has no arm
+    /// store to learn in; only a decider with a store overrides it.
+    async fn observe_turn(
+        &self,
+        _decision: &CognitiveDecision,
+        _stop_reason: Option<&str>,
+        _subtype: &str,
+        _is_error: bool,
+        _provider_error: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::provider::cognitive::signature::TaskClass;
+    use crate::chat::provider::cognitive::store::ArmKey;
+
+    fn decision() -> CognitiveDecision {
+        CognitiveDecision {
+            id: uuid::Uuid::new_v4(),
+            at: chrono::Utc::now(),
+            signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
+            chosen: Some(Pick::new("deepseek", "v4")),
+            score: None,
+            explored: false,
+            reason: "test".into(),
+            alternatives: vec![],
+            applied: true,
+            mode: ProviderRoutingMode::Full,
+            stage: LearningStage::Auto,
+            session_id: None,
+            task_id: None,
+            run_id: None,
+            turn_index: None,
+            outcome: None,
+            used: None,
+        }
+    }
+
+    #[test]
+    fn a_completed_turn_is_a_full_reward() {
+        assert_eq!(
+            turn_reward(Some("completed"), "success", false, false),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_success_subtype_without_a_stop_reason_is_a_full_reward() {
+        assert_eq!(turn_reward(None, "success", false, false), Some(1.0));
+    }
+
+    #[test]
+    fn a_provider_error_is_a_full_penalty() {
+        assert_eq!(
+            turn_reward(Some("error"), "error_during_execution", true, true),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn an_error_without_a_provider_cause_is_ambiguous() {
+        assert_eq!(
+            turn_reward(Some("error"), "error_during_execution", true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn ambiguous_endings_never_feed_the_posterior() {
+        for reason in [
+            "interrupted",
+            "max_turns",
+            "budget_exceeded",
+            "refusal",
+            "max_tokens",
+        ] {
+            assert_eq!(
+                turn_reward(Some(reason), "success", false, false),
+                None,
+                "{reason} must not read as a success"
+            );
+        }
+    }
+
+    #[test]
+    fn a_max_tokens_turn_is_not_a_success_even_when_the_subtype_defaults_to_success() {
+        // `default_subtype` maps an unknown non-error stop reason to "success";
+        // the neutral stop reason still says the turn did not complete.
+        assert_eq!(
+            turn_reward(Some("max_tokens"), "success", false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn served_arm_prefers_used_and_falls_back_to_chosen() {
+        let mut d = decision();
+        assert_eq!(d.served_arm(), d.arm(), "applied: served == chosen");
+        d.used = Some(Pick::new("glm", "big"));
+        assert_eq!(
+            d.served_arm(),
+            Some(ArmKey::new("utility.compaction", "glm", "big"))
+        );
+        // A decision that was NOT applied ran on the session's current provider,
+        // not on `chosen`: without a `used`, it names no arm.
+        d.used = None;
+        d.applied = false;
+        assert_eq!(d.served_arm(), None, "not applied: never `chosen`");
+        // Without a served nor a chosen pair there is no arm to feed.
+        d.chosen = None;
+        assert_eq!(d.served_arm(), None);
     }
 }
