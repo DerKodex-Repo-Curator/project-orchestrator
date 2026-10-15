@@ -1185,8 +1185,7 @@ async fn after_a_provider_move_the_next_turn_of_another_class_changes_model_not_
         .unwrap();
     let moved_at = std::time::Instant::now();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await
-    else {
+    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await else {
         unreachable!()
     };
     assert_eq!(
@@ -1286,8 +1285,7 @@ async fn after_a_provider_move_the_next_turn_of_the_same_class_is_steady() {
         .await
         .unwrap();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await
-    else {
+    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await else {
         unreachable!()
     };
     assert_eq!(

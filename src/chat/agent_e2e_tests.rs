@@ -4409,9 +4409,7 @@ mod provider_switch {
         stored_until(&w, &cc1, |events| {
             events
                 .iter()
-                .filter(|ev| {
-                    ev.event_type == "assistant_text" && ev.data.contains(CLAUDE_ANSWER)
-                })
+                .filter(|ev| ev.event_type == "assistant_text" && ev.data.contains(CLAUDE_ANSWER))
                 .count()
                 >= 2
         })

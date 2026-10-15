@@ -11027,14 +11027,18 @@ impl ChatManager {
                 .as_deref()
                 .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok())
                 .or_else(|| {
-                    node.routing_pool.is_some().then_some(
-                        super::provider::cognitive::ConversationRoutingMode::Full,
-                    )
+                    node.routing_pool
+                        .is_some()
+                        .then_some(super::provider::cognitive::ConversationRoutingMode::Full)
                 })
         } else {
             None
         };
-        let carried_pool = if by_router { node.routing_pool.clone() } else { None };
+        let carried_pool = if by_router {
+            node.routing_pool.clone()
+        } else {
+            None
+        };
 
         // Pre-flight: the consent/gate/journal check runs BEFORE the old process is closed,
         // so a refused move never tears it down (the old session stays exactly as it was:
@@ -16931,10 +16935,7 @@ impl ChatManager {
             // The stored thread keeps showing `message` alone; the model sees the relay in
             // front of it (never stored).
             handle
-                .send_message_relayed(
-                    message,
-                    &super::relay::prefixed(relay.text(), message),
-                )
+                .send_message_relayed(message, &super::relay::prefixed(relay.text(), message))
                 .await
         } else {
             handle.send_message(message).await
