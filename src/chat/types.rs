@@ -1107,6 +1107,30 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
     },
+    /// The session's provider was re-targeted **in place** (same thread): the provider
+    /// and model changed, the `session_id` did not. The frontend renders a
+    /// "provider switched" notice on the SAME thread — the opposite of
+    /// [`ChatEvent::ConversationRelayed`], which told the client to follow a new
+    /// session. Emitted when a move leaves `from_session_id == to_session_id`.
+    ProviderSwitched {
+        /// The session the switch happened on (unchanged by the move).
+        session_id: String,
+        /// Provider instance it left.
+        from_provider: String,
+        /// Provider instance it reached.
+        to_provider: String,
+        /// The model on the new provider.
+        model: String,
+        /// Earlier entries (messages, answers, one per tool call) carried over by the
+        /// in-place relay, when the switch replayed the conversation. `None` = nothing
+        /// to carry (or the count is not stated).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relayed_entries: Option<u64>,
+        /// Oldest entries left out to fit the target's context window, when the relay
+        /// was bounded; the omission is stated to the model, never silent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        omitted_entries: Option<u64>,
+    },
 }
 
 impl ChatEvent {
@@ -1149,6 +1173,7 @@ impl ChatEvent {
             ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
             ChatEvent::SessionClosed { .. } => "session_closed",
             ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
+            ChatEvent::ProviderSwitched { .. } => "provider_switched",
         }
     }
 
@@ -1334,7 +1359,8 @@ impl ChatEvent {
             | ChatEvent::ActiveTasksUpdate { .. }
             | ChatEvent::SecretRequest { .. }
             | ChatEvent::SecretRequestResolved { .. }
-            | ChatEvent::SessionClosed { .. } => None,
+            | ChatEvent::SessionClosed { .. }
+            | ChatEvent::ProviderSwitched { .. } => None,
         }
     }
 }
@@ -1663,15 +1689,21 @@ impl SwitchProviderError {
     }
 }
 
-/// Result of moving a conversation to another provider (B-SW).
+/// Result of moving a conversation to another provider (B-SW). The move is now
+/// **in place**: the provider is re-targeted on the SAME session, so `session_id`
+/// is the id the caller already had — there is no new thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwitchProviderResponse {
-    /// The new session, on the target provider.
+    /// The session the conversation is on — unchanged by the switch (the same
+    /// thread keeps running, on the target provider).
     pub session_id: String,
     pub stream_url: String,
-    /// The session the conversation moved from (now closed).
+    /// Kept for wire compatibility: the switch re-targets the provider in place,
+    /// so this always equals `session_id` (there is no distinct previous session).
+    /// Deprecated — clients should treat `session_id` as the sole thread id.
     pub previous_session_id: String,
-    /// Earlier entries carried to the new session.
+    /// Earlier entries carried over (replayed to the new provider process only;
+    /// the stored thread is continuous).
     pub relayed_entries: usize,
     /// Older entries left out to fit the target's context window (stated to the model).
     pub omitted_entries: usize,
@@ -2564,6 +2596,52 @@ mod tests {
             // Verify the type tag roundtrips correctly
             assert_eq!(event.event_type(), deserialized.event_type());
         }
+    }
+
+    /// An in-place provider switch is stated on the SAME thread with a dedicated
+    /// event (`provider_switched`), not as a `conversation_relayed` to a new session.
+    /// The wire tag and every field round-trip unchanged.
+    #[test]
+    fn a_provider_switched_event_serializes_for_the_thread() {
+        let event = ChatEvent::ProviderSwitched {
+            session_id: "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b".into(),
+            from_provider: "claude-code".into(),
+            to_provider: "local".into(),
+            model: "example-model-large".into(),
+            relayed_entries: Some(12),
+            omitted_entries: Some(3),
+        };
+        assert_eq!(event.event_type(), "provider_switched");
+
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "provider_switched");
+        assert_eq!(wire["session_id"], "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b");
+        assert_eq!(wire["from_provider"], "claude-code");
+        assert_eq!(wire["to_provider"], "local");
+        assert_eq!(wire["model"], "example-model-large");
+        assert_eq!(wire["relayed_entries"], 12);
+        assert_eq!(wire["omitted_entries"], 3);
+
+        let back: ChatEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back.event_type(), "provider_switched");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            wire,
+            "round-trips unchanged"
+        );
+
+        // With nothing to state the two optional counts stay off the wire.
+        let bare = ChatEvent::ProviderSwitched {
+            session_id: "s".into(),
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            model: "m".into(),
+            relayed_entries: None,
+            omitted_entries: None,
+        };
+        let bare_wire = serde_json::to_value(&bare).unwrap();
+        assert!(bare_wire.get("relayed_entries").is_none());
+        assert!(bare_wire.get("omitted_entries").is_none());
     }
 
     #[test]

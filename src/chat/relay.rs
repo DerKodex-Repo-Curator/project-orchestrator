@@ -12,6 +12,7 @@
 //! the budget is exceeded the OLDEST turns are dropped and the omission is stated in
 //! the relay itself. A relay never truncates in silence.
 
+use super::provider::cognitive::segment::SegmentsSnapshot;
 use super::types::ChatEvent;
 
 /// Longest tool result kept, in characters.
@@ -234,6 +235,17 @@ pub struct RelayedFrom {
     pub moved_by: String,
     /// The memory conversation of the session it leaves, which the new session keeps.
     pub conversation_id: Option<String>,
+    /// The conversation's segmentation (its segments and boundaries) carried across the
+    /// move, so the new router continues segmenting where the old one stopped instead of
+    /// resetting to an empty history. `None` = nothing to resume (a fresh conversation).
+    pub segments: Option<SegmentsSnapshot>,
+    /// The SEGMENTER's next turn id (the conversation's `last_turn + 1`), carried so the
+    /// reopened router continues segmenting where the old one stopped. It is NOT the R-S3
+    /// seed: the relayed turn of a moved-in router keys on the provider's own 0-based turn.
+    /// Keeping the segmenter's turn strictly increasing after the move — under an unchanged
+    /// session id (and thus segment seed) — keeps every segment id byte-identical, so the
+    /// store's `PRECEDES` links stay valid (no re-base, no orphaning).
+    pub next_turn: u32,
 }
 
 impl RelayedFrom {
@@ -243,16 +255,32 @@ impl RelayedFrom {
     }
 
     /// The event stating the relay, for the thread of either session.
-    pub fn event(&self, to_session_id: &str, to_provider: &str) -> ChatEvent {
-        ChatEvent::ConversationRelayed {
-            from_session_id: self.from_session_id.clone(),
-            to_session_id: to_session_id.to_string(),
-            from_provider: self.from_provider.clone(),
-            to_provider: to_provider.to_string(),
-            relayed_entries: self.relay.included,
-            omitted_entries: self.relay.omitted,
-            moved_by: self.moved_by.clone(),
-            conversation_id: self.conversation_id.clone(),
+    ///
+    /// An in-place switch (`from_session_id == to_session_id`, the SAME thread) is stated
+    /// with [`ChatEvent::ProviderSwitched`], which carries the relay counts so a bounded
+    /// relay never truncates in silence. A move to a NEW session keeps the legacy
+    /// [`ChatEvent::ConversationRelayed`], which tells the client to follow `to_session_id`.
+    pub fn event(&self, to_session_id: &str, to_provider: &str, model: &str) -> ChatEvent {
+        if self.from_session_id == to_session_id {
+            ChatEvent::ProviderSwitched {
+                session_id: to_session_id.to_string(),
+                from_provider: self.from_provider.clone(),
+                to_provider: to_provider.to_string(),
+                model: model.to_string(),
+                relayed_entries: Some(self.relay.included as u64),
+                omitted_entries: Some(self.relay.omitted as u64),
+            }
+        } else {
+            ChatEvent::ConversationRelayed {
+                from_session_id: self.from_session_id.clone(),
+                to_session_id: to_session_id.to_string(),
+                from_provider: self.from_provider.clone(),
+                to_provider: to_provider.to_string(),
+                relayed_entries: self.relay.included,
+                omitted_entries: self.relay.omitted,
+                moved_by: self.moved_by.clone(),
+                conversation_id: self.conversation_id.clone(),
+            }
         }
     }
 }
@@ -480,5 +508,54 @@ mod tests {
         assert!(
             first.find("</conversation_relay>").unwrap() < first.find("next question").unwrap()
         );
+    }
+
+    /// Slice B: a [`RelayedFrom`] carries the segmenter state (segments + boundaries) and the
+    /// router's turn counter, so a provider move re-seeds the new router instead of resetting
+    /// the conversation's segmentation. The snapshot and the counter round-trip (clone/eq)
+    /// losslessly inside the already-`Clone+PartialEq+Eq` struct.
+    #[test]
+    fn a_relay_carries_the_segment_snapshot_and_turn_counter() {
+        use super::super::provider::cognitive::segment::{
+            Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter,
+        };
+
+        // One harness switch: a single boundary and two segments.
+        let observation = |turn: u32, provider: &str| Observation {
+            turn,
+            prints: [(Dimension::Harness, Fingerprint::new([provider]))]
+                .into_iter()
+                .collect(),
+        };
+        let segmenter = Segmenter::replay(
+            SegmentPolicy::default(),
+            7,
+            &[observation(0, "deepseek"), observation(1, "claude-code")],
+        )
+        .unwrap();
+        let snapshot = SegmentsSnapshot {
+            segments: segmenter.segments(),
+            boundaries: segmenter.boundaries().to_vec(),
+        };
+        assert!(!snapshot.is_empty());
+
+        let relayed = RelayedFrom {
+            relay: Relay {
+                text: String::new(),
+                included: 0,
+                omitted: 0,
+            },
+            from_session_id: "session".into(),
+            from_provider: "deepseek".into(),
+            moved_by: MOVED_BY_AUTO.into(),
+            conversation_id: None,
+            segments: Some(snapshot.clone()),
+            next_turn: 2,
+        };
+
+        // The snapshot and the turn counter travel with the relay, byte for byte.
+        assert_eq!(relayed.segments.as_ref(), Some(&snapshot));
+        assert_eq!(relayed.next_turn, 2);
+        assert_eq!(relayed.clone(), relayed);
     }
 }

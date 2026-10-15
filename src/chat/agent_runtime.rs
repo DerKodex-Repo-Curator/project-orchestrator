@@ -2360,6 +2360,16 @@ impl AgentRuntime {
     /// Closes a session: tells the provider, announces `session_closed` (A45),
     /// forgets it.
     pub async fn close(&self, session_id: &str) -> Result<()> {
+        self.close_inner(session_id, true).await
+    }
+
+    /// [`Self::close`] without announcing `session_closed`: an in-place provider switch, whose
+    /// same thread must see only `provider_switched`, never `session_closed`.
+    pub async fn close_for_switch(&self, session_id: &str) -> Result<()> {
+        self.close_inner(session_id, false).await
+    }
+
+    async fn close_inner(&self, session_id: &str, announce: bool) -> Result<()> {
         let handle = self
             .sessions
             .write()
@@ -2370,12 +2380,14 @@ impl AgentRuntime {
         // Last chance for a token the provider named outside any turn end.
         handle.sync_resume_token().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.session.close()).await;
-        handle
-            .emit(ChatEvent::SessionClosed {
-                session_id: session_id.to_string(),
-                reason: Some("closed".to_string()),
-            })
-            .await;
+        if announce {
+            handle
+                .emit(ChatEvent::SessionClosed {
+                    session_id: session_id.to_string(),
+                    reason: Some("closed".to_string()),
+                })
+                .await;
+        }
         Ok(())
     }
 }

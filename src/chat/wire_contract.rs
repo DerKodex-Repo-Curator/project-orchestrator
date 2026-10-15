@@ -46,7 +46,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 36] = [
+const EXPECTED_SERVER_TAGS: [&str; 37] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -63,6 +63,7 @@ const EXPECTED_SERVER_TAGS: [&str; 36] = [
     "permission_decision",
     "permission_mode_changed",
     "permission_request",
+    "provider_switched",
     "refs_resolved",
     "result",
     "retrying",
@@ -145,6 +146,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
         ChatEvent::SessionClosed { .. } => "session_closed",
         ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
+        ChatEvent::ProviderSwitched { .. } => "provider_switched",
     }
 }
 
@@ -711,6 +713,24 @@ fn server_examples() -> Vec<ServerExample> {
                 omitted_entries: 0,
                 moved_by: s("user"),
                 conversation_id: None,
+            },
+        ),
+        ServerExample::new(
+            ChatEvent::ProviderSwitched {
+                session_id: s(SESSION_ID),
+                from_provider: s("claude-code"),
+                to_provider: s("local"),
+                model: s("example-model-large"),
+                relayed_entries: Some(12),
+                omitted_entries: Some(3),
+            },
+            ChatEvent::ProviderSwitched {
+                session_id: s(SESSION_ID),
+                from_provider: s("claude-code"),
+                to_provider: s("local"),
+                model: s("example-model-large"),
+                relayed_entries: None,
+                omitted_entries: None,
             },
         ),
     ]

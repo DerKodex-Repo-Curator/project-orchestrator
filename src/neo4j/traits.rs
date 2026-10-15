@@ -2113,6 +2113,30 @@ pub trait GraphStore: Send + Sync {
         routed_by: Option<&str>,
     ) -> Result<bool>;
 
+    /// Re-target a chat session IN PLACE to another provider (B-SW phase 1): set
+    /// `provider_id`, `model` and `routed_by`, and clear the provider-specific fields
+    /// that do not survive a move across provider families (`resume_token`,
+    /// `capabilities`, `cli_session_id`, `engine`). `false` when the session does not
+    /// exist.
+    async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+    ) -> Result<bool>;
+
+    /// Restore the provider fields of a chat session after a FAILED in-place re-target:
+    /// `provider_id` is `provider_id` (the resolved id it was on), while `model`, `routed_by`
+    /// and the provider-specific state [`Self::update_chat_session_provider`] cleared
+    /// (`resume_token`, `capabilities`, `cli_session_id`, `engine`) come back from `node`
+    /// (the session as it was before the re-target). `false` when the session does not exist.
+    async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> Result<bool>;
+
     /// Settings of the provider harness (instances, consents, roles, aliases,
     /// policy), one JSON document per (scope, key). Scope is `global` or
     /// `project:<slug>`.

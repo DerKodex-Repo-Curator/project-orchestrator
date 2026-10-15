@@ -446,6 +446,70 @@ impl Neo4jClient {
         Ok(result.next().await?.is_some())
     }
 
+    /// Re-target a chat session IN PLACE to another provider (B-SW phase 1). Providers do
+    /// not share a session format and a resume token is refused across families, so the
+    /// provider-specific fields are cleared (read back as `None`, like every optional
+    /// session property). `false`: no such session.
+    pub async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+    ) -> Result<bool> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) \
+             SET s.provider_id = $provider_id, s.model = $model, s.routed_by = $routed_by, \
+                 s.resume_token = '', s.capabilities = '', s.cli_session_id = '', \
+                 s.engine = 'agent', s.updated_at = datetime() \
+             RETURN s.id AS id",
+        )
+        .param("id", id.to_string())
+        .param("provider_id", provider_id.to_string())
+        .param("model", model.to_string())
+        .param("routed_by", routed_by.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// Restore the provider fields of a chat session after a failed in-place re-target:
+    /// `provider_id` is `provider_id` (the resolved id it was on), while the rest comes back
+    /// from `node` (the session as it was before the re-target). An absent optional field is
+    /// written empty and reads back `None`, like every optional session property.
+    pub async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> Result<bool> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) \
+             SET s.provider_id = $provider_id, s.model = $model, s.routed_by = $routed_by, \
+                 s.resume_token = $resume_token, s.capabilities = $capabilities, \
+                 s.cli_session_id = $cli_session_id, s.engine = $engine, \
+                 s.updated_at = datetime() \
+             RETURN s.id AS id",
+        )
+        .param("id", node.id.to_string())
+        .param("provider_id", provider_id.to_string())
+        .param("model", node.model.clone())
+        .param("routed_by", node.routed_by.clone().unwrap_or_default())
+        .param(
+            "resume_token",
+            node.resume_token.clone().unwrap_or_default(),
+        )
+        .param(
+            "capabilities",
+            node.capabilities.clone().unwrap_or_default(),
+        )
+        .param(
+            "cli_session_id",
+            node.cli_session_id.clone().unwrap_or_default(),
+        )
+        .param("engine", node.engine.clone().unwrap_or_default());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
     /// One setting document of the provider harness.
     pub async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
         let q = query("MATCH (s:LlmSetting {scope: $scope, key: $key}) RETURN s.value AS value")
