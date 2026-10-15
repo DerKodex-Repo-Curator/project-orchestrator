@@ -394,7 +394,7 @@ pub(crate) struct TurnRouter {
     /// The segmenter's own turn base, decoupled from the harness's `ctx.turn_index` (which
     /// resets to 0 on a provider move). It is the turn id the segmenter assigns to the
     /// harness's turn 0: `0` on a fresh conversation (the harness's index IS the segmenter's),
-    /// and the carried snapshot's `last_turn + 1` after a move. [`TurnRouter::observe_turn`]
+    /// and the carried snapshot's `last_turn` after a move. [`TurnRouter::observe_turn`]
     /// feeds the harness's turn shifted by this base, so observations stay strictly
     /// increasing across a move — the segmenter keeps its ids/`PRECEDES` stable and never
     /// sees `OutOfOrder`.
@@ -732,8 +732,8 @@ impl TurnRouter {
         let topic = topic::topic_labels(&message);
         // The segmenter's own turn id: the harness's index shifted by the segmenter's base.
         // On a fresh router the base is 0 (the harness's index IS the segmenter's, unchanged);
-        // after a move the base is the carried `last_turn + 1`, so the harness's reset index
-        // (0, 1, …) still segments as `last_turn + 1, last_turn + 2, …`. The segmenter's own
+        // after a move the base is the carried `last_turn`, so the harness's reset index
+        // (0, 1, …) still segments as `last_turn, last_turn + 1, …`. The segmenter's own
         // `last_turn` check still dedups a turn seen by both the provider check and the hook
         // (both yield the same shifted id).
         let segment_turn = turn_index.saturating_add(*locked(&self.segment_turn));
@@ -3634,8 +3634,8 @@ mod segment_tests {
 
     /// Slice B: a router rebuilt from a carried snapshot continues segmenting where the old
     /// one stopped even though the provider's harness RESETS its turn index to 0. The carried
-    /// snapshot's `last_turn + 1` becomes the segmenter's turn base, so the reset indices
-    /// (0, 1, …) still segment as `last_turn + 1, last_turn + 2, …` — no `OutOfOrder`, no
+    /// snapshot's `last_turn` becomes the segmenter's turn base, so the reset indices
+    /// (0, 1, …) still segment as `last_turn, last_turn + 1, …` — no `OutOfOrder`, no
     /// spurious boundary, and the pre-carry boundary stays put.
     #[test]
     fn a_router_rebuilt_from_a_carried_snapshot_continues_segmenting_not_reset() {
@@ -3673,7 +3673,7 @@ mod segment_tests {
         // The pre-carry boundary is restored, not reset.
         assert_eq!(locked(&rebuilt.segmenter).boundaries().len(), 1);
         // The provider's harness restarts at 0: the segmenter shifts each reset index up by
-        // `last_turn + 1`, so the continued subject is absorbed, never OutOfOrder, and never
+        // `last_turn`, so the continued subject is absorbed, never OutOfOrder, and never
         // mistaken for a new direction.
         assert!(
             feed(&rebuilt, 0, "deepseek", other).is_empty(),
@@ -3684,8 +3684,8 @@ mod segment_tests {
             "the reset index still segments strictly increasing"
         );
         assert_eq!(locked(&rebuilt.segmenter).boundaries().len(), 1);
-        // The reopened router's segmenter continued at `last_turn + 1`, not reset to 0.
-        assert_eq!(rebuilt.next_turn(), last_turn + 3);
+        // The reopened router's segmenter continued from the carried `last_turn` (its base), not reset to 0.
+        assert_eq!(rebuilt.next_turn(), last_turn + 2);
     }
 
     /// Slice B: the relayed turn of a moved-in router is recorded at the provider's 0-based
