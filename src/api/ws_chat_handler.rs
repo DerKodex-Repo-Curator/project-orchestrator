@@ -281,14 +281,18 @@ async fn handle_ws_chat_loop(
                 // created_at, and send it flat — so the frontend always receives the
                 // same JSON shape regardless of whether the event comes from replay,
                 // snapshot, or live.
-                let msg = replayed_frame(&event);
-                if ws_sender
-                    .send(Message::Text(msg.to_string().into()))
-                    .await
-                    .is_err()
-                {
-                    debug!("Client disconnected during replay");
-                    return;
+                // A `tool_result_spill` record holds the full text of a spilled
+                // tool result, server-side only: it is never replayed as a client
+                // frame (which would be typeless and leak the full text).
+                if let Some(msg) = replayed_frame(&event) {
+                    if ws_sender
+                        .send(Message::Text(msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        debug!("Client disconnected during replay");
+                        return;
+                    }
                 }
             }
         } else if last_event == 0 {
@@ -308,14 +312,15 @@ async fn handle_ws_chat_loop(
                         "Replaying message history (fallback)"
                     );
                     for event in &loaded.events {
-                        let msg = replayed_frame(event);
-                        if ws_sender
-                            .send(Message::Text(msg.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            debug!("Client disconnected during fallback replay");
-                            return;
+                        if let Some(msg) = replayed_frame(event) {
+                            if ws_sender
+                                .send(Message::Text(msg.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                debug!("Client disconnected during fallback replay");
+                                return;
+                            }
                         }
                     }
                 }
@@ -1183,10 +1188,15 @@ pub(crate) fn wire_seconds(at: chrono::DateTime<chrono::Utc>) -> f64 {
 }
 
 /// A persisted event as a replay frame: its payload, flat, plus `seq`,
-/// `replaying` and `created_at` (the time it was stored).
-fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> serde_json::Value {
+/// `replaying` and `created_at` (the time it was stored). `None` for a record
+/// that must never reach the client: the `tool_result_spill` record carries the
+/// full text of a spilled tool result, which stays server-side only.
+fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> Option<serde_json::Value> {
+    if record.event_type == crate::chat::spill::SPILL_EVENT_TYPE {
+        return None;
+    }
     let created_at = serde_json::json!(wire_seconds(record.created_at));
-    match serde_json::from_str::<serde_json::Value>(&record.data) {
+    let frame = match serde_json::from_str::<serde_json::Value>(&record.data) {
         Ok(serde_json::Value::Object(mut obj)) => {
             obj.insert("seq".to_string(), serde_json::json!(record.seq));
             obj.insert("replaying".to_string(), serde_json::json!(true));
@@ -1201,7 +1211,8 @@ fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> serde_json:
             "replaying": true,
             "created_at": created_at,
         }),
-    }
+    };
+    Some(frame)
 }
 
 /// A live event (local broadcast or relayed over NATS) as a frame: its payload
@@ -1711,6 +1722,30 @@ mod tests {
         assert_eq!(frame["code"], "cancel_failed");
         assert_eq!(frame["reason"], "owner_unreachable");
         assert_eq!(frame["seq"], 0);
+    }
+
+    /// A spilled tool result's full text lives in a `tool_result_spill`
+    /// transcript record, server-side only: replay must never re-emit it as a
+    /// client frame (the frame would be typeless and would leak the full text).
+    #[test]
+    fn a_spilled_tool_result_is_never_replayed_to_the_client() {
+        let record = crate::neo4j::models::ChatEventRecord {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            seq: 1,
+            event_type: crate::chat::spill::SPILL_EVENT_TYPE.to_string(),
+            data: serde_json::json!({
+                "key": "k",
+                "tool_result_id": "t1",
+                "full_text": "SECRET-FULL-TEXT-NEVER-ON-THE-WIRE"
+            })
+            .to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        assert!(
+            replayed_frame(&record).is_none(),
+            "the spill record must not become a client frame"
+        );
     }
 
     /// Verify that dropping the broadcast sender causes RecvError::Closed.
