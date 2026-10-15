@@ -341,6 +341,8 @@ async fn execute_via_agent(
             "Protocol '{}' — executing state '{}'",
             protocol.name, state.name
         )),
+        subagent_type: None,
+        route_auto: false,
         scaffolding_override: None,
         runner_context: None,
         routing_decision_id: None,
@@ -950,5 +952,56 @@ mod tests {
         assert!(!is_mcp_style("foo("));
         // Only closing paren
         assert!(!is_mcp_style(")bar"));
+    }
+
+    /// The protocol executor's slow path (an LLM state) builds its `ChatRequest` in
+    /// `execute_via_agent` and hands it to `ChatManager::create_session`. Nothing reached
+    /// that literal, so the two AUTO-SUB fields it carries (`subagent_type`, `route_auto`)
+    /// had no coverage at all (codecov/patch of #772, `src/protocol/executor/agent.rs` at
+    /// 0 %). The manager used here is the real one; its session table is FULL, which refuses
+    /// the opening at the cap before any provider is resolved or spawned (no network, no CLI,
+    /// no wait). What the assertion proves is that the request built on this path is the one
+    /// that reached that opening.
+    #[tokio::test]
+    async fn the_agent_path_opens_its_session_with_the_request_it_builds() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let app = crate::test_helpers::mock_app_state();
+        let config = crate::chat::config::ChatConfig {
+            max_sessions: 0,
+            ..Default::default()
+        };
+        let manager = Arc::new(ChatManager::new_without_memory(
+            app.neo4j.clone(),
+            app.meili.clone(),
+            config,
+        ));
+        let executor = AgentExecutor::new(Some(manager), CancellationToken::new());
+
+        let protocol_id = uuid::Uuid::new_v4();
+        let state_id = uuid::Uuid::new_v4();
+        let protocol = Protocol::new(uuid::Uuid::new_v4(), "Review", state_id);
+        let mut state = ProtocolState::new(protocol_id, "review");
+        state.id = state_id;
+        // Not an MCP-style action: the slow path (an LLM session), not the fast one.
+        state.action = Some("Review the diff and report the outcome".to_string());
+        let run = ProtocolRun::new(protocol_id, state_id, "review");
+        let store = MockGraphStore::new();
+
+        let err = crate::protocol::executor::Executor::execute_state(
+            &executor, &state, &run, &protocol, &store,
+        )
+        .await
+        .expect_err("a full session table refuses the opening");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to create agent session for protocol state"),
+            "the executor wrapped the failure of the session it opened: {msg}"
+        );
+        assert!(
+            msg.contains("Maximum number of active sessions reached"),
+            "the request the agent path built reached the manager's opening: {msg}"
+        );
     }
 }
