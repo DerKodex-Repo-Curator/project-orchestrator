@@ -338,6 +338,26 @@ fn is_result(event: &ChatEvent) -> bool {
     matches!(event, ChatEvent::Result { .. })
 }
 
+/// Waits for an in-place move to be stated on the SAME thread and returns the
+/// `ProviderSwitched` event. The in-place switch replaces the live broadcast channel, so a
+/// subscription taken before `send_message` would observe `RecvError::Closed`; the stored
+/// thread the session keeps is the reliable view.
+async fn switched_in_place(w: &World, session_id: &str) -> ChatEvent {
+    let id = Uuid::parse_str(session_id).unwrap();
+    for _ in 0..200 {
+        let events = w.graph.get_chat_events(id, 0, 500).await.unwrap();
+        if let Some(event) = events
+            .iter()
+            .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+            .find(|e| matches!(e, ChatEvent::ProviderSwitched { .. }))
+        {
+            return event;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the in-place move was never stated for {session_id}");
+}
+
 /// Opens a session and waits for the result of its opening turn.
 async fn open(w: &World, request: &ChatRequest) -> String {
     let created = w
@@ -698,23 +718,21 @@ async fn full_auto_moves_a_conversation_handed_back_to_po_to_another_provider() 
         )
         .await
         .unwrap();
-    let mut rx = w.manager.subscribe(&p).await.unwrap();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let relayed = wait_for(&mut rx, |e| {
-        matches!(e, ChatEvent::ConversationRelayed { .. })
-    })
-    .await;
-    let ChatEvent::ConversationRelayed {
-        to_session_id,
+    let relayed = switched_in_place(&w, &p).await;
+    let ChatEvent::ProviderSwitched {
+        session_id,
         from_provider,
         to_provider,
-        moved_by,
         ..
     } = relayed
     else {
         unreachable!()
     };
-    assert_eq!(moved_by, "auto");
+    assert_eq!(
+        session_id, p,
+        "the move re-targets the SAME thread in place"
+    );
     assert_eq!(
         (from_provider.as_str(), to_provider.as_str()),
         ("primary", "worker")
@@ -727,10 +745,7 @@ async fn full_auto_moves_a_conversation_handed_back_to_po_to_another_provider() 
     }
     assert_eq!(model_of_turn(&w.worker, SIMPLE, &[]), ["wa"]);
     assert!(model_of_turn(&w.primary, SIMPLE, &[]).is_empty());
-    assert_eq!(
-        node(&w, &to_session_id).await.provider_id.as_deref(),
-        Some("worker")
-    );
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("worker"));
 }
 
 /// The compaction summary of a native session goes through a cognitive decision, recorded
@@ -1030,7 +1045,9 @@ async fn turn_decisions(w: &World, session_id: &str) -> Vec<CognitiveDecision> {
     let mut mine: Vec<CognitiveDecision> = decisions_of(w, session_id)
         .await
         .into_iter()
-        .filter(|d| d.turn_index.is_some_and(|i| i > 0))
+        // Only OPEN decisions (outcome None) are the turns' own: a provider move leaves its
+        // own decision CLOSED on the same thread, so it is not the decision of the next turn.
+        .filter(|d| d.outcome.is_none() && d.turn_index.is_some_and(|i| i > 0))
         .collect();
     mine.sort_by_key(|d| d.turn_index);
     mine
@@ -1168,34 +1185,33 @@ async fn after_a_provider_move_the_next_turn_of_another_class_changes_model_not_
         )
         .await
         .unwrap();
-    let mut rx = w.manager.subscribe(&p).await.unwrap();
     let moved_at = std::time::Instant::now();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let ChatEvent::ConversationRelayed { to_session_id, .. } = wait_for(&mut rx, |e| {
-        matches!(e, ChatEvent::ConversationRelayed { .. })
-    })
-    .await
-    else {
+    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await else {
         unreachable!()
     };
+    assert_eq!(
+        session_id, p,
+        "the move re-targets the SAME thread in place"
+    );
     for _ in 0..400 {
         if !model_of_turn(&w.worker, SIMPLE, &[]).is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    idle(&w, &to_session_id).await;
+    idle(&w, &p).await;
     let move_turn = moved_at.elapsed();
     assert_eq!(model_of_turn(&w.worker, SIMPLE, &[]), ["wa"]);
 
     let changed_at = std::time::Instant::now();
-    let events = turn_events(&w, &to_session_id, EXPLORE).await;
+    let events = turn_events(&w, &p, EXPLORE).await;
     let change_turn = changed_at.elapsed();
     assert_eq!(changes(&events), ["wb"], "the model may change");
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e, ChatEvent::ConversationRelayed { .. })),
+            .any(|e| matches!(e, ChatEvent::ProviderSwitched { .. })),
         "no second move"
     );
     assert_eq!(model_of_turn(&w.worker, EXPLORE, &[]), ["wb"]);
@@ -1203,11 +1219,8 @@ async fn after_a_provider_move_the_next_turn_of_another_class_changes_model_not_
         model_of_turn(&w.primary, EXPLORE, &[]).is_empty(),
         "the provider stays"
     );
-    assert_eq!(
-        node(&w, &to_session_id).await.provider_id.as_deref(),
-        Some("worker")
-    );
-    let explore = turn_decisions(&w, &to_session_id)
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("worker"));
+    let explore = turn_decisions(&w, &p)
         .await
         .into_iter()
         .find(|d| d.signature.arm_key() == class_of(EXPLORE))
@@ -1273,26 +1286,25 @@ async fn after_a_provider_move_the_next_turn_of_the_same_class_is_steady() {
         )
         .await
         .unwrap();
-    let mut rx = w.manager.subscribe(&p).await.unwrap();
     w.manager.send_message(&p, SIMPLE).await.unwrap();
-    let ChatEvent::ConversationRelayed { to_session_id, .. } = wait_for(&mut rx, |e| {
-        matches!(e, ChatEvent::ConversationRelayed { .. })
-    })
-    .await
-    else {
+    let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &p).await else {
         unreachable!()
     };
+    assert_eq!(
+        session_id, p,
+        "the move re-targets the SAME thread in place"
+    );
     for _ in 0..400 {
         if !model_of_turn(&w.worker, SIMPLE, &[]).is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    idle(&w, &to_session_id).await;
-    let events = turn_events(&w, &to_session_id, SIMPLE2).await;
+    idle(&w, &p).await;
+    let events = turn_events(&w, &p, SIMPLE2).await;
     assert!(changes(&events).is_empty(), "{events:#?}");
     assert_eq!(model_of_turn(&w.worker, SIMPLE2, &[]), ["wa"]);
-    let decision = turn_decisions(&w, &to_session_id)
+    let decision = turn_decisions(&w, &p)
         .await
         .pop()
         .expect("the second simple turn is decided");

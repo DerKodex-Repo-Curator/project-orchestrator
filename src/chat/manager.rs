@@ -871,6 +871,10 @@ pub(crate) struct OpeningTurn<'a> {
     pub message: &'a str,
     /// Index of the first turn the router counts itself (legacy engine).
     pub next_turn: u32,
+    /// The conversation's segmentation (segments + boundaries) carried across a provider
+    /// move: the new router resumes it instead of a fresh (or stale store) segmentation.
+    /// `None` = nothing to resume.
+    pub segments: Option<super::provider::cognitive::segment::SegmentsSnapshot>,
     /// The person the conversation belongs to (`ChatSessionNode::owner`): their "models Auto
     /// may use" (AUTO-L) bound an Auto conversation without a pool of its own.
     pub owner: Option<&'a str>,
@@ -3617,13 +3621,20 @@ impl ChatManager {
             .cognitive_routing
             .as_ref()
             .and_then(|routing| routing.segment_store.clone());
-        // S4: the conversation's persisted segmentation, read once here. A conversation
-        // reopened after a restart continues where it stopped; a fresh one has nothing to
-        // resume. Bounded, and never fatal: `read_segments_snapshot` starts a fresh
-        // segmentation rather than delaying or failing the turn.
-        let segments = match segment_store.as_ref() {
-            Some(store) => Self::read_segments_snapshot(store, session_id).await,
-            None => None,
+        // S4: the conversation's segmentation, read once here. A conversation reopened after
+        // a restart continues where it stopped; a fresh one has nothing to resume. Bounded,
+        // and never fatal: `read_segments_snapshot` starts a fresh segmentation rather than
+        // delaying or failing the turn.
+        //
+        // A provider move carries the live segmentation in the opening (fresher than the
+        // store, which is written on a confirmed boundary only): prefer it, so a move never
+        // resumes from a stale store entry.
+        let segments = match turn.segments.clone() {
+            Some(snapshot) => Some(snapshot),
+            None => match segment_store.as_ref() {
+                Some(store) => Self::read_segments_snapshot(store, session_id).await,
+                None => None,
+            },
         };
         // A model the request named, or the user set by hand, stays pinned across a
         // resume or a restart: the pin is stored, not only held by the router.
@@ -3803,6 +3814,22 @@ impl ChatManager {
                     reason = %decision.reason,
                     "the router moved the conversation to another provider"
                 );
+                // A move is a completed transition, not a per-turn decision left open: close
+                // it so the store's open decisions are only the turns' own (an in-place switch
+                // keeps the move's decision on the SAME thread, which otherwise reads as the
+                // next turn's).
+                if let Some(store) = self
+                    .cognitive_routing
+                    .as_ref()
+                    .and_then(|r| r.store.clone())
+                {
+                    if let Err(error) = store
+                        .set_outcome(decision.id, decision.outcome.unwrap_or_default())
+                        .await
+                    {
+                        warn!(%decision.id, %error, "closing the move's routing decision failed");
+                    }
+                }
                 true
             }
             Err(error) => {
@@ -5105,6 +5132,27 @@ impl ChatManager {
         request_model
             .map(|m| m.to_string())
             .unwrap_or_else(|| self.config.default_model.clone())
+    }
+
+    /// The model a moved conversation opens on: the explicit one when the user named it,
+    /// otherwise the TARGET provider's own default (never the OLD provider's model name, which
+    /// a provider like ACP would refuse). Mirrors [`Self::create_session_resolved`]'s model
+    /// resolution for a non-Claude target.
+    async fn resolve_target_model(&self, provider: &str, model: Option<&str>) -> Result<String> {
+        if let Some(model) = model {
+            return Ok(model.to_string());
+        }
+        if provider == super::provider::resolver::CLAUDE_CODE {
+            return Ok(self.resolve_model(None));
+        }
+        super::provider::store::instance(self.graph.as_ref(), provider)
+            .await?
+            .and_then(|i| i.default_model)
+            .ok_or_else(|| {
+                anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                    "this provider instance has no default model: name one",
+                ))
+            })
     }
 
     /// [`Self::build_system_prompt`] plus the anchor map of the session, according
@@ -7198,6 +7246,7 @@ impl ChatManager {
                     permission_mode: request.permission_mode.as_deref(),
                     message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 1,
+                    segments: None,
                     owner: session_node.owner.as_deref(),
                 },
             )
@@ -7533,7 +7582,11 @@ impl ChatManager {
         // A relayed conversation says so first: what the model is given in front
         // of the message is stated on the thread, never slipped in silently.
         if let Some(relay) = relay {
-            let relayed = relay.event(&session_id.to_string(), &provider_choice.provider_id);
+            let relayed = relay.event(
+                &session_id.to_string(),
+                &provider_choice.provider_id,
+                &model,
+            );
             let record = ChatEventRecord {
                 id: Uuid::new_v4(),
                 session_id,
@@ -10932,6 +10985,10 @@ impl ChatManager {
             )));
         }
 
+        // The model the moved conversation opens on, resolved BEFORE anything is torn down:
+        // the explicit one, else the target's own default (never the old provider's model name).
+        let target_model = self.resolve_target_model(provider, model).await?;
+
         // The conversation so far, from what was stored.
         let records = self.graph.get_chat_events(previous, 0, 5_000).await?;
         let events: Vec<ChatEvent> = records
@@ -10941,12 +10998,12 @@ impl ChatManager {
         // A relay may use 40 % of the target's window when it is known.
         let window = match self.provider_for(provider).await {
             Ok(target) => target
-                .capabilities(model.or(node.model.as_str().into()))
+                .capabilities(Some(&target_model))
                 .context_window
                 .map(|w| w.value),
             Err(_) => None,
         };
-        let relayed = relay::RelayedFrom {
+        let mut relayed = relay::RelayedFrom {
             relay: relay::render_relay(
                 &events,
                 &current,
@@ -10956,79 +11013,102 @@ impl ChatManager {
             from_session_id: session_id.to_string(),
             from_provider: current.clone(),
             moved_by: moved_by.to_string(),
-            // The memory conversation goes on in the new session.
+            // The memory conversation goes on in the same session.
             conversation_id: node.conversation_id.clone(),
+            segments: None,
+            next_turn: 0,
         };
+        // Carry the live router's segmenter state (segments + boundaries) and its segmenter
+        // turn counter, BEFORE teardown destroys the live router: the reopened router resumes
+        // from them instead of resetting the conversation's segmentation.
+        if let Some(router) = self.turn_routing.get(session_id) {
+            relayed.segments = Some(router.snapshot_segments());
+            relayed.next_turn = router.next_turn();
+        }
         let rendered = &relayed.relay;
 
-        // A neutral session continues in a neutral place of its own (a new session, a new directory).
-        let relay_cwd = if node.execution_place == super::neutral_place::ExecutionPlace::Neutral {
-            String::new()
-        } else {
-            node.cwd.clone()
-        };
         let by_router = moved_by == relay::MOVED_BY_AUTO;
-        let request = ChatRequest {
-            file_scope_lifted: node.file_scope_lifted,
-            routing_pool: node
-                .routing_pool
-                .as_deref()
-                .filter(|_| by_router)
-                .and_then(|json| serde_json::from_str(json).ok()),
-            routing_mode: node
-                .routing_mode
-                .as_deref()
-                .filter(|_| by_router)
-                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok())
-                // The router moves only a conversation that is `full` in effect; a pool kept
-                // without a mode (the settings said `full`) says so, or the opening of the new
-                // session would decide its target again among the pool (review of #713, C1-bis).
-                .or_else(|| {
-                    (by_router && node.routing_pool.is_some())
-                        .then_some(super::provider::cognitive::ConversationRoutingMode::Full)
-                }),
-            attachments: Vec::new(),
-            refs: Vec::new(),
-            message: message.to_string(),
-            session_id: None,
-            cwd: relay_cwd,
-            project_slug: node.project_slug.clone(),
-            model: model.map(str::to_string),
-            provider: Some(provider.to_string()),
-            task_alias: None,
-            persona_alias: None,
-            run_provider: None,
-            run_model: None,
-            max_tokens: None,
-            task_class: None,
-            permission_mode: node.permission_mode.clone(),
-            add_dirs: node.add_dirs.clone(),
-            workspace_slug: node.workspace_slug.clone(),
-            user_claims: claims,
-            // A child of a session stays one when it moves: its lineage (depth 1, P18 / A17)
-            // and its third-party parent (H6) go with it.
-            spawned_by: node
-                .spawned_by
-                .clone()
-                .filter(|s| parse_spawned_by(s).is_some_and(|ctx| ctx.parent_session_id.is_some())),
-            task_context: None,
-            subagent_type: None,
-            route_auto: false,
-            scaffolding_override: None,
-            // A switch never widens: the new session keeps the access of the old one.
-            access: Some(node.access),
-            runner_context: None,
-            routing_decision_id: None,
+        let routed_by = if by_router {
+            relay::MOVED_BY_AUTO
+        } else {
+            "request"
         };
-        // Opening can be refused (consent, endpoint, gate, no model): the old
-        // session is then left exactly as it was.
-        let created = self
-            .create_session_relayed(&request, Some(&relayed))
+        // The routing the target keeps, as `create_session_resolved` persisted on a NEW
+        // session before the in-place flow: a router move keeps the conversation's mode and
+        // pool (a pool without a mode reads `full`, or the reopened target would decide its
+        // model again among the pool — review of #713, C1-bis); a user move imposes the
+        // target and keeps none.
+        let carried_mode = if by_router {
+            node.routing_mode
+                .as_deref()
+                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok())
+                .or_else(|| {
+                    node.routing_pool
+                        .is_some()
+                        .then_some(super::provider::cognitive::ConversationRoutingMode::Full)
+                })
+        } else {
+            None
+        };
+        let carried_pool = if by_router {
+            node.routing_pool.clone()
+        } else {
+            None
+        };
+
+        // Pre-flight: the consent/gate/journal check runs BEFORE the old process is closed,
+        // so a refused move never tears it down (the old session stays exactly as it was:
+        // process live, resume token intact).
+        self.authorize_provider_switch(&node, provider, &target_model, claims.as_ref())
             .await?;
 
-        // The thread it leaves learns where the conversation went, before it closes.
-        self.emit_on_session(session_id, relayed.event(&created.session_id, provider))
-            .await;
+        // Re-target the SAME id in place: the node is updated, the old provider process is
+        // closed quietly (`close_session_for_switch`, which emits no `session_closed` and,
+        // unlike `close_session`, does not remove a neutral directory), then the same id is
+        // reopened on the target with its stored history relayed in front of the first message.
+        // The engine written is the one the target runs on, so a later resume of the SAME
+        // session routes on the branch the switch reopened with (agent vs legacy).
+        let engine = if self.engine_is_agent(provider) {
+            ChatSessionNode::ENGINE_AGENT
+        } else {
+            ChatSessionNode::ENGINE_LEGACY
+        };
+        self.graph
+            .update_chat_session_provider(previous, provider, &target_model, routed_by, engine)
+            .await?;
+        if let Err(error) = self.close_session_for_switch(session_id).await {
+            debug!(%session_id, %error, "closing the provider process before an in-place switch");
+        }
+        if let Err(error) = self
+            .reopen_session_on_provider(session_id, message, claims.as_ref(), Some(&relayed))
+            .await
+        {
+            // The move failed after the node was retargeted and the old process closed:
+            // restore EVERY cleared field (provider, model, routed_by, resume_token,
+            // capabilities, cli_session_id, engine), so a later resume finds the old session.
+            self.graph
+                .restore_chat_session_provider(&node, &current)
+                .await?;
+            return Err(error);
+        }
+        // The target keeps the routing a router move carried (or none, for a user move),
+        // persisted after the reopen so a later resume routes on it.
+        self.graph
+            .update_chat_session_routing(
+                previous,
+                carried_mode.as_ref().map(|m| m.as_str()),
+                carried_pool.as_deref(),
+                Some(routed_by),
+            )
+            .await?;
+
+        // The SAME thread states the switch — with the relay counts, so a bounded relay
+        // is never a silent truncation; there is no new session to follow.
+        self.emit_on_session(
+            session_id,
+            relayed.event(session_id, provider, &target_model),
+        )
+        .await;
 
         let note = serde_json::json!({
             "from_session": session_id,
@@ -11038,22 +11118,14 @@ impl ChatManager {
         });
         if let Err(error) = self
             .graph
-            .put_llm_setting(
-                &format!("handoff:{}", created.session_id),
-                "note",
-                &note.to_string(),
-            )
+            .put_llm_setting(&format!("handoff:{session_id}"), "note", &note.to_string())
             .await
         {
-            warn!(session_id = %created.session_id, %error, "recording the provider handoff failed (non-fatal)");
-        }
-        // The conversation lives on in the new session; the old one ends.
-        if let Err(error) = self.close_session(session_id).await {
-            debug!(%session_id, %error, "closing the previous session after a provider switch");
+            warn!(session_id = %session_id, %error, "recording the provider handoff failed (non-fatal)");
         }
         Ok(super::types::SwitchProviderResponse {
-            session_id: created.session_id,
-            stream_url: created.stream_url,
+            session_id: session_id.to_string(),
+            stream_url: format!("/ws/chat/{session_id}"),
             previous_session_id: session_id.to_string(),
             relayed_entries: rendered.included,
             omitted_entries: rendered.omitted,
@@ -11600,6 +11672,35 @@ impl ChatManager {
                 .await;
         }
 
+        self.reopen_legacy_session(&session_node, message, user_claims, None)
+            .await
+    }
+
+    /// Reopens a session on the legacy Claude Code CLI (the historical engine): spawns the
+    /// CLI and delivers `message`. It is the shared legacy branch of [`Self::resume_session_on`];
+    /// `relay` names an in-place provider switch, whose first message goes out relay-prefixed
+    /// and whose router is re-seeded from the carried segmenter state.
+    async fn reopen_legacy_session(
+        &self,
+        node: &ChatSessionNode,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        relay: Option<&super::relay::RelayedFrom>,
+    ) -> Result<()> {
+        let sid = node.id.to_string();
+        let session_id: &str = sid.as_str();
+        let uuid = node.id;
+        let session_node = node;
+        // (P20-suite-2) As on a resume: re-derive the person from the stored owner when the
+        // reopen has no caller claims, so the session token can be minted again.
+        let rederived_claims;
+        let user_claims: Option<&crate::auth::jwt::Claims> = match user_claims {
+            Some(claims) => Some(claims),
+            None => {
+                rederived_claims = self.resume_identity(node).await;
+                rederived_claims.as_ref()
+            }
+        };
         let cli_session_id = session_node.cli_session_id.as_deref();
 
         if let Some(cli_id) = cli_session_id {
@@ -11694,6 +11795,55 @@ impl ChatManager {
         // A resume keeps the access the session was opened with and can only narrow it.
         let access = super::provider::policy::SessionAccess::for_resume(session_node.access, None);
         let resume_add_dirs = session_node.add_dirs.clone().unwrap_or_default();
+
+        // A move re-seeds the router (the quiet close of the switch removed it): a router
+        // move (`auto`) keeps the conversation's routing (mode, pool) and lets it choose
+        // again; a user move imposes the target. The legacy engine counts its first routed
+        // turn after the relayed one, hence `next_turn: 1`.
+        if let Some(relay) = relay {
+            let moved_in = relay.moved_by == super::relay::MOVED_BY_AUTO;
+            let routing_mode = if moved_in {
+                session_node
+                    .routing_mode
+                    .as_deref()
+                    .and_then(|m| {
+                        serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
+                    })
+                    .or_else(|| {
+                        (session_node.routing_pool.is_some())
+                            .then_some(super::provider::cognitive::ConversationRoutingMode::Full)
+                    })
+            } else {
+                None
+            };
+            let routing_pool = if moved_in {
+                session_node
+                    .routing_pool
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+            } else {
+                None
+            };
+            self.register_turn_router(
+                session_id,
+                super::provider::resolver::CLAUDE_CODE,
+                &session_node.model,
+                session_node.project_slug.as_deref(),
+                OpeningTurn {
+                    routing_mode,
+                    routing_pool,
+                    explicit_model: false,
+                    permission_mode: session_node.permission_mode.as_deref(),
+                    provider_imposed: !moved_in && session_node.routing_pool.is_none(),
+                    moved_in,
+                    message,
+                    next_turn: 1,
+                    segments: relay.segments.clone(),
+                    owner: session_node.owner.as_deref(),
+                },
+            )
+            .await;
+        }
 
         // `--resume <cli_session_id>` can name a conversation the CLI no longer
         // has (expired, purged, stale): the CLI then exits at once and the turn
@@ -12049,7 +12199,7 @@ impl ChatManager {
         let session_id_str = session_id.to_string();
         let graph = self.graph.clone();
         let active_sessions = self.active_sessions.clone();
-        let prompt = message.to_string();
+        let prompt = super::relay::prefixed(relay.and_then(|r| r.text()), message);
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
         let nats = self.nats.clone();
@@ -15169,6 +15319,67 @@ impl ChatManager {
         provider.capabilities(Some(model)).per_session_mcp && !refused_before
     }
 
+    /// The consent/gate/journal check of an in-place provider switch, run BEFORE the old
+    /// provider process is closed: a refused move (`NotAllowed`, `EndpointRefused`, an
+    /// un-gated trust, an unjournalable send) returns here while the old session is still
+    /// exactly as it was (process live, resume token intact). It is the same
+    /// [`Self::authorize_provider_use`] the opening runs, keyed on the policy mode the target
+    /// would open with.
+    async fn authorize_provider_switch(
+        &self,
+        node: &ChatSessionNode,
+        provider: &str,
+        model: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+    ) -> Result<()> {
+        // As on a resume: re-derive the person from the stored owner when the move has no
+        // caller claims (a router move), so the journal names who the content belongs to.
+        let rederived_claims;
+        let user_claims = match user_claims {
+            Some(claims) => Some(claims),
+            None => {
+                rederived_claims = self.resume_identity(node).await;
+                rederived_claims.as_ref()
+            }
+        };
+        let mode = self.policy_mode_for(node).await.ok_or_else(|| {
+            anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                "unknown permission mode or malformed tool pattern",
+            ))
+        })?;
+        self.authorize_provider_use(ProviderUse {
+            provider_id: provider,
+            model,
+            mode,
+            project_slug: node.project_slug.as_deref(),
+            claims: user_claims,
+            session_id: &node.id.to_string(),
+        })
+        .await
+    }
+
+    /// The `PolicyMode` a session of `node`'s permission mode and access would open with
+    /// (the same derivation [`Self::build_agent_spec_with_access`] uses for `spec.policy.mode`),
+    /// `None` when the mode cannot be parsed.
+    async fn policy_mode_for(
+        &self,
+        node: &ChatSessionNode,
+    ) -> Option<nexus_claude::agent::PolicyMode> {
+        let perm = self.permission_config.read().await;
+        let mode = node
+            .permission_mode
+            .clone()
+            .unwrap_or_else(|| perm.mode.clone());
+        let access = super::provider::policy::SessionAccess::for_resume(node.access, None);
+        super::provider::policy::tool_policy_with_access(
+            &mode,
+            &perm.allowed_tools,
+            &perm.disallowed_tools,
+            access,
+        )
+        .map(|policy| policy.mode)
+    }
+
     /// Everything that must hold before a session's content is sent to a
     /// provider other than Claude Code. Claude Code (the historical path) is
     /// not subject to it.
@@ -15784,6 +15995,7 @@ impl ChatManager {
                     permission_mode: request.permission_mode.as_deref(),
                     message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 0,
+                    segments: None,
                     owner,
                 },
             )
@@ -15932,7 +16144,7 @@ impl ChatManager {
         if let Some(handle) = self.agent_runtime.get(&sid).await {
             // A relayed conversation says so first, on the thread.
             if let Some(relay) = relay {
-                handle.emit(relay.event(&sid, provider_id)).await;
+                handle.emit(relay.event(&sid, provider_id, model)).await;
             }
             if !request.message.is_empty() {
                 // Counted on the node at creation (`message_count: 1`).
@@ -16437,15 +16649,63 @@ impl ChatManager {
         self.reopen_agent_session(node, message, user_claims).await
     }
 
-    /// The reopening itself of [`Self::resume_agent_session`]: the caller HOLDS the
-    /// session's resume lock (`resume_locks`) and has decided there is nothing live to
-    /// deliver to — a person's resume, or the restart recovery, which skips a session
-    /// another resume brought back instead of writing into it (`recovery.rs`).
+    /// Reopens a session IN PLACE on another provider (B-SW phase 1): the SAME `session_id`
+    /// continues, on the target provider/model it was just re-targeted to, replaying its
+    /// stored history through `relay` in front of the first message. It IS the shared resume
+    /// path of [`Self::resume_session_on`]: the branch on the engine the node was re-targeted
+    /// to (the agent runtime, or the legacy Claude Code CLI), with the router re-seeded from
+    /// the carried segmenter state. Unlike a resume, the consent/gate/journal check already
+    /// ran in `authorize_provider_switch` (before the old process closed), so the leaf
+    /// reopens skip it.
+    async fn reopen_session_on_provider(
+        &self,
+        session_id: &str,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        relay: Option<&super::relay::RelayedFrom>,
+    ) -> Result<()> {
+        let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
+        let node = self
+            .graph
+            .get_chat_session(uuid)
+            .await
+            .context("Failed to fetch session from Neo4j")?
+            .ok_or_else(|| anyhow!("Session {session_id} not found in database"))?;
+        // The engine written by `update_chat_session_provider` names the branch: a session
+        // re-targeted to a native provider reopens on the agent runtime; to Claude Code on
+        // the legacy CLI — the SAME branch a later resume takes (`resume_session_on`).
+        if node.opened_on_agent() {
+            self.reopen_agent_session_with(&node, message, user_claims, relay)
+                .await
+        } else {
+            self.reopen_legacy_session(&node, message, user_claims, relay)
+                .await
+        }
+    }
+
+    /// Reopens a session of the agent engine that is no longer live (the caller holds the
+    /// session's resume lock): from its persisted resume token, or a fresh open, then
+    /// delivers `message`.
     pub(super) async fn reopen_agent_session(
         &self,
         node: &ChatSessionNode,
         message: &str,
         user_claims: Option<&crate::auth::jwt::Claims>,
+    ) -> Result<()> {
+        self.reopen_agent_session_with(node, message, user_claims, None)
+            .await
+    }
+
+    /// [`Self::reopen_agent_session`] with `relay`: an in-place provider switch reopens on
+    /// the node it was just re-targeted to (its provider/model are the target's), the first
+    /// message goes out relay-prefixed, and the router is re-seeded from the carried
+    /// segmenter state. `relay == None` is the plain resume.
+    async fn reopen_agent_session_with(
+        &self,
+        node: &ChatSessionNode,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        relay: Option<&super::relay::RelayedFrom>,
     ) -> Result<()> {
         let sid = node.id.to_string();
         // (P20-suite-2) The restart recovery reopens the session with no caller: re-derive
@@ -16490,8 +16750,31 @@ impl ChatManager {
             .await;
         // From here, a failure undoes the router and the token (finding 5 of #682).
         let mut cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
-        // A resumed session starts counting its turns again; the harness is the authority
-        // on the index, and nothing says whether its model was named by the request.
+        // A move by the router (`auto`) keeps the conversation's routing (mode, pool) and
+        // lets it choose again; a move by the user imposes the target (`routed_by: request`).
+        // A plain resume keeps the mode the conversation was opened with, and starts counting
+        // its turns again (the harness is the authority on the index).
+        let moved_in = relay.is_some_and(|r| r.moved_by == super::relay::MOVED_BY_AUTO);
+        let routing_mode = if relay.is_some() && !moved_in {
+            None
+        } else {
+            node.routing_mode
+                .as_deref()
+                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok())
+                // The router moves only a conversation `full` in effect; a pool kept without
+                // a mode says so (review of #713, C1-bis).
+                .or_else(|| {
+                    (moved_in && node.routing_pool.is_some())
+                        .then_some(super::provider::cognitive::ConversationRoutingMode::Full)
+                })
+        };
+        let routing_pool = if relay.is_some() && !moved_in {
+            None
+        } else {
+            node.routing_pool
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+        };
         let router = self
             .register_turn_router(
                 &sid,
@@ -16499,23 +16782,19 @@ impl ChatManager {
                 &node.model,
                 node.project_slug.as_deref(),
                 OpeningTurn {
-                    // The mode the conversation was opened with stays its own across a resume.
-                    routing_mode: node.routing_mode.as_deref().and_then(|m| {
-                        serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
-                    }),
-                    routing_pool: node
-                        .routing_pool
-                        .as_deref()
-                        .and_then(|json| serde_json::from_str(json).ok()),
+                    routing_mode,
+                    routing_pool,
                     explicit_model: false,
                     permission_mode: node.permission_mode.as_deref(),
-                    // A provider the request named stays imposed across a resume (a conversation
-                    // opened with ticked models names its pilot without imposing it).
+                    // A provider the request named stays imposed across a resume, and a user
+                    // move imposes its target (a pool, carried only by a router move, keeps
+                    // the provider free); a router move never imposes it.
                     provider_imposed: node.routed_by.as_deref() == Some("request")
                         && node.routing_pool.is_none(),
-                    moved_in: false,
+                    moved_in,
                     message,
                     next_turn: 0,
+                    segments: relay.and_then(|r| r.segments.clone()),
                     owner: node.owner.as_deref(),
                 },
             )
@@ -16554,21 +16833,28 @@ impl ChatManager {
             .await?;
         cleanup.minted(&spec, self.config.jwt_secret.as_deref());
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
-        // A resume is a new sending of the project's content: consent, guard
-        // and journal apply again (a consent may have been revoked meanwhile).
-        self.authorize_provider_use(ProviderUse {
-            provider_id: &provider_id,
-            model: &node.model,
-            mode: spec.policy.mode,
-            project_slug: node.project_slug.as_deref(),
-            claims: user_claims,
-            session_id: &sid,
-        })
-        .await?;
-        let token = node
-            .resume_token
-            .as_deref()
-            .and_then(|raw| nexus_claude::agent::ResumeToken::from_wire(raw).ok());
+        if relay.is_none() {
+            // A resume is a new sending of the project's content: consent, guard and
+            // journal apply again (a consent may have been revoked meanwhile). A switch
+            // already passed `authorize_provider_switch` before the old process closed.
+            self.authorize_provider_use(ProviderUse {
+                provider_id: &provider_id,
+                model: &node.model,
+                mode: spec.policy.mode,
+                project_slug: node.project_slug.as_deref(),
+                claims: user_claims,
+                session_id: &sid,
+            })
+            .await?;
+        }
+        // No resume token survives a move across provider families: a switch opens fresh.
+        let token = if relay.is_some() {
+            None
+        } else {
+            node.resume_token
+                .as_deref()
+                .and_then(|raw| nexus_claude::agent::ResumeToken::from_wire(raw).ok())
+        };
         let mut host_missing = host_degraded(
             provider.kind(),
             &spec,
@@ -16649,7 +16935,11 @@ impl ChatManager {
             !per_session_mcp || without_mcp,
             project_dir,
             lasting,
-            true,
+            // A provider switch is NOT a resume: the shell never left the project root, so the
+            // session's lasting `always` rules still bind (a resume starts optimistically
+            // moved, which would make every `always` command be asked again). Only a plain
+            // resume (no relay) may have moved.
+            relay.is_none(),
         )
         .await;
         let handle = self
@@ -16661,7 +16951,15 @@ impl ChatManager {
         // capped (as on Claude Code; the flag an older version persisted is not read).
         let (on, max) = super::post_stream::session_auto_continue(false, self.config.auto_continue);
         handle.configure_auto_continue(on, max);
-        handle.send_message(message).await
+        if let Some(relay) = relay {
+            // The stored thread keeps showing `message` alone; the model sees the relay in
+            // front of it (never stored).
+            handle
+                .send_message_relayed(message, &super::relay::prefixed(relay.text(), message))
+                .await
+        } else {
+            handle.send_message(message).await
+        }
     }
 
     /// Close an active session: interrupt first, then disconnect and remove.
@@ -16704,6 +17002,17 @@ impl ChatManager {
     }
 
     async fn close_session_inner(&self, session_id: &str) -> Result<()> {
+        self.close_session_inner_with(session_id, true).await
+    }
+
+    /// Tears the session down WITHOUT announcing `session_closed`: an in-place provider
+    /// switch, whose same thread must see only `provider_switched`, never `session_closed`.
+    /// Unlike [`Self::close_session`], it does not remove a neutral directory.
+    async fn close_session_for_switch(&self, session_id: &str) -> Result<()> {
+        self.close_session_inner_with(session_id, false).await
+    }
+
+    async fn close_session_inner_with(&self, session_id: &str, announce: bool) -> Result<()> {
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             self.anchor_cache.forget(uuid);
         }
@@ -16716,8 +17025,13 @@ impl ChatManager {
                 .remove(session_id);
             crate::auth::agent_tokens::revoke_session(session_id);
             // Every instance learns the session is gone, as on the legacy path: the
-            // `session_closed` the runtime emits is published like every event.
-            self.agent_runtime.close(session_id).await?;
+            // `session_closed` the runtime emits is published like every event. A quiet
+            // close (an in-place switch) skips that announcement.
+            if announce {
+                self.agent_runtime.close(session_id).await?;
+            } else {
+                self.agent_runtime.close_for_switch(session_id).await?;
+            }
             return Ok(());
         }
         // 0. The session's MCP token dies with it — before anything that can
@@ -16747,14 +17061,17 @@ impl ChatManager {
         };
         self.notify_attention(session_id, AttentionReason::SessionInactive);
 
-        // A45: tell every client (and every instance) the session is gone.
-        let closed = ChatEvent::SessionClosed {
-            session_id: session_id.to_string(),
-            reason: Some("closed".to_string()),
-        };
-        let _ = events_tx.send(closed.clone());
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(session_id, closed);
+        // A45: tell every client (and every instance) the session is gone. A quiet close
+        // (an in-place switch) skips it: the same thread sees only `provider_switched`.
+        if announce {
+            let closed = ChatEvent::SessionClosed {
+                session_id: session_id.to_string(),
+                reason: Some("closed".to_string()),
+            };
+            let _ = events_tx.send(closed.clone());
+            if let Some(ref nats) = self.nats {
+                nats.publish_chat_event(session_id, closed);
+            }
         }
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
@@ -22742,6 +23059,8 @@ mod tests {
             from_provider: "local".into(),
             moved_by: "user".into(),
             conversation_id: None,
+            segments: None,
+            next_turn: 0,
         };
         let mut req = agent_request("hello");
         req.cwd = "/Users/someone/work/proj".into();
@@ -23226,10 +23545,286 @@ mod tests {
             origin: crate::chat::provider::settings::process_origin("acp", None),
             cost_source: "none".into(),
             credential_ref: "none".into(),
+            default_model: Some("acp-default".into()),
             ..Default::default()
         };
         super::super::agent_e2e_tests::store_instance(graph, &record).await;
         super::super::agent_e2e_tests::consent(graph, slug, id, &record.origin).await;
+    }
+
+    /// Two fake providers under two ids, for the in-place provider-switch tests (offline:
+    /// no HTTP, no spawned process).
+    struct TwoProviders {
+        claude: super::super::agent_runtime::fake::FakeProvider,
+        acp: super::super::agent_runtime::fake::FakeProvider,
+    }
+
+    impl super::super::agent_runtime::ProviderSource for TwoProviders {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            match provider_id {
+                "claude-code" => Some(Arc::new(self.claude.clone())),
+                "acp" => Some(Arc::new(self.acp.clone())),
+                _ => None,
+            }
+        }
+    }
+
+    /// A signed agent manager with two fake providers (`claude-code` and `acp`).
+    fn two_provider_manager() -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+        super::super::agent_runtime::fake::FakeProvider,
+    ) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        config.jwt_secret = Some(SIGNING_SECRET.into());
+        let claude = super::super::agent_runtime::fake::FakeProvider::new();
+        let acp = super::super::agent_runtime::fake::FakeProvider::new();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(TwoProviders {
+                claude: claude.clone(),
+                acp: acp.clone(),
+            }));
+        (manager, graph, claude, acp)
+    }
+
+    /// Opens a session on `claude-code` and runs its first turn to completion.
+    async fn first_turn_on_claude(
+        manager: &ChatManager,
+        claude: &super::super::agent_runtime::fake::FakeProvider,
+    ) -> String {
+        use nexus_claude::agent::AgentEvent;
+        let mut req = agent_request("hi there");
+        req.provider = Some("claude-code".into());
+        req.project_slug = Some("proj".into());
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        claude.state.push(AgentEvent::Text {
+            text: "hello".into(),
+            seq: None,
+            parent: None,
+        });
+        claude.state.push(done_event(false, None));
+        let _ = next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        claude.state.end_turn();
+        sid
+    }
+
+    /// B-SW phase 1: moving a conversation re-targets the SAME `session_id` instead of
+    /// opening a new one. The node's provider is updated, the old provider process is
+    /// closed, and the target provider sees the relayed history in front of the message.
+    #[tokio::test]
+    async fn an_in_place_switch_keeps_the_session_id_and_updates_the_provider() {
+        let (manager, graph, claude, acp) = two_provider_manager();
+        consented_acp_instance(&graph, "acp", "proj").await;
+        let sid = first_turn_on_claude(&manager, &claude).await;
+
+        let before = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 5_000)
+            .await
+            .unwrap();
+        assert!(
+            !before.is_empty(),
+            "the first turn is stored before the switch"
+        );
+
+        let moved = manager
+            .switch_session_provider(&sid, "acp", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        assert_eq!(moved.previous_session_id, sid);
+        assert!(
+            moved.relayed_entries >= 2,
+            "the relay carried the first turn"
+        );
+
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("acp"));
+        assert_eq!(node.routed_by.as_deref(), Some("request"));
+
+        // The old provider process was closed; the target saw the relay then the message.
+        assert!(claude
+            .state
+            .closed
+            .load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let started = acp.state.turns_started.lock().unwrap();
+            assert_eq!(started.len(), 1, "{started:?}");
+            assert!(started[0].contains("<conversation_relay"), "{}", started[0]);
+            assert!(started[0].contains("second question"), "{}", started[0]);
+        }
+
+        // No new session was opened: the events keep growing on the SAME thread.
+        let after = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 5_000)
+            .await
+            .unwrap();
+        assert!(
+            after.len() > before.len(),
+            "the thread grew by the new turn only"
+        );
+        assert_eq!(
+            graph.chat_sessions.read().await.len(),
+            1,
+            "no new session node was opened"
+        );
+    }
+
+    /// A refused in-place switch (the target's project never consented) leaves the old
+    /// session EXACTLY as it was: the consent check runs before the process is closed, so
+    /// the process stays live and the resume token (and every other cleared field) survives.
+    #[tokio::test]
+    async fn an_in_place_switch_refused_by_consent_leaves_the_old_session_untouched() {
+        let (manager, graph, claude, _acp) = two_provider_manager();
+        // No consent for `acp`: the refusal is detected in the pre-flight check, before any
+        // teardown.
+        let sid = first_turn_on_claude(&manager, &claude).await;
+        let before = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        // The first turn named a provider session, so there is a resume token to survive.
+        assert!(
+            before.resume_token.is_some(),
+            "the session has a resume token to survive a refusal"
+        );
+
+        let result = manager
+            .switch_session_provider(&sid, "acp", None, "second question", None)
+            .await;
+        assert!(result.is_err(), "a non-consented target is refused");
+
+        // The old process was never closed.
+        assert!(
+            !claude
+                .state
+                .closed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a refused move must not tear the old process down"
+        );
+        // The node was never touched: provider, model AND the provider-specific fields all
+        // survived.
+        let after = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.provider_id.as_deref(),
+            before.provider_id.as_deref(),
+            "the provider is unchanged"
+        );
+        assert_eq!(after.model, before.model, "the model is unchanged");
+        assert_eq!(
+            after.resume_token, before.resume_token,
+            "the resume token survives a refusal"
+        );
+        assert_eq!(
+            after.capabilities, before.capabilities,
+            "the capabilities survive a refusal"
+        );
+        assert_eq!(
+            after.cli_session_id, before.cli_session_id,
+            "the cli_session_id survives a refusal"
+        );
+        assert_eq!(after.engine, before.engine, "the engine survives a refusal");
+    }
+
+    /// A consented switch whose target fails to OPEN (after the consent check passed, so the
+    /// node was retargeted and the old process closed) rolls back EVERY cleared field — model,
+    /// resume_token, capabilities, cli_session_id, engine — so a later resume finds the old
+    /// session, provider and model again.
+    #[tokio::test]
+    async fn an_in_place_switch_whose_target_fails_to_open_rolls_back_every_cleared_field() {
+        let (manager, graph, claude, acp) = two_provider_manager();
+        consented_acp_instance(&graph, "acp", "proj").await;
+        let sid = first_turn_on_claude(&manager, &claude).await;
+        let before = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The target consents, but its open fails: the re-target is rolled back in full.
+        *acp.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::unsupported(
+            "open_refused",
+        ));
+
+        let result = manager
+            .switch_session_provider(&sid, "acp", None, "second question", None)
+            .await;
+        assert!(result.is_err(), "a failing target open refuses the move");
+
+        let after = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.provider_id.as_deref(),
+            before.provider_id.as_deref(),
+            "the provider rolled back"
+        );
+        assert_eq!(after.model, before.model, "the model rolled back");
+        assert_eq!(
+            after.resume_token, before.resume_token,
+            "the resume token rolled back"
+        );
+        assert_eq!(
+            after.capabilities, before.capabilities,
+            "the capabilities rolled back"
+        );
+        assert_eq!(
+            after.cli_session_id, before.cli_session_id,
+            "the cli_session_id rolled back"
+        );
+        assert_eq!(after.engine, before.engine, "the engine rolled back");
+    }
+
+    /// The graph method re-targets a node in place and clears the provider-specific fields
+    /// that do not survive a move across provider families.
+    #[tokio::test]
+    async fn update_chat_session_provider_retargets_and_clears_provider_state() {
+        let (_manager, graph) = manager_with_mock();
+        let mut session = test_chat_session(None);
+        session.provider_id = Some("claude-code".into());
+        session.model = "old-model".into();
+        session.resume_token = Some("resume".into());
+        session.capabilities = Some("{}".into());
+        session.cli_session_id = Some("cli-1".into());
+        session.engine = Some("legacy".into());
+        graph.create_chat_session(&session).await.unwrap();
+
+        let ok = graph
+            .update_chat_session_provider(session.id, "acp", "new-model", "request", "agent")
+            .await
+            .unwrap();
+        assert!(ok);
+        let node = graph.get_chat_session(session.id).await.unwrap().unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("acp"));
+        assert_eq!(node.model, "new-model");
+        assert_eq!(node.routed_by.as_deref(), Some("request"));
+        assert_eq!(node.resume_token, None);
+        assert_eq!(node.capabilities, None);
+        assert_eq!(node.cli_session_id, None);
+        assert_eq!(node.engine.as_deref(), Some("agent"));
+
+        // A missing session is a clean `false`.
+        assert!(!graph
+            .update_chat_session_provider(Uuid::new_v4(), "acp", "m", "request", "agent")
+            .await
+            .unwrap());
     }
 
     async fn open_on(
@@ -23373,6 +23968,7 @@ mod tests {
             permission_mode: None,
             message: "hello",
             next_turn: 0,
+            segments: None,
             owner: None,
         };
         // The opening that will fail: its router, its token.

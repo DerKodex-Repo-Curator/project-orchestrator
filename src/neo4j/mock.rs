@@ -8059,6 +8059,51 @@ impl GraphStore for MockGraphStore {
         Ok(true)
     }
 
+    async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+        engine: &str,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        session.provider_id = Some(provider_id.to_owned());
+        session.model = model.to_owned();
+        session.routed_by = Some(routed_by.to_owned());
+        // Providers do not share a session format: a resume token is refused across
+        // families, so the provider-specific fields are cleared (as the Neo4j store does).
+        session.resume_token = None;
+        session.capabilities = None;
+        session.cli_session_id = None;
+        session.engine = Some(engine.to_owned());
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&node.id) else {
+            return Ok(false);
+        };
+        session.provider_id = Some(provider_id.to_owned());
+        session.model = node.model.clone();
+        session.routed_by = node.routed_by.clone();
+        session.resume_token = node.resume_token.clone();
+        session.capabilities = node.capabilities.clone();
+        session.cli_session_id = node.cli_session_id.clone();
+        session.engine = node.engine.clone();
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
     async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
         loop {
             let released = self.llm_setting_writes_released.notified();

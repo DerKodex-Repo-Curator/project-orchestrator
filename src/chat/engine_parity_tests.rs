@@ -219,7 +219,7 @@ const FUNCTIONS: &[(&str, &str)] = &[
     ),
     (
         "provider_switch.relay",
-        "la bascule vers ce moteur relaie la conversation sur le fil (conversation_relayed)",
+        "la bascule vers ce moteur relaie la conversation sur le même fil (provider_switched)",
     ),
     (
         "images",
@@ -2899,6 +2899,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         .await
         .unwrap_or_else(|e| panic!("switching to the native instance: {e:#}"));
     let nid = switched.session_id.clone();
+    assert_eq!(nid, sid, "the SAME thread continues in place");
     assert!(
         manager.agent_runtime.owns(&nid).await,
         "native: agent engine"
@@ -2911,8 +2912,17 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     let relayed = wait_body(&fake, "SWITCH-ONE").await.unwrap_or_default();
     let on_wire = wn
         .wait(WAIT, |e| {
-            matches!(e, ChatEvent::ConversationRelayed { from_provider, to_provider, .. }
-                if from_provider == "claude-code" && to_provider == "local")
+            matches!(
+                e,
+                ChatEvent::ProviderSwitched {
+                    session_id,
+                    from_provider,
+                    to_provider,
+                    ..
+                } if session_id.as_str() == nid.as_str()
+                    && from_provider == "claude-code"
+                    && to_provider == "local"
+            )
         })
         .await;
     let history = relayed.contains("<conversation_relay") && relayed.contains("answered one");
@@ -2920,7 +2930,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         "provider_switch.relay",
         history && on_wire,
         Cause::Harness,
-        format!("historique relayé au modèle={history}, conversation_relayed={on_wire}"),
+        format!("historique relayé au modèle={history}, provider_switched={on_wire}"),
     );
     assert!(
         wn.said(WAIT, "answered switch one").await,
@@ -3681,6 +3691,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         .switch_session_provider(&nid, "claude-code", None, "SWITCH-TWO: and back", None)
         .await
         .unwrap_or_else(|e| panic!("switching back to Claude Code: {e:#}"));
+    assert_eq!(back.session_id, nid, "the SAME thread continues in place");
     let wb = Watch::start(
         stage.graph.clone(),
         &back.session_id,
@@ -3692,8 +3703,17 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         .unwrap_or_default();
     let on_wire = wb
         .wait(WAIT, |e| {
-            matches!(e, ChatEvent::ConversationRelayed { from_provider, to_provider, .. }
-                if from_provider == "local" && to_provider == "claude-code")
+            matches!(
+                e,
+                ChatEvent::ProviderSwitched {
+                    session_id,
+                    from_provider,
+                    to_provider,
+                    ..
+                } if session_id.as_str() == back.session_id.as_str()
+                    && from_provider == "local"
+                    && to_provider == "claude-code"
+            )
         })
         .await;
     let history = line.contains("<conversation_relay") && line.contains("answered compact");
@@ -3701,7 +3721,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         "provider_switch.relay",
         history && on_wire,
         Cause::Harness,
-        format!("historique relayé au CLI={history}, conversation_relayed={on_wire}"),
+        format!("historique relayé au CLI={history}, provider_switched={on_wire}"),
     );
     wb.said(WAIT, "answered switch two").await;
     let _ = manager.close_session(&back.session_id).await;

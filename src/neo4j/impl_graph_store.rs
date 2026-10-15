@@ -2511,6 +2511,26 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+        engine: &str,
+    ) -> anyhow::Result<bool> {
+        self.update_chat_session_provider(id, provider_id, model, routed_by, engine)
+            .await
+    }
+
+    async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.restore_chat_session_provider(node, provider_id).await
+    }
+
     async fn get_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<Option<String>> {
         self.get_llm_setting(scope, key).await
     }

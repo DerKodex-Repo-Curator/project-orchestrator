@@ -3379,6 +3379,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    segments: None,
                     owner: None,
                 },
             )
@@ -3427,6 +3428,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    segments: None,
                     owner: None,
                 },
             )
@@ -3510,6 +3512,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    segments: None,
                     owner: None,
                 },
             )
@@ -3818,6 +3821,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    segments: None,
                     owner: None,
                 },
             )
@@ -3995,7 +3999,7 @@ mod provider_switch {
             .switch_session_provider(&old, "local2", None, "second question", None)
             .await
             .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
-        assert_ne!(moved.session_id, old);
+        assert_eq!(moved.session_id, old, "the SAME thread continues in place");
         assert_eq!(moved.previous_session_id, old);
         assert!(
             moved.relayed_entries >= 2,
@@ -4038,24 +4042,26 @@ mod provider_switch {
             "the relay comes first"
         );
 
-        // The conversation shows the user's words only: the relay is not a message.
+        // The conversation shows the user's words only: the relay is not a message. In the
+        // in-place flow the SAME thread already holds the pre-move "hi there", so the user's
+        // new words are the user_message that carries them, not the first one.
         let stored = stored_until(&w, &moved.session_id, |events| {
             events.iter().any(|e| e.event_type == "user_message")
         })
         .await;
-        let first_user = stored
+        let moved_user = stored
             .iter()
-            .find(|e| e.event_type == "user_message")
-            .unwrap();
-        assert!(first_user.data.contains("second question"));
+            .filter(|e| e.event_type == "user_message")
+            .find(|e| e.data.contains("second question"))
+            .expect("the moved turn's user message");
         assert!(
-            !first_user.data.contains("conversation_relay"),
+            !moved_user.data.contains("conversation_relay"),
             "the relay must not be stored as the user's message: {}",
-            first_user.data
+            moved_user.data
         );
 
-        // The old session is closed and the handoff is traceable.
-        assert!(!w.manager.is_session_active(&old).await);
+        // The SAME session stays live (in place) and the handoff is traceable.
+        assert!(w.manager.is_session_active(&old).await);
         let note = w
             .graph
             .get_llm_setting(&format!("handoff:{}", moved.session_id), "note")
@@ -4240,10 +4246,12 @@ mod provider_switch {
             .collect()
     }
 
-    fn relayed_of(events: &[ChatEvent]) -> Vec<&ChatEvent> {
+    /// The events stating a provider move. A move is now in place (same thread), so it is
+    /// stated with [`ChatEvent::ProviderSwitched`] — never a new-session relay.
+    fn switched_of(events: &[ChatEvent]) -> Vec<&ChatEvent> {
         events
             .iter()
-            .filter(|e| matches!(e, ChatEvent::ConversationRelayed { .. }))
+            .filter(|e| matches!(e, ChatEvent::ProviderSwitched { .. }))
             .collect()
     }
 
@@ -4310,22 +4318,29 @@ mod provider_switch {
             first_decision.outcome.is_none(),
             "open while the session runs"
         );
-        let mut old_rx = w.manager.subscribe(&cc1).await.unwrap();
-
-        // 2. Claude Code → native: the target answers knowing the history.
+        // 2. Claude Code → native: the SAME thread is re-targeted in place, and the target
+        // answers knowing the history.
         let moved = w
             .manager
             .switch_session_provider(&cc1, "local", None, "second question", None)
             .await
             .unwrap_or_else(|err| panic!("switch to local failed: {err:#}"));
-        let native = moved.session_id.clone();
+        assert_eq!(
+            moved.session_id, cc1,
+            "the move re-targets the SAME thread in place"
+        );
+        assert_eq!(moved.previous_session_id, cc1);
         assert_eq!((moved.relayed_entries, moved.omitted_entries), (2, 0));
         assert_eq!(moved.conversation_id.as_deref(), Some("conv-kept"));
         assert!(
-            w.manager.agent_runtime.owns(&native).await,
-            "native: agent engine"
+            w.manager.agent_runtime.owns(&cc1).await,
+            "native: agent engine, same session"
         );
-        stored_until(&w, &native, |events| {
+        assert!(
+            w.manager.is_session_active(&cc1).await,
+            "the SAME session stays live across the switch"
+        );
+        stored_until(&w, &cc1, |events| {
             events
                 .iter()
                 .any(|ev| ev.event_type == "assistant_text" && ev.data.contains("the answer"))
@@ -4346,60 +4361,21 @@ mod provider_switch {
             body.contains("hi there") && body.contains(CLAUDE_ANSWER),
             "{body}"
         );
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&cc1).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.provider_id.as_deref(),
+            Some("local"),
+            "the node was re-targeted in place"
+        );
+        assert_eq!(node.conversation_id.as_deref(), Some("conv-kept"));
 
-        // The thread it left says where it went, then closes; the thread it reached
-        // says what was relayed, before the user's message.
-        let on_old = next_event(&mut old_rx, |ev| {
-            matches!(ev, ChatEvent::ConversationRelayed { .. })
-        })
-        .await;
-        let as_json = |ev: &ChatEvent| serde_json::to_value(ev).unwrap();
-        assert_eq!(
-            as_json(&on_old),
-            as_json(&ChatEvent::ConversationRelayed {
-                from_session_id: cc1.clone(),
-                to_session_id: native.clone(),
-                from_provider: "claude-code".into(),
-                to_provider: "local".into(),
-                relayed_entries: 2,
-                omitted_entries: 0,
-                moved_by: "user".into(),
-                conversation_id: Some("conv-kept".into()),
-            })
-        );
-        next_event(&mut old_rx, |ev| {
-            matches!(ev, ChatEvent::SessionClosed { .. })
-        })
-        .await;
-        assert!(
-            !w.manager.is_session_active(&cc1).await,
-            "the old session is closed"
-        );
-        assert_eq!(
-            relayed_of(&stored_events(&w, &cc1).await).len(),
-            1,
-            "stored on the old thread"
-        );
-        let new_thread = stored_events(&w, &native).await;
-        let relay_at = new_thread
-            .iter()
-            .position(|ev| matches!(ev, ChatEvent::ConversationRelayed { .. }))
-            .expect("stated on the new thread");
-        let message_at = new_thread
-            .iter()
-            .position(|ev| matches!(ev, ChatEvent::UserMessage { content } if content == "second question"))
-            .expect("the user's message");
-        assert!(
-            relay_at < message_at,
-            "the relay is stated before the message"
-        );
-        assert_eq!(
-            as_json(&new_thread[relay_at]),
-            as_json(&on_old),
-            "both threads carry the same statement"
-        );
-
-        // The routing decision of the session that closed is closed too.
+        // The routing decision of the session is closed by the switch (the move was its
+        // outcome), as on the legacy close path.
         assert!(w.manager.open_decisions.lock().unwrap().get(&cc1).is_none());
         let closed = decision_of(&w, &cc1).await.unwrap();
         assert!(
@@ -4407,22 +4383,35 @@ mod provider_switch {
             "closed with what the session saw: {closed:?}"
         );
 
-        // 3. Native → Claude Code: back, with everything so far.
+        // 3. Native → Claude Code: back, with everything so far, still on the SAME thread.
         let back = w
             .manager
-            .switch_session_provider(&native, "claude-code", None, "third question", None)
+            .switch_session_provider(&cc1, "claude-code", None, "third question", None)
             .await
             .unwrap_or_else(|err| panic!("switch back to claude-code failed: {err:#}"));
-        let cc2 = back.session_id.clone();
-        assert_eq!(back.previous_session_id, native);
+        assert_eq!(
+            back.session_id, cc1,
+            "the back-switch stays on the SAME thread"
+        );
+        assert_eq!(back.previous_session_id, cc1);
+        // In the in-place flow the SAME thread holds every entry — the two earlier ones and
+        // the two native turns — so the back-switch relays all four (the fresh CLI needs the
+        // whole conversation), not just the native session's own two.
         assert_eq!(
             (back.relayed_entries, back.omitted_entries),
-            (2, 0),
-            "the native session's own two entries (the relay it was given is not a message)"
+            (4, 0),
+            "the whole thread relays, on the SAME thread"
         );
         assert_eq!(back.conversation_id.as_deref(), Some("conv-kept"));
-        stored_until(&w, &cc2, |events| {
-            events.iter().any(|ev| ev.event_type == "result")
+        // The SAME thread already holds step 1's Claude answer: wait for the reopened CLI to
+        // answer "third question" (a second Claude answer on the thread), so the CLI has then
+        // read the relayed message in front of it.
+        stored_until(&w, &cc1, |events| {
+            events
+                .iter()
+                .filter(|ev| ev.event_type == "assistant_text" && ev.data.contains(CLAUDE_ANSWER))
+                .count()
+                >= 2
         })
         .await;
         let third = cli_line_with(&cli, "third question");
@@ -4435,32 +4424,23 @@ mod provider_switch {
             "the native turn is in the relay: {third}"
         );
         assert!(
-            !w.manager.agent_runtime.owns(&native).await,
-            "the native session is closed"
+            !w.manager.agent_runtime.owns(&cc1).await,
+            "back on the legacy engine, same session"
         );
-        assert!(w.manager.is_session_active(&cc2).await);
-        let cc2_thread = stored_events(&w, &cc2).await;
-        assert!(
-            matches!(relayed_of(&cc2_thread).as_slice(),
-                [ChatEvent::ConversationRelayed { from_provider, to_provider, .. }]
-                    if from_provider == "local" && to_provider == "claude-code"),
-            "{cc2_thread:?}"
+        assert!(w.manager.is_session_active(&cc1).await);
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&cc1).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.conversation_id.as_deref(), Some("conv-kept"));
+        assert_eq!(
+            node.routed_by.as_deref(),
+            Some("request"),
+            "the user chose: explicit"
         );
-        for id in [&native, &cc2] {
-            let node = w
-                .graph
-                .get_chat_session(Uuid::parse_str(id).unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(node.conversation_id.as_deref(), Some("conv-kept"), "{id}");
-            assert_eq!(
-                node.routed_by.as_deref(),
-                Some("request"),
-                "the user chose: explicit"
-            );
-        }
-        w.manager.close_session(&cc2).await.unwrap();
+        w.manager.close_session(&cc1).await.unwrap();
     }
 
     #[tokio::test]
@@ -4492,7 +4472,7 @@ mod provider_switch {
             "the conversation stays"
         );
         assert!(
-            relayed_of(&stored_events(&w, &cc1).await).is_empty(),
+            switched_of(&stored_events(&w, &cc1).await).is_empty(),
             "nothing stated"
         );
         assert!(
@@ -4537,6 +4517,11 @@ mod provider_switch {
             .switch_session_provider(&old.to_string(), "local", None, "second question", None)
             .await
             .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        assert_eq!(
+            moved.session_id,
+            old.to_string(),
+            "the switch re-targets the SAME thread in place"
+        );
         assert!(moved.omitted_entries > 0, "{moved:?}");
         assert!(moved.relayed_entries > 0, "{moved:?}");
         assert_eq!(moved.relayed_entries + moved.omitted_entries, 80);
@@ -4568,24 +4553,27 @@ mod provider_switch {
             relay_chars <= 51_200 + 1_000,
             "the relay is bounded by the window: {relay_chars} chars"
         );
-        // The thread says how much was left out: never a silent truncation.
+        // The SAME thread states the switch and how much was left out: a bounded relay is
+        // never a silent truncation.
         let stated = stored_events(&w, &moved.session_id).await;
-        match relayed_of(&stated).as_slice() {
-            [ChatEvent::ConversationRelayed {
+        match stated
+            .iter()
+            .filter(|e| matches!(e, ChatEvent::ProviderSwitched { .. }))
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [ChatEvent::ProviderSwitched {
+                session_id,
                 relayed_entries,
                 omitted_entries,
                 ..
             }] => {
-                assert_eq!(*relayed_entries, moved.relayed_entries);
-                assert_eq!(*omitted_entries, moved.omitted_entries);
+                assert_eq!(session_id, &moved.session_id);
+                assert_eq!(*relayed_entries, Some(moved.relayed_entries as u64));
+                assert_eq!(*omitted_entries, Some(moved.omitted_entries as u64));
             }
-            other => panic!("one statement expected: {other:?}"),
+            other => panic!("one provider_switched statement expected: {other:?}"),
         }
-        // Stated on the thread it left as well, even though it was not live.
-        assert_eq!(
-            relayed_of(&stored_events(&w, &old.to_string()).await).len(),
-            1
-        );
     }
 
     // ── The router moves a conversation (P1c): mode `full`, stage `auto` ──
@@ -4805,7 +4793,7 @@ mod provider_switch {
         /// Sends `text` to a session that stays, and waits for its answer there.
         async fn answered_in_place(w: &World, session_id: &str, text: &str) {
             let answers_before = answers_on(&stored_events(w, session_id).await);
-            let relayed_before = relayed_of(&stored_events(w, session_id).await).len();
+            let switched_before = switched_of(&stored_events(w, session_id).await).len();
             w.manager.send_message(session_id, text).await.unwrap();
             stored_until(w, session_id, |records| {
                 records
@@ -4820,10 +4808,25 @@ mod provider_switch {
                 "the conversation stays"
             );
             assert_eq!(
-                relayed_of(&stored_events(w, session_id).await).len(),
-                relayed_before,
+                switched_of(&stored_events(w, session_id).await).len(),
+                switched_before,
                 "no move stated"
             );
+        }
+
+        /// Waits for the in-place move to be stated on the SAME thread and returns the
+        /// `ProviderSwitched` event. The in-place switch replaces the live broadcast channel,
+        /// so a subscription taken before `send_message` would observe `RecvError::Closed`;
+        /// the stored thread the session keeps is the reliable view.
+        async fn switched_in_place(w: &World, session_id: &str) -> ChatEvent {
+            stored_until(w, session_id, |records| {
+                records.iter().any(|r| r.event_type == "provider_switched")
+            })
+            .await;
+            let stated = stored_events(w, session_id).await;
+            let switched = switched_of(&stated);
+            assert_eq!(switched.len(), 1, "exactly one move stated: {stated:?}");
+            switched[0].clone()
         }
 
         #[tokio::test]
@@ -4833,38 +4836,33 @@ mod provider_switch {
             let old = first_turn(&w).await;
             hand_back_to_po(&w, &old).await;
             idle(&w, &old).await;
-            let mut old_rx = w.manager.subscribe(&old).await.unwrap();
 
             w.manager
                 .send_message(&old, "second question")
                 .await
                 .unwrap();
 
-            let on_old = next_event(&mut old_rx, |e| {
-                matches!(e, ChatEvent::ConversationRelayed { .. })
-            })
-            .await;
-            let ChatEvent::ConversationRelayed {
-                from_session_id,
-                to_session_id,
+            let on_old = switched_in_place(&w, &old).await;
+            let ChatEvent::ProviderSwitched {
+                session_id,
                 from_provider,
                 to_provider,
-                moved_by,
                 ..
             } = on_old.clone()
             else {
                 unreachable!()
             };
-            assert_eq!(moved_by, "auto");
             assert_eq!(
                 (from_provider.as_str(), to_provider.as_str()),
                 ("local", "local2")
             );
-            assert_eq!(from_session_id, old);
-            let new = to_session_id;
+            assert_eq!(
+                session_id, old,
+                "the move re-targets the SAME thread in place"
+            );
 
             // Answered by the new provider, sent ONCE, with the history relayed in front.
-            stored_until(&w, &new, |records| {
+            stored_until(&w, &old, |records| {
                 records
                     .iter()
                     .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
@@ -4877,26 +4875,22 @@ mod provider_switch {
                 "{}",
                 sent[0]
             );
-            // The old session started no turn of its own and is closed.
-            assert!(!w.manager.is_session_active(&old).await);
+            // The SAME session stays live across the move: the turn ran on the new provider
+            // only, on the thread it already owned.
             assert!(
-                !stored_events(&w, &old).await.iter().any(
-                    |e| matches!(e, ChatEvent::UserMessage { content } if content == "second question")
-                ),
-                "the old thread never got the message"
+                w.manager.is_session_active(&old).await,
+                "the SAME session stays live across the move"
             );
-            // Both threads carry the same statement, `moved_by: auto`.
+            // The SAME thread carries the statement, exactly once.
             let as_json = |ev: &ChatEvent| serde_json::to_value(ev).unwrap();
-            for thread in [&old, &new] {
-                let stated = stored_events(&w, thread).await;
-                let relayed = relayed_of(&stated);
-                assert_eq!(relayed.len(), 1, "{thread}");
-                assert_eq!(as_json(relayed[0]), as_json(&on_old), "{thread}");
-            }
+            let stated = stored_events(&w, &old).await;
+            let switched = switched_of(&stated);
+            assert_eq!(switched.len(), 1);
+            assert_eq!(as_json(switched[0]), as_json(&on_old));
             // Nobody imposed the target: the router goes on choosing there.
             let node = w
                 .graph
-                .get_chat_session(Uuid::parse_str(&new).unwrap())
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
                 .await
                 .unwrap()
                 .unwrap();
@@ -4915,33 +4909,31 @@ mod provider_switch {
             let old = first_turn(&w).await;
             hand_back_to_po(&w, &old).await;
             idle(&w, &old).await;
-            let mut old_rx = w.manager.subscribe(&old).await.unwrap();
             w.manager
                 .send_message(&old, "second question")
                 .await
                 .unwrap();
-            let ChatEvent::ConversationRelayed {
-                to_session_id: new, ..
-            } = next_event(&mut old_rx, |e| {
-                matches!(e, ChatEvent::ConversationRelayed { .. })
-            })
-            .await
+            let ChatEvent::ProviderSwitched { session_id, .. } = switched_in_place(&w, &old).await
             else {
                 unreachable!()
             };
-            stored_until(&w, &new, |records| {
+            assert_eq!(
+                session_id, old,
+                "the move re-targets the SAME thread in place"
+            );
+            stored_until(&w, &old, |records| {
                 records
                     .iter()
                     .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
             })
             .await;
-            idle(&w, &new).await;
+            idle(&w, &old).await;
 
             // The router now prefers the way back: right after a move, no second move (R-S3):
             // the turn is decided among the models of the provider it moved to.
-            answered_in_place(&w, &new, "second question, again").await;
+            answered_in_place(&w, &old, "second question, again").await;
             assert_eq!(
-                relayed_of(&stored_events(&w, &new).await).len(),
+                switched_of(&stored_events(&w, &old).await).len(),
                 1,
                 "the move in only"
             );
@@ -5000,15 +4992,11 @@ mod provider_switch {
             let old = first_turn(&w).await;
             hand_back_to_po(&w, &old).await;
             idle(&w, &old).await;
-            let mut old_rx = w.manager.subscribe(&old).await.unwrap();
             w.manager
                 .send_message(&old, "second question")
                 .await
                 .unwrap();
-            next_event(&mut old_rx, |e| {
-                matches!(e, ChatEvent::ConversationRelayed { .. })
-            })
-            .await;
+            switched_in_place(&w, &old).await;
             let checks = mover.checks();
             assert_eq!(checks.len(), 1);
             assert_eq!(checks[0].settings.stage, LearningStage::Auto);
@@ -5062,30 +5050,29 @@ mod provider_switch {
             }
         }
 
-        /// Sends `text` and waits for the conversation to move; returns the new session.
-        async fn moved_by_auto(w: &World, old: &str, text: &str) -> (String, String) {
-            let mut old_rx = w.manager.subscribe(old).await.unwrap();
+        /// Sends `text` and waits for the conversation to move in place (same session);
+        /// returns the provider it moved to.
+        async fn moved_by_auto(w: &World, old: &str, text: &str) -> String {
             w.manager.send_message(old, text).await.unwrap();
-            let ChatEvent::ConversationRelayed {
-                to_session_id,
+            let ChatEvent::ProviderSwitched {
+                session_id,
                 to_provider,
-                moved_by,
                 ..
-            } = next_event(&mut old_rx, |e| {
-                matches!(e, ChatEvent::ConversationRelayed { .. })
-            })
-            .await
+            } = switched_in_place(w, old).await
             else {
                 unreachable!()
             };
-            assert_eq!(moved_by, "auto");
-            stored_until(w, &to_session_id, |records| {
+            assert_eq!(
+                session_id, old,
+                "the move re-targets the SAME thread in place"
+            );
+            stored_until(w, old, |records| {
                 records
                     .iter()
                     .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
             })
             .await;
-            (to_session_id, to_provider)
+            to_provider
         }
 
         // ── AUTO-L: the person's "models Auto may use" ───────────────────────────────
@@ -5132,7 +5119,7 @@ mod provider_switch {
             let old = first_turn_of(&w, "alice").await;
             hand_back_to_po(&w, &old).await;
             idle(&w, &old).await;
-            let (new, provider) = moved_by_auto(&w, &old, "second question").await;
+            let provider = moved_by_auto(&w, &old, "second question").await;
             assert_eq!(provider, "local2");
             let checks = mover.checks();
             assert!(checks[0].pool.iter().all(|f| f.provider_id == "local2"));
@@ -5140,7 +5127,7 @@ mod provider_switch {
             // The conversation stays alice's across the move (her list goes on applying).
             let node = w
                 .graph
-                .get_chat_session(Uuid::parse_str(&new).unwrap())
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
                 .await
                 .unwrap()
                 .unwrap();
@@ -5227,45 +5214,46 @@ mod provider_switch {
             .await;
             idle(&w, &cc1).await;
             hand_back_to_po(&w, &cc1).await;
-            let mut old_rx = w.manager.subscribe(&cc1).await.unwrap();
 
             w.manager
                 .send_message(&cc1, "second question")
                 .await
                 .unwrap();
 
-            let ChatEvent::ConversationRelayed {
-                to_session_id: native,
-                moved_by,
+            let ChatEvent::ProviderSwitched {
+                session_id,
                 from_provider,
                 to_provider,
                 ..
-            } = next_event(&mut old_rx, |e| {
-                matches!(e, ChatEvent::ConversationRelayed { .. })
-            })
-            .await
+            } = switched_in_place(&w, &cc1).await
             else {
                 unreachable!()
             };
-            assert_eq!(moved_by, "auto");
+            assert_eq!(
+                session_id, cc1,
+                "the move re-targets the SAME thread in place"
+            );
             assert_eq!(
                 (from_provider.as_str(), to_provider.as_str()),
                 ("claude-code", "local")
             );
-            stored_until(&w, &native, |records| {
+            stored_until(&w, &cc1, |records| {
                 records
                     .iter()
                     .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
             })
             .await;
-            assert!(!w.manager.is_session_active(&cc1).await);
+            assert!(
+                w.manager.is_session_active(&cc1).await,
+                "the SAME session stays live across the move"
+            );
             assert!(
                 !cli.stdin().contains("second question"),
                 "the CLI never got the turn: {}",
                 cli.stdin()
             );
             assert_eq!(mover.checks().len(), 1);
-            w.manager.close_session(&native).await.ok();
+            w.manager.close_session(&cc1).await.ok();
         }
     }
 }

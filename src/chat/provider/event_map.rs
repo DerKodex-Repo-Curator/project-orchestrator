@@ -1712,4 +1712,61 @@ mod tests {
         };
         assert!(mapper.map(&notice).is_empty());
     }
+
+    /// A reopened session on a new provider must still map the provider's own
+    /// `SessionStarted` → `system_init` and `ModelChanged` → `model_changed`
+    /// identically: those two mappings are what the frontend uses to render the
+    /// "now on provider X / model Y" notice on the same thread after an in-place
+    /// switch. Pin them so the switch path cannot drift the mapping.
+    #[test]
+    fn a_reopened_session_on_a_new_provider_maps_system_init_and_model_changed_identically() {
+        let mut mapper = EventMapper::new();
+        let started = AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("example-model-large".into()),
+            policy_mode: None,
+            native_mode: Some("acceptEdits".into()),
+            tools: vec!["Bash".into()],
+            mcp_servers: vec![],
+            cwd: None,
+        };
+        let init = mapper.map(&started);
+        let [ChatEvent::SystemInit {
+            cli_session_id,
+            model,
+            tools,
+            mcp_servers,
+            permission_mode,
+            provider,
+            capabilities,
+            tool_policy,
+            policy_mode,
+            engine,
+            degraded_features,
+        }] = init.as_slice()
+        else {
+            panic!("SessionStarted maps to one system_init: {init:?}");
+        };
+        assert_eq!(cli_session_id, "p1");
+        assert_eq!(model.as_deref(), Some("example-model-large"));
+        assert_eq!(tools, &vec!["Bash".to_string()]);
+        assert!(mcp_servers.is_empty());
+        // The native mode is preferred for the wire `permission_mode`.
+        assert_eq!(permission_mode.as_deref(), Some("acceptEdits"));
+        assert!(provider.is_none());
+        assert!(capabilities.is_none());
+        assert!(tool_policy.is_none());
+        assert!(policy_mode.is_none());
+        assert!(engine.is_none());
+        assert!(degraded_features.is_none());
+
+        let changed = AgentEvent::ModelChanged {
+            model: "example-model-large".into(),
+        };
+        let mapped = mapper.map(&changed);
+        let [ChatEvent::ModelChanged { model }] = mapped.as_slice() else {
+            panic!("ModelChanged maps to one model_changed: {mapped:?}");
+        };
+        assert_eq!(model, "example-model-large");
+    }
 }

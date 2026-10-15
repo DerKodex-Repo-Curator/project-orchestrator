@@ -391,6 +391,14 @@ pub(crate) struct TurnRouter {
     /// harness relaxes the R-S3 "no two provider moves in a row" guard, while a harness
     /// boundary is an explicit provider change (which keeps that guard).
     segmenter: Mutex<Segmenter>,
+    /// The segmenter's own turn base, decoupled from the harness's `ctx.turn_index` (which
+    /// resets to 0 on a provider move). It is the turn id the segmenter assigns to the
+    /// harness's turn 0: `0` on a fresh conversation (the harness's index IS the segmenter's),
+    /// and the carried snapshot's `last_turn` after a move. [`TurnRouter::observe_turn`]
+    /// feeds the harness's turn shifted by this base, so observations stay strictly
+    /// increasing across a move — the segmenter keeps its ids/`PRECEDES` stable and never
+    /// sees `OutOfOrder`.
+    segment_turn: Mutex<u32>,
     /// Where the confirmed boundaries (and the segment snapshot) are persisted, when a
     /// graph-backed store is attached (`CognitiveRouting.segment_store`). `None` keeps them
     /// in the segmenter only (the in-memory default). Writes are best-effort and
@@ -462,9 +470,24 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The last turn a snapshot segmented, if any: the max of every segment's `last_turn` and
+/// every boundary's `at_turn`, the same notion [`Segmenter::resume`] restores as its own
+/// `last_turn`. `None` when the snapshot is empty (nothing to continue from).
+fn snapshot_last_turn(snapshot: &SegmentsSnapshot) -> Option<u32> {
+    snapshot
+        .segments
+        .iter()
+        .map(|segment| segment.last_turn)
+        .chain(snapshot.boundaries.iter().map(|boundary| boundary.at_turn))
+        .max()
+}
+
 impl TurnRouter {
     pub(crate) fn new(spec: TurnRouterSpec) -> Self {
-        // The relayed turn (index 0) runs on the pair the move chose: nothing to ask.
+        // The relayed turn runs on the pair the move chose: nothing to ask. It is always the
+        // target provider's FIRST turn (index 0, whatever the conversation's carried counter
+        // was), so the predecision keys on 0 — the same index the host's hook sends — and the
+        // R-S3 guard below keys on the provider's 0-based turn, not the carried counter.
         let predecided = spec.moved_in.then_some(PreDecided {
             turn_index: 0,
             pick: None,
@@ -485,6 +508,16 @@ impl TurnRouter {
                 (v as u64) ^ (v >> 64) as u64
             })
             .unwrap_or(0);
+        // The segmenter's turn base: the carried snapshot's `last_turn` (NOT `last_turn + 1`).
+        // The relayed turn re-observes the message the move's own turn already carried, so it
+        // must land on the SAME segment id as that turn (the segmenter then tolerates it as a
+        // repeat); `last_turn + 1` made it a fresh turn, which misread the relay as a new
+        // segment and relaxed the "no two moves in a row" guard with a false direction change.
+        let segment_turn = spec
+            .segments
+            .as_ref()
+            .and_then(snapshot_last_turn)
+            .map_or(0, |last| last);
         Self {
             decider: spec.decider,
             pool: spec.pool,
@@ -526,6 +559,7 @@ impl TurnRouter {
                     }),
                 None => Segmenter::new(SegmentPolicy::default(), seed),
             }),
+            segment_turn: Mutex::new(segment_turn),
             segment_store: spec.segment_store,
             timeout: DECIDE_TIMEOUT,
         }
@@ -602,6 +636,26 @@ impl TurnRouter {
         ctx
     }
 
+    /// The SEGMENTER's next turn id (the conversation's `last_turn + 1`), carried across a
+    /// provider move so the reopened router's segmenter continues where this one stopped
+    /// (its ids/`PRECEDES` stay byte-identical under the unchanged session seed). This is NOT
+    /// the R-S3 seed: the relayed turn of a moved-in router keys on the provider's own
+    /// 0-based turn (see [`TurnRouter::new`] and [`TurnRouter::seed_relayed_turn`]).
+    pub(crate) fn next_turn(&self) -> u32 {
+        snapshot_last_turn(&self.snapshot_segments()).map_or(0, |last| last + 1)
+    }
+
+    /// The conversation's segmentation as it stands (its segments and boundaries), for
+    /// carrying across a provider move: the new router resumes from it instead of starting
+    /// an empty history, so a move does not reset the cognitive segments.
+    pub(crate) fn snapshot_segments(&self) -> SegmentsSnapshot {
+        let segmenter = locked(&self.segmenter);
+        SegmentsSnapshot {
+            segments: segmenter.segments(),
+            boundaries: segmenter.boundaries().to_vec(),
+        }
+    }
+
     /// The model [`model_for_images`] chose could not be made active (the session refused
     /// it, or closed): the model did not change, and the decision kept for the turn is dropped,
     /// so the next turn (with or without an image) is decided afresh, never handed a change
@@ -627,10 +681,14 @@ impl TurnRouter {
     }
 
     /// The conversation reached this session by a provider move (`moved_in`): its relayed
-    /// turn (0) runs on the pair the move chose, which is a change of model, recorded with
-    /// the class of that turn's message (set just before, [`Self::set_last_message`]). Turn 1
-    /// of the same class is then steady (R-S3, [`held_by_class`]), on top of being decided
-    /// on this provider only.
+    /// turn runs on the pair the move chose, which is a change of model, recorded with the
+    /// class of that turn's message (set just before, [`Self::set_last_message`]). Turn 1 of
+    /// the same class is then steady (R-S3, [`held_by_class`]), on top of being decided on
+    /// this provider only.
+    ///
+    /// The relayed turn is always the target provider's FIRST turn, index 0 (the provider
+    /// resets its own turn counter, whatever the conversation's carried counter was): the
+    /// change is recorded AT 0, so `held_by_class` fires for turn 1 of the same class.
     pub(crate) fn seed_relayed_turn(&self) {
         if !self.moved_in.load(Ordering::SeqCst) {
             return;
@@ -638,7 +696,10 @@ impl TurnRouter {
         let class = self.signature().arm_key();
         let mut state = locked(&self.state);
         let model = state.current_model.clone();
-        record_change(&mut state, 0, &model, class);
+        // The provider's 0-based index, not the carried `state.next_turn`: the R-S3 guard
+        // keys on the turn the host actually sends (0), so the next turn (1) is guarded.
+        let turn = 0;
+        record_change(&mut state, turn, &model, class);
     }
 
     /// An applied change that could not be sent: the model did not change.
@@ -669,7 +730,15 @@ impl TurnRouter {
     fn observe_turn(&self, turn_index: u32, provider_id: &str) -> Vec<Boundary> {
         let message = locked(&self.last_message).clone().unwrap_or_default();
         let topic = topic::topic_labels(&message);
-        let observation = observe::observation(turn_index, provider_id, &self.signature(), &topic);
+        // The segmenter's own turn id: the harness's index shifted by the segmenter's base.
+        // On a fresh router the base is 0 (the harness's index IS the segmenter's, unchanged);
+        // after a move the base is the carried `last_turn`, so the harness's reset index
+        // (0, 1, …) still segments as `last_turn, last_turn + 1, …`. The segmenter's own
+        // `last_turn` check still dedups a turn seen by both the provider check and the hook
+        // (both yield the same shifted id).
+        let segment_turn = turn_index.saturating_add(*locked(&self.segment_turn));
+        let observation =
+            observe::observation(segment_turn, provider_id, &self.signature(), &topic);
         let boundaries = match locked(&self.segmenter).observe(&observation) {
             Ok(boundaries) => boundaries,
             Err(SegmentError::OutOfOrder { turn, last }) => {
@@ -2234,6 +2303,9 @@ mod provider_move_tests {
             LearningStage::Auto,
         );
         s.moved_in = true;
+        // The moved-to session opens fresh: its counter starts at 0, so the relayed turn's
+        // predecision (now keyed on the carried `next_turn`) matches the turn sent at index 0.
+        s.next_turn = 0;
         let router = router(s);
         // The relayed turn (0) runs on the pair the move chose: nothing is asked.
         directive_for_turn(&router, &TurnContext::new(0, "m")).await;
@@ -2318,6 +2390,9 @@ mod provider_move_tests {
             LearningStage::Auto,
         );
         s.moved_in = true;
+        // The moved-to session opens fresh: its counter starts at 0, so the relayed turn's
+        // predecision (now keyed on the carried `next_turn`) matches the turn sent at index 0.
+        s.next_turn = 0;
         let router = router(s);
         directive_for_turn(&router, &TurnContext::new(0, "m")).await;
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
@@ -3555,5 +3630,89 @@ mod segment_tests {
             request.narrowed.contains(&SAME_CLASS_NO_EXPLORE),
             "{request:?}"
         );
+    }
+
+    /// Slice B: a router rebuilt from a carried snapshot continues segmenting where the old
+    /// one stopped even though the provider's harness RESETS its turn index to 0. The carried
+    /// snapshot's `last_turn` becomes the segmenter's turn base, so the reset indices
+    /// (0, 1, …) still segment as `last_turn, last_turn + 1, …` — no `OutOfOrder`, no
+    /// spurious boundary, and the pre-carry boundary stays put.
+    #[test]
+    fn a_router_rebuilt_from_a_carried_snapshot_continues_segmenting_not_reset() {
+        let session = Uuid::new_v4();
+        let routing = "the routing of the provider";
+        let other = "neo4j docker tests";
+        // The first router confirms a topic boundary (two deviating turns).
+        let first = router(session);
+        feed(&first, 0, "deepseek", routing);
+        feed(&first, 1, "deepseek", routing);
+        feed(&first, 2, "deepseek", other);
+        let confirmed = feed(&first, 3, "deepseek", other);
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].dimension, Dimension::Topic);
+
+        let snapshot = first.snapshot_segments();
+        let last_turn = snapshot
+            .segments
+            .iter()
+            .map(|segment| segment.last_turn)
+            .chain(snapshot.boundaries.iter().map(|boundary| boundary.at_turn))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(last_turn, 3);
+        // The segmenter counter the move carries is `last_turn + 1` (NOT the R-S3 seed).
+        assert_eq!(first.next_turn(), last_turn + 1);
+
+        // Rebuild on the same session with the carried snapshot. The R-S3 `next_turn` is the
+        // provider's 0-based index (its harness resets), not the carried counter.
+        let mut carried = spec(session);
+        carried.segments = Some(snapshot.clone());
+        carried.next_turn = 0;
+        let rebuilt = TurnRouter::new(carried);
+
+        // The pre-carry boundary is restored, not reset.
+        assert_eq!(locked(&rebuilt.segmenter).boundaries().len(), 1);
+        // The provider's harness restarts at 0: the segmenter shifts each reset index up by
+        // `last_turn`, so the continued subject is absorbed, never OutOfOrder, and never
+        // mistaken for a new direction.
+        assert!(
+            feed(&rebuilt, 0, "deepseek", other).is_empty(),
+            "a continued subject must not open a spurious boundary"
+        );
+        assert!(
+            feed(&rebuilt, 1, "deepseek", other).is_empty(),
+            "the reset index still segments strictly increasing"
+        );
+        assert_eq!(locked(&rebuilt.segmenter).boundaries().len(), 1);
+        // The reopened router's segmenter continued from the carried `last_turn` (its base), not reset to 0.
+        assert_eq!(rebuilt.next_turn(), last_turn + 2);
+    }
+
+    /// Slice B: the relayed turn of a moved-in router is recorded at the provider's 0-based
+    /// index (turn 0), NOT the carried counter, so `held_by_class` fires for the following
+    /// turn (1) of the same class. Red with the carried counter (e.g. 5): the next turn's
+    /// index (1) would never follow the recorded change and the "no two moves in a row" guard
+    /// would die.
+    #[test]
+    fn a_carried_relayed_turn_seeds_the_guard_at_the_provider_index() {
+        let session = Uuid::new_v4();
+        let mut carried = spec(session);
+        carried.moved_in = true;
+        carried.next_turn = 5; // the carried counter must NOT leak into the R-S3 seed
+        let router = TurnRouter::new(carried);
+        router.set_last_message("the routing of the provider");
+        let class = router.signature().arm_key();
+        router.seed_relayed_turn();
+
+        let state = locked(&router.state);
+        assert_eq!(
+            state.last_change_turn,
+            Some(0),
+            "the relayed turn is recorded at the provider's 0-based index"
+        );
+        assert_eq!(state.last_change_class.as_deref(), Some(class.as_str()));
+        // The following turn (1) of the same class is steady; turn 2 is not.
+        assert!(held_by_class(&state, 1, &class));
+        assert!(!held_by_class(&state, 2, &class));
     }
 }
