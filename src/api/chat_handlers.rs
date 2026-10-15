@@ -3121,6 +3121,8 @@ mod tests {
             user_claims: Some(crate::auth::jwt::Claims::service_account("t")),
             spawned_by: None,
             task_context: None,
+            subagent_type: None,
+            route_auto: false,
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,

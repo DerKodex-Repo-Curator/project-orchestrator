@@ -1388,6 +1388,8 @@ fn delegation_chat_request(
         ))),
         spawned_by: None,
         task_context: Some(task_title.to_string()),
+        subagent_type: None,
+        route_auto: false,
         scaffolding_override: None,
         runner_context: None, // TODO: populate for delegate_task
         routing_decision_id: None,

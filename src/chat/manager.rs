@@ -168,6 +168,10 @@ pub(crate) fn auto_refused_by_locked_vault(
 /// Most models offered instead of unlocking the vault.
 pub(crate) const MAX_LOCKED_VAULT_FALLBACKS: usize = 3;
 
+/// How many pool members the `cognitive decision` debug line names: the pool is the whole
+/// catalog, and an unbounded list in a log line is noise (review nit).
+const MAX_LOGGED_POOL: usize = 8;
+
 /// The models Auto could still open on without the vault, best first: its own
 /// pick, then the eligible alternatives by score. None of them depends on the
 /// vault (those came back unhealthy or offline, but the filter says it
@@ -1329,6 +1333,18 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
         protocol_state,
         scaffolding_level,
     })
+}
+
+/// Whether the request opens a child of a conversation — a native parent's `Agent`
+/// call (its `tool_use_id` is set) or a sub-conversation it spawned. Such a child is a
+/// sub-task, so its routing signature is built from the sub-task (description, prompt,
+/// `subagent_type`), never from a task node or a stated class alone.
+fn is_subagent_spawn(request: &ChatRequest) -> bool {
+    request
+        .spawned_by
+        .as_deref()
+        .and_then(parse_spawned_by)
+        .is_some_and(|ctx| ctx.spawn_type == "conversation")
 }
 
 /// Project id handed to every enrichment stage, resolved once from the
@@ -3560,7 +3576,8 @@ impl ChatManager {
     }
 
     /// Whether the session's model was pinned (named by the request or set by hand).
-    async fn model_is_pinned(&self, session_id: &str) -> bool {
+    /// Read by the sub-agent opening too (AUTO-SUB, review point 4).
+    pub(crate) async fn model_is_pinned(&self, session_id: &str) -> bool {
         matches!(
             self.graph
                 .get_llm_setting(&Self::pin_scope(session_id), Self::MODEL_PIN_KEY)
@@ -13945,6 +13962,42 @@ impl ChatManager {
         request.routing_pool.as_deref().filter(|p| !p.is_empty())
     }
 
+    /// The pair (provider, model) of the session that spawned `request`: the explicit
+    /// fallback of a routed sub-agent (AUTO-SUB, review point 1). A routed child carries
+    /// neither a pool nor a pair of its own — naming one would make its request "named" and
+    /// the router would never run — so when the router applies nothing, this is what opens
+    /// it instead of the declared rules (project rule, global rule, configured default). A
+    /// DeepSeek Auto parent would otherwise see its `Agent` child open on `claude-code`
+    /// with no visible reason. The parent's id rides the `spawned_by` the child already
+    /// carries; an unknown parent (a pruned node, a test) is no fallback.
+    ///
+    /// The pair is NOT put back into the request's `provider`/`model`: it is used at the
+    /// `request` level of the resolution, only once the router had its say.
+    async fn parent_pair_of(
+        &self,
+        request: &ChatRequest,
+    ) -> Option<super::provider::resolver::Candidate> {
+        use super::provider::resolver;
+        let parent_id = request
+            .spawned_by
+            .as_deref()
+            .and_then(parse_spawned_by)?
+            .parent_session_id?;
+        let parent = self
+            .graph
+            .get_chat_session(Uuid::parse_str(&parent_id).ok()?)
+            .await
+            .ok()??;
+        // A node written before the harness names no provider: it is Claude Code (M0/A4).
+        let provider = parent
+            .provider_id
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| resolver::CLAUDE_CODE.to_owned());
+        let model = (!parent.model.is_empty()).then(|| parent.model.clone());
+        Some(resolver::Candidate::new(provider, model))
+    }
+
     /// Same, tying the stored cognitive decision to the session being opened.
     pub(crate) async fn resolve_provider_choice_for(
         &self,
@@ -14063,6 +14116,14 @@ impl ChatManager {
                     }),
             }
         });
+        // AUTO-SUB (review point 1): the pair of the session that spawned this child. Read
+        // once, applied below ONLY when the router applies nothing — the declared rules
+        // must never substitute a default for a child whose parent named its engine.
+        let parent_fallback = if request.route_auto {
+            self.parent_pair_of(request).await
+        } else {
+            None
+        };
         let declared_project_rule = input.project_rule.clone();
         if let Some(pick) = &auto_pick {
             input.project_rule = Some(resolver::Candidate::new(
@@ -14076,6 +14137,11 @@ impl ChatManager {
             }
         } else if let Some(fallback) = &pool_fallback {
             input.request = fallback.clone();
+        } else if let Some(fallback) = &parent_fallback {
+            // AUTO-SUB: nothing applied and no pool stands behind the opening — the engine
+            // of the session this child came from opens it, at the explicit `request`
+            // level, so no declared rule can substitute a configured default.
+            input.request = Some(fallback.clone());
         }
         // Models ticked, none named and no applied pick among them: the first ticked model
         // opens the conversation, never a default the user did not tick.
@@ -14099,7 +14165,10 @@ impl ChatManager {
             // falls back inside the resolver, so the pool's own fallback opens the
             // conversation instead of the opening failing (review of #713, C2). The decision
             // is stored back as not applied, with why.
-            Err(refused) if auto_pick.is_some() && pool_fallback.is_some() => {
+            Err(refused)
+                if auto_pick.is_some()
+                    && (pool_fallback.is_some() || parent_fallback.is_some()) =>
+            {
                 // Rewritten BEFORE the fallback is resolved: the pick was not applied, whether
                 // the fallback then opens the conversation or is refused too (nothing opens).
                 if let Some(decision) = cognitive.as_mut() {
@@ -14113,7 +14182,9 @@ impl ChatManager {
                     }
                 }
                 input.project_rule = declared_project_rule;
-                input.request = pool_fallback.flatten();
+                // What stands behind the refused pick opens the conversation: the pool's
+                // pilot, else the parent's pair (AUTO-SUB).
+                input.request = pool_fallback.clone().flatten().or(parent_fallback.clone());
                 auto_pick = None;
                 resolver::resolve(&input, &store_catalog)
                     .map_err(|e| anyhow::Error::new(e.in_scope(project_slug)))?
@@ -14726,13 +14797,24 @@ impl ChatManager {
                 project_slug,
                 ContextHints::default(),
             ),
-            super::provider::resolver::Role::Executor => TaskSignature::from_delegation(
-                request.task_class.as_deref(),
-                None,
-                1,
-                project_slug,
-                ContextHints::default(),
-            ),
+            super::provider::resolver::Role::Executor => {
+                if is_subagent_spawn(request) {
+                    TaskSignature::from_subagent(
+                        request.subagent_type.as_deref(),
+                        &crate::refs::turn::visible_text(&request.message),
+                        project_slug,
+                        ContextHints::default(),
+                    )
+                } else {
+                    TaskSignature::from_delegation(
+                        request.task_class.as_deref(),
+                        None,
+                        1,
+                        project_slug,
+                        ContextHints::default(),
+                    )
+                }
+            }
         };
         routing.set_hints(PriorHints::from_aliases(aliases));
         // A provider, model, alias or run the caller named is never substituted. The
@@ -14766,6 +14848,21 @@ impl ChatManager {
         if ticked.is_some() {
             settings.mode = super::provider::cognitive::ProviderRoutingMode::Full;
         }
+        // AUTO-SUB: a sub-agent PO routes (its parent was in Auto) is decided over the full
+        // pool at the `auto` stage, whatever the settings — a spawned session normally
+        // cannot hand its routing over, but this is PO's own choice, not the child's.
+        if request.route_auto {
+            settings.mode = super::provider::cognitive::ProviderRoutingMode::Full;
+            settings.stage = super::provider::cognitive::LearningStage::Auto;
+        }
+        debug!(
+            route_auto = request.route_auto,
+            subagent = is_subagent_spawn(request),
+            named = named,
+            mode = ?settings.mode,
+            stage = ?settings.stage,
+            "cognitive decision settings"
+        );
         // What the probes may cost: nothing for a named choice (the session opening
         // probes its own model) or in `primary` + `shadow`; only the ticked models when
         // there are some; every model otherwise.
@@ -14794,7 +14891,8 @@ impl ChatManager {
         // the fallback to every model, stated in the reason, when nothing listed can serve).
         let person_code = if !named
             && ticked.is_none()
-            && matches!(role, super::provider::resolver::Role::Pilot)
+            && (matches!(role, super::provider::resolver::Role::Pilot)
+                || is_subagent_spawn(request))
             && settings.mode == super::provider::cognitive::ProviderRoutingMode::Full
         {
             match self
@@ -14852,7 +14950,13 @@ impl ChatManager {
         // decision is stored: nothing is persisted that no session will ever close
         // (review of #689, nit 6). The offer is what the router would have chosen
         // without the vault, previewed, not decided.
-        if vault_locked && !named {
+        //
+        // AUTO-SUB (review point 2): a request `route_auto` is not a user turning Auto on
+        // for a conversation — it is PO's own choice for an `Agent` call of a parent that
+        // is ALREADY open and holds a working pair. The fallback here is not silent, it is
+        // that pair (`parent_pair_of`), so the refusal buys nothing: it would only make the
+        // tool call fail on a vault that re-locked while the parent idled.
+        if vault_locked && !named && !request.route_auto {
             let waits = match routing.claude_code_catalog.as_ref() {
                 Some(catalog) => catalog.waits_on_vault().await,
                 None => false,
@@ -14890,6 +14994,19 @@ impl ChatManager {
             }
         }
         let decision = routing.decider.decide(&decide).await?;
+        debug!(
+            chosen = ?decision.chosen,
+            applied = decision.applied,
+            role = ?decide.signature.role,
+            pool_len = decide.pool.len(),
+            pool = ?decide
+                .pool
+                .iter()
+                .take(MAX_LOGGED_POOL)
+                .map(|f| f.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            "cognitive decision"
+        );
         // A conversation that routes (Auto, models ticked) is decided turn by turn from
         // pools that follow the stored settings, which may forbid probing: the candidates
         // of its provider not known yet are probed now, in the background, within the
@@ -21445,6 +21562,8 @@ mod tests {
                 .to_string(),
             ),
             task_context: None,
+            subagent_type: None,
+            route_auto: false,
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,
