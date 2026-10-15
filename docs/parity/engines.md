@@ -34,7 +34,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | not_measured | ok |
 | `enrichment` | le contexte du graphe précède le message du tour | ok | ok | ok |
 | `refs` | une référence #kind:id atteint le modèle en pointeur po-context | ok | ok | ok |
-| `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le fil (conversation_relayed) | ok | ok | ok |
+| `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le même fil (provider_switched) | ok | ok | ok |
 | `images` | une image jointe atteint le provider en bloc image | ok | ok | ok |
 | `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | ok | ok |
 | `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok | ok |
