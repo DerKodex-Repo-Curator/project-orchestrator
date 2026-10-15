@@ -16935,7 +16935,11 @@ impl ChatManager {
             !per_session_mcp || without_mcp,
             project_dir,
             lasting,
-            true,
+            // A provider switch is NOT a resume: the shell never left the project root, so the
+            // session's lasting `always` rules still bind (a resume starts optimistically
+            // moved, which would make every `always` command be asked again). Only a plain
+            // resume (no relay) may have moved.
+            relay.is_none(),
         )
         .await;
         let handle = self
