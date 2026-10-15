@@ -21,6 +21,7 @@ use nexus_claude::agent::{
 };
 use serde_json::{json, Value};
 
+use super::endpoint_guard::redact_error_body;
 use super::errors::open_failure;
 use super::policy::{legacy_name, neutral_name};
 use crate::chat::manager::{MASKING_FAILED_MESSAGE, MASKING_FAILED_SUBTYPE};
@@ -377,6 +378,20 @@ impl EventMapper {
                     request_id: None,
                 }]
             }
+            // A compaction that failed (nexus native harness, #105) no longer ends the turn:
+            // it goes on with the history intact, and this notice is the only thing that says
+            // why. Shown as an error frame with its code, so the thread carries it instead of
+            // letting the failure look like nothing happened.
+            AgentEvent::ProviderNotice { kind, data } if kind == COMPACTION_FAILED_NOTICE => {
+                vec![ChatEvent::Error {
+                    message: compaction_failed_message(data),
+                    parent_tool_use_id: None,
+                    code: Some(kind.clone()),
+                    reason: None,
+                    index: None,
+                    request_id: None,
+                }]
+            }
             // A notice is a diagnostic: nothing in a turn.
             AgentEvent::ProviderNotice { .. } => Vec::new(),
             // `AgentEvent` is non-exhaustive: an unknown event is ignored.
@@ -432,6 +447,13 @@ pub const TURN_TIME_LIMIT_NOTICE: &str = "turn_time_limit";
 /// Notice of a native session whose configured budget is spent (nexus `loop.rs`).
 pub const SESSION_BUDGET_NOTICE: &str = "session_budget_reached";
 
+/// Notice of an automatic compaction that failed (nexus `providers/native/loop.rs`, #105): the
+/// turn goes on with the history intact, and this notice is the only thing that says why.
+pub const COMPACTION_FAILED_NOTICE: &str = "compaction_failed";
+
+/// Longest cause kept from the provider's own words in a `compaction_failed` notice.
+const COMPACTION_CAUSE_MAX: usize = 400;
+
 /// A duration as a person reads it: `25 min`, `25 min 3 s`, `40 s`, `400 ms`.
 fn human_duration(ms: u64) -> String {
     match (ms / 60_000, (ms % 60_000) / 1000) {
@@ -480,6 +502,41 @@ pub(crate) fn limit_notice_message(kind: &str, data: &Value) -> Option<String> {
             })
         }
         _ => None,
+    }
+}
+
+/// The text shown for a compaction that failed: what could not be done, and what happened
+/// instead. Never empty, and never a bare code — the notice's `code` (`protocol`, an endpoint
+/// error) says nothing on its own, the cause is in its `message`.
+///
+/// Unlike [`limit_notice_message`], built from numbers only, the cause here is the provider's
+/// own sentence: it is the only place that says *why* (a summary that came back empty, an
+/// endpoint that refused the call). nexus has already redacted it; it is redacted again here
+/// and bounded, so a verbose endpoint can neither leak a credential nor flood the thread.
+pub(crate) fn compaction_failed_message(data: &Value) -> String {
+    let message = data
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    // Redacted in full first — a credential split by the cut would escape otherwise — then
+    // bounded; a cut is said, so a sentence never ends mid-word without a trace.
+    let redacted = redact_error_body(message, usize::MAX);
+    let mut cause = redact_error_body(&redacted, COMPACTION_CAUSE_MAX);
+    if cause.len() < redacted.len() {
+        cause.push('…');
+    }
+    let said = if data.get("trigger").and_then(Value::as_str) == Some("auto") {
+        "The conversation's context could not be summarised automatically"
+    } else {
+        "The conversation's context could not be summarised"
+    };
+    const INTACT: &str = "The turn went on without compacting: the history is intact, so \
+                          nothing of the conversation is lost.";
+    if cause.is_empty() {
+        format!("{said}. {INTACT}")
+    } else {
+        format!("{said} ({cause}). {INTACT}")
     }
 }
 
@@ -1306,6 +1363,72 @@ mod tests {
             data: Value::Null,
         };
         assert!(EventMapper::new().map(&bare).is_empty());
+    }
+
+    /// COMPACT-2 (nexus #105): a compaction that fails no longer ends the turn — the native
+    /// harness goes on with the history intact and says so with a `provider_notice`. That
+    /// notice has to reach the thread, cause included: the typed `code` alone (`protocol`)
+    /// would say nothing, and the turn would look as if nothing had happened.
+    #[test]
+    fn a_compaction_that_failed_is_said_in_the_thread_with_its_cause() {
+        let frame = |data: Value| {
+            let notice = AgentEvent::ProviderNotice {
+                kind: COMPACTION_FAILED_NOTICE.to_string(),
+                data,
+            };
+            match EventMapper::new().map(&notice).as_slice() {
+                [ChatEvent::Error { message, code, .. }] => (message.clone(), code.clone()),
+                other => panic!("one error frame expected: {other:?}"),
+            }
+        };
+
+        let (message, code) = frame(json!({
+            "trigger": "auto",
+            "code": "protocol",
+            "message": "protocol error: the compaction summary came back empty",
+        }));
+        assert_eq!(code.as_deref(), Some("compaction_failed"));
+        // The cause — nexus' own words, already redacted there — is what a bare `protocol`
+        // code loses.
+        assert!(
+            message.contains("the compaction summary came back empty"),
+            "{message}"
+        );
+        // Both facts, and neither in the place of the other: the context could not be
+        // summarised AND the turn went on.
+        assert!(message.contains("could not be summarised"), "{message}");
+        assert!(message.contains("went on without compacting"), "{message}");
+
+        // A notice without a cause still says the two facts, and invents none.
+        let (message, code) = frame(Value::Null);
+        assert_eq!(code.as_deref(), Some("compaction_failed"));
+        assert!(message.contains("could not be summarised"), "{message}");
+        assert!(message.contains("went on without compacting"), "{message}");
+
+        // A credential the endpoint echoed back never reaches the thread: nexus redacts the
+        // notice, and a credential-looking shape is caught here as well.
+        let (message, _) = frame(json!({
+            "trigger": "auto",
+            "code": "protocol",
+            "message": "upstream refused the summary: api_key=sk-live-0123456789abcdef",
+        }));
+        assert!(!message.contains("sk-live-0123456789abcdef"), "{message}");
+    }
+
+    /// The same notice out of turn stays a diagnostic line: the background path carries what
+    /// the provider said, it does not turn it into an in-turn error.
+    #[test]
+    fn a_compaction_that_failed_out_of_turn_stays_a_diagnostic() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: COMPACTION_FAILED_NOTICE.to_string(),
+            data: json!({"trigger": "auto", "code": "protocol", "message": "empty summary"}),
+        };
+        let out = out_of_band_to_chat_events(&[notice], &mut EventMapper::new(), Utc::now());
+        assert!(
+            matches!(out.as_slice(), [ChatEvent::BackgroundOutput { source, .. }]
+                if source == "system:compaction_failed"),
+            "{out:?}"
+        );
     }
 
     #[test]
