@@ -2454,6 +2454,26 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             ),
         )
         .await;
+        // The citations of the answer, validated and announced on the thread,
+        // as the Claude Code engine's `handle_feedback` does: the runtime emits
+        // what comes back, and persists it (its own sequence), so a replay has
+        // it. Readable citations draw a chip, the others stay plain text.
+        if let Some(event) = self
+            .step(
+                &mut after,
+                session_id,
+                "cites",
+                super::feedback::cited_refs_event(
+                    &self.graph,
+                    session_id,
+                    &outcome.assistant_text,
+                ),
+            )
+            .await
+            .flatten()
+        {
+            after.events.push(event);
+        }
         after
     }
 }

@@ -874,6 +874,46 @@ pub async fn process_cited_refs(
         }
     }
 }
+/// The `cites_resolved` event of one answer, or `None` when it cites nothing.
+///
+/// The citations of the ANSWER, read with the one reader
+/// ([`crate::refs::cite::cited_refs`]: a token in code is not a citation) and
+/// each handed to the one door
+/// ([`crate::refs::cite::guard_cites`] over
+/// [`AccessPolicy::resolve_checked`](crate::refs::access::AccessPolicy::resolve_checked)),
+/// so what the interface is told is exactly what the guard decided: an id that
+/// names nothing, an entity of another project or an unreadable one comes back
+/// `not_found` and carries no label. The caller announces the result; the
+/// client draws a chip for an `ok` entry and plain text for anything else —
+/// never a link to an entity nobody resolved.
+///
+/// `None` when the answer cites nothing: an empty event would key nothing.
+///
+/// A second read of the same citations, next to [`process_cited_refs`]: that one
+/// records the DISCUSSED set from a background task that only runs with a memory
+/// manager, while this event has to reach the thread whatever the session holds.
+/// Both use the same reader and the same door, so the two cannot disagree.
+pub async fn cited_refs_event(
+    graph: &Arc<dyn GraphStore>,
+    session_id: &str,
+    answer: &str,
+) -> Option<crate::chat::types::ChatEvent> {
+    if crate::refs::cite::cited_refs(answer).is_empty() {
+        return None;
+    }
+    let source = crate::refs::resolvers::GraphRefSource::new(graph.clone());
+    let principal =
+        crate::refs::turn::session_principal(graph.as_ref(), &session_id.to_string()).await;
+    let refs = crate::refs::cite::guard_cites(
+        &source,
+        &crate::refs::access::AccessPolicy::open_instance(),
+        &principal,
+        answer,
+    )
+    .await;
+    (!refs.is_empty()).then(|| crate::chat::types::ChatEvent::CitesResolved { refs })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
